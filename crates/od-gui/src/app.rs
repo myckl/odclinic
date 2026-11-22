@@ -3354,6 +3354,35 @@ impl OdApp {
             });
             let as_of = chrono::NaiveDate::parse_from_str(&self.plan_recon_as_of_text, "%Y-%m-%d")
                 .unwrap_or(today);
+            let mut dyn_count = 0usize;
+            let mut dyn_issued_count = 0usize;
+            let mut dyn_expected_due_count = 0usize;
+            let mut dyn_issued_total = 0.0_f64;
+            let mut dyn_expected_due_total = 0.0_f64;
+            let mut dyn_missing_due_count = 0usize;
+            let mut dyn_missing_due_total = 0.0_f64;
+            for plan in &plans {
+                if plan.is_dynamic {
+                    dyn_count += 1;
+                    let own_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == plan.pay_plan_num).cloned().collect();
+                    let r = od_core::reconciliation(plan, &own_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
+                    dyn_issued_count += r.issued_count;
+                    dyn_expected_due_count += r.expected_due_count;
+                    dyn_issued_total += r.issued_total;
+                    dyn_expected_due_total += r.expected_due_total;
+                    dyn_missing_due_count += r.missing_due_count;
+                    dyn_missing_due_total += r.missing_due_total;
+                }
+            }
+            if dyn_count > 0 {
+                ui.label(format!(
+                    "Dynamic portfolio (as of {as_of}): {dyn_count} plan(s) · issued {dyn_issued_count}/{dyn_expected_due_count} due {dyn_issued_total:.2}/{dyn_expected_due_total:.2} · missing due {dyn_missing_due_count} {dyn_missing_due_total:.2}"
+                ));
+                if dyn_missing_due_count > 0 {
+                    ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Some dynamic plans have missing due charges for this as-of date.");
+                }
+                ui.separator();
+            }
             for plan in &plans {
                 let own_links: Vec<PayPlanLink> = plan_links
                     .iter()
