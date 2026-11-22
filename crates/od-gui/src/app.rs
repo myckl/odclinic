@@ -1191,6 +1191,7 @@ struct OdApp {
     plan_refund_transfer_target: PaymentTarget,
 
     // Payment plan state.
+    plan_recon_as_of_text: String,
     plan_edit: Option<PayPlan>,
     plan_edit_open: bool,
     plan_amount_text: String,
@@ -1435,6 +1436,7 @@ impl OdApp {
             account_transfer_to_text: String::new(),
             account_ledger_export_path: String::new(),
             plan_refund_transfer_target: PaymentTarget::Unallocated,
+            plan_recon_as_of_text: chrono::Local::now().format("%Y-%m-%d").to_string(),
             plan_edit: None,
             plan_edit_open: false,
             plan_amount_text: String::new(),
@@ -3339,16 +3341,42 @@ impl OdApp {
                 ui.label("No payment plans for this patient.");
             }
             let today = chrono::Local::now().date_naive();
+            ui.horizontal(|ui| {
+                ui.label("As of");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.plan_recon_as_of_text)
+                        .desired_width(90.0)
+                        .hint_text("YYYY-MM-DD"),
+                );
+                if ui.small_button("Today").clicked() {
+                    self.plan_recon_as_of_text = today.format("%Y-%m-%d").to_string();
+                }
+            });
+            let as_of = chrono::NaiveDate::parse_from_str(&self.plan_recon_as_of_text, "%Y-%m-%d")
+                .unwrap_or(today);
             for plan in &plans {
                 let own_links: Vec<PayPlanLink> = plan_links
                     .iter()
                     .filter(|l| l.pay_plan_num == plan.pay_plan_num)
                     .cloned()
                     .collect();
-                let breakdown = od_core::pay_plan_balance_breakdown(plan, &plan_charges, &splits, today);
-                let balance = od_core::pay_plan_balance(plan, &plan_charges, &splits, today);
+                let breakdown = od_core::pay_plan_balance_breakdown(plan, &plan_charges, &splits, as_of);
+                let balance = od_core::pay_plan_balance(plan, &plan_charges, &splits, as_of);
                 let due_now = breakdown.due_now - breakdown.unapplied_credit;
                 let kind = if plan.is_dynamic { "dynamic" } else { "static" };
+                let recon = if plan.is_dynamic {
+                    Some(od_core::reconciliation(
+                        plan,
+                        &own_links,
+                        &procedures,
+                        &adjustments,
+                        &splits,
+                        &plan_charges,
+                        as_of,
+                    ))
+                } else {
+                    None
+                };
                 ui.collapsing(
                     format!(
                         "{} — {:.2} owing, {:.2} due now ({}, {:.2}% APR)",
@@ -3375,6 +3403,25 @@ impl OdApp {
                             "Due now {:.2} · Future due {:.2} · Unapplied/overpaid credit {:.2}",
                             breakdown.due_now, breakdown.future_due, breakdown.unapplied_credit
                         ));
+                        if let Some(r) = recon {
+                            ui.label(format!(
+                                "Dynamic reconciliation (as of {}): issued {}/{} due {:.2}/{:.2} · full {}/{} {:.2}/{:.2} · missing due {} {:.2}",
+                                as_of,
+                                r.issued_count,
+                                r.expected_due_count,
+                                r.issued_total,
+                                r.expected_due_total,
+                                r.issued_count,
+                                r.expected_full_count,
+                                r.issued_total,
+                                r.expected_full_total,
+                                r.missing_due_count,
+                                r.missing_due_total,
+                            ));
+                            if r.missing_due_count > 0 {
+                                ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Due charges are missing for this as-of date. Use Issue charges due.");
+                            }
+                        }
                         if breakdown.unapplied_credit > 0.005 && !plan.is_closed {
                             ui.horizontal(|ui| {
                                 let target_label = match self.plan_refund_transfer_target {

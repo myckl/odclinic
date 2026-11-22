@@ -4,6 +4,8 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  schedule:
+    - cron: "17 6 * * 1" # Weekly Monday 06:17 UTC sanity build
   workflow_dispatch:
     inputs:
       run_live_mysql:
@@ -12,6 +14,10 @@ on:
         default: "false"
         type: choice
         options: ["false", "true"]
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   build:
