@@ -1,0 +1,63 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_live_mysql:
+        description: "Run live MySQL tests/smoke (requires ODCLINIC_DB_URL secret and reachable MySQL)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  build:
+    name: Build and test (no live DB)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run build sequence
+        run: ./scripts/build_sequence.ps1 -Phase all -SkipLive -SkipSmoke
+
+  live-mysql:
+    name: Live MySQL tests and smoke (opt-in)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_mysql == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      ODCLINIC_DB_URL: ${{ secrets.ODCLINIC_DB_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify ODCLINIC_DB_URL secret
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ODCLINIC_DB_URL)) {
+            throw "ODCLINIC_DB_URL secret is required for live MySQL/smoke job."
+          }
+          Write-Host "ODCLINIC_DB_URL is configured."
+
+      - name: Run live MySQL and smoke sequence
+        run: ./scripts/build_sequence.ps1 -Phase all

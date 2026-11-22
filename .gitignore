@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp
+*.log
+.env
+.env.*
+.idea/
+.vscode/
+build-sequence*.log
+nulp

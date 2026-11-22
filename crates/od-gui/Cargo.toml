@@ -1,0 +1,13 @@
+[package]
+name = "od-gui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[dependencies]
+od-domain = { path = "../od-domain" }
+od-db = { path = "../od-db" }
+od-core = { path = "../od-core" }
+eframe = "0.37.0"
+egui = "0.37.0"
+chrono = "0.4"

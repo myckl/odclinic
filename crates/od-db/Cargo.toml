@@ -1,0 +1,13 @@
+[package]
+name = "od-db"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+[dependencies]
+od-domain = { path = "../od-domain" }
+chrono = "0.4"
+mysql = "28"
+
+[dev-dependencies]
+od-core = { path = "../od-core" }

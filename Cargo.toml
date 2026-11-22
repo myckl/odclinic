@@ -1,0 +1,17 @@
+[package]
+name = "odclinic"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Rust desktop application porting a scoped subset of Open Dental"
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[dependencies]
+od-domain = { path = "crates/od-domain" }
+od-db = { path = "crates/od-db" }
+od-core = { path = "crates/od-core" }
+od-gui = { path = "crates/od-gui" }
+eframe = "0.37.0"
