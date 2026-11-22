@@ -713,6 +713,13 @@ fn demo_store_dynamic_plan_links_issue_due_charges() {
     );
     assert!(again.is_empty(), "issuance must be idempotent");
 
+    // Mid-period reconciliation: as of mid-Feb, Jan+Feb are due, Mar is not.
+    let mid_feb = NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
+    let rec = od_core::reconciliation(&stored, &own_links, &procs, &adjs, &splits, &after, mid_feb);
+    assert!(rec.expected_due_count >= 2);
+    assert!(rec.issued_count <= rec.expected_due_count);
+    assert!(rec.expected_full_count >= rec.expected_due_count);
+
     store.delete_pay_plan_link(link_num).unwrap();
     let remaining = store.list_pay_plan_links().unwrap();
     assert!(!remaining.iter().any(|l| l.pay_plan_link_num == link_num));

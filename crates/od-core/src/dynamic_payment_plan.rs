@@ -427,6 +427,75 @@ pub fn issue_charges_due(
     charges
 }
 
+/// Reconciliation snapshot for a dynamic plan as of `as_of`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DynamicPlanReconciliation {
+    pub issued_count: usize,
+    pub issued_total: f64,
+    pub expected_due_count: usize,
+    pub expected_due_total: f64,
+    pub expected_full_count: usize,
+    pub expected_full_total: f64,
+    pub missing_due_count: usize,
+    pub missing_due_total: f64,
+}
+
+/// Compare issued dynamic-plan charges against expected schedule through `as_of`.
+/// `missing_due_*` counts expected-due charges/amount not yet issued as of `as_of`.
+pub fn reconciliation(
+    plan: &PayPlan,
+    links: &[PayPlanLink],
+    procedures: &[Procedure],
+    adjustments: &[Adjustment],
+    splits: &[od_domain::PaySplit],
+    existing_charges: &[PayPlanCharge],
+    as_of: NaiveDate,
+) -> DynamicPlanReconciliation {
+    let plan_links: Vec<PayPlanLink> = links
+        .iter()
+        .filter(|l| l.pay_plan_num == plan.pay_plan_num)
+        .cloned()
+        .collect();
+    let entries = production_entries(&plan_links, procedures, adjustments, splits);
+    let own_existing: Vec<PayPlanCharge> = existing_charges
+        .iter()
+        .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_type == PayPlanChargeType::Debit && !is_down_payment(c))
+        .cloned()
+        .collect();
+    let issued: Vec<&PayPlanCharge> = own_existing.iter().filter(|c| c.charge_date <= as_of).collect();
+    let issued_total = issued.iter().map(|c| c.principal + c.interest).sum();
+
+    // Expected due through as_of, ignoring existing dates so we see what should exist.
+    let expected_due = build_charges(plan, &entries, &[], as_of, true, false);
+    let expected_due_total = expected_due.iter().map(|c| c.principal + c.interest).sum();
+
+    // Full expected schedule for visibility.
+    let expected_full = build_charges(plan, &entries, &[], as_of, false, false);
+    let expected_full_total = expected_full.iter().map(|c| c.principal + c.interest).sum();
+
+    // Missing due: expected due dates/amounts not present in existing issued charges.
+    let mut missing_due_count = 0usize;
+    let mut missing_due_total = 0.0f64;
+    for exp in &expected_due {
+        let covered = own_existing.iter().any(|c| c.charge_date == exp.charge_date && c.fkey == exp.fkey && c.link_type == exp.link_type);
+        if !covered {
+            missing_due_count += 1;
+            missing_due_total += exp.principal + exp.interest;
+        }
+    }
+
+    DynamicPlanReconciliation {
+        issued_count: issued.len(),
+        issued_total: round2(issued_total),
+        expected_due_count: expected_due.len(),
+        expected_due_total: round2(expected_due_total),
+        expected_full_count: expected_full.len(),
+        expected_full_total: round2(expected_full_total),
+        missing_due_count,
+        missing_due_total: round2(missing_due_total),
+    }
+}
+
 /// Why a dynamic plan cannot issue charges right now. Returned to the UI so the
 /// user sees the exact reason rather than a silent no-op.
 pub fn issuance_block(plan: &PayPlan, links: &[PayPlanLink]) -> Option<&'static str> {
@@ -693,5 +762,38 @@ mod tests {
         p.pay_amt = 0.0;
         p.number_of_payments = 0;
         assert!(issuance_block(&p, &links).is_some());
+    }
+
+    #[test]
+    fn mid_period_as_of_does_not_issue_next_period_charge() {
+        let links = [link(1, PayPlanLink::PROCEDURE, 100)];
+        let procedures = [proc(100, 300.0, ProcedureStatus::Complete, 2)];
+        let p = plan(DynamicPayPlanTPOption::None); // monthly 100, starts 2026-01-01
+        let mid_jan = date(2026, 1, 15);
+        let due = issue_charges_due(&p, &links, &procedures, &[], &[], &[], mid_jan);
+        assert_eq!(due.len(), 1, "only Jan 1 period is due by Jan 15");
+        assert_eq!(due[0].charge_date, date(2026, 1, 1));
+        let due_feb1 = issue_charges_due(&p, &links, &procedures, &[], &[], &due, date(2026, 2, 1));
+        assert_eq!(due_feb1.len(), 1);
+        assert_eq!(due_feb1[0].charge_date, date(2026, 2, 1));
+    }
+
+    #[test]
+    fn reconciliation_reports_issued_and_expected_through_as_of() {
+        let links = [link(1, PayPlanLink::PROCEDURE, 100)];
+        let procedures = [proc(100, 300.0, ProcedureStatus::Complete, 2)];
+        let p = plan(DynamicPayPlanTPOption::None); // monthly 100, 3 periods
+        let as_of = date(2026, 2, 15); // mid period: Jan+Feb due, Mar not due
+        let issued = issue_charges_due(&p, &links, &procedures, &[], &[], &[], as_of);
+        assert_eq!(issued.len(), 2);
+        let rec = reconciliation(&p, &links, &procedures, &[], &[], &issued, as_of);
+        assert_eq!(rec.issued_count, 2);
+        assert_eq!(round2(rec.issued_total), 200.0);
+        assert_eq!(rec.expected_due_count, 2);
+        assert_eq!(round2(rec.expected_due_total), 200.0);
+        assert_eq!(rec.expected_full_count, 3);
+        assert_eq!(round2(rec.expected_full_total), 300.0);
+        assert_eq!(rec.missing_due_count, 0);
+        assert!(round2(rec.missing_due_total).abs() < 0.01);
     }
 }

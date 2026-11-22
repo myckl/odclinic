@@ -3856,6 +3856,11 @@ fn mysql_live_dynamic_plan_links_issue_due_charges() {
     );
     assert!(again.is_empty(), "dynamic issuance must be idempotent");
 
+    let mid = NaiveDate::from_ymd_opt(2097, 2, 15).unwrap();
+    let rec = od_core::reconciliation(&stored_plan, &own_links, &procs, &adjs, &splits, &saved, mid);
+    assert!(rec.expected_due_count >= 2);
+    assert!(rec.issued_count <= rec.expected_due_count);
+
     // Clean up in dependency order.
     let _ = conn.exec_drop("DELETE FROM payplancharge WHERE PayPlanNum=?", (plan_num,));
     let _ = conn.exec_drop("DELETE FROM payplanlink WHERE PayPlanLinkNum=?", (link_num,));

@@ -31,7 +31,8 @@ pub use discount::{
 pub use dynamic_payment_plan::{
     calc_periods_for_frequency, calculate_period_payment, chargeable_entries, completed_amount,
     expected_charges, issuance_block, issue_charges_due, principal_amount, production_entries,
-    with_amount_remaining, ProductionEntry, MAX_CATCH_UP_PERIODS,
+    reconciliation, with_amount_remaining, DynamicPlanReconciliation, ProductionEntry,
+    MAX_CATCH_UP_PERIODS,
 };
 pub use payment_plan::{
     charge_generation_block, generate_plan_charges, next_period_date, period_rate,

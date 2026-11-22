@@ -1061,7 +1061,7 @@ pub fn pay_plan_detail_report(
         "Balance",
         "Due Now",
         "Bal Not Due",
-        "Unapplied Credit",
+        "Unapplied Credit / Reconciliation",
     ]);
     if options.show_family_balance {
         headers.push("Fam Balance");
@@ -1174,6 +1174,13 @@ pub fn pay_plan_detail_report(
                 format!("Ins #{}", plan.insurance_plan_num)
             });
         }
+        let recon = if plan.is_dynamic {
+            let own_links: Vec<PayPlanLink> = links.iter().filter(|l| l.pay_plan_num == plan.pay_plan_num).cloned().collect();
+            let r = crate::reconciliation(plan, &own_links, procedures, adjustments, splits, charges, as_of);
+            format!(" · issued {}/{} {:.2}/{:.2} · missing {} {:.2}", r.issued_count, r.expected_due_count, r.issued_total, r.expected_due_total, r.missing_due_count, r.missing_due_total)
+        } else {
+            String::new()
+        };
         values.extend([
             format!("{princ:.2}"),
             format!("{interest:.2}"),
@@ -1181,7 +1188,7 @@ pub fn pay_plan_detail_report(
             format!("{balance:.2}"),
             format!("{due:.2}"),
             format!("{not_due:.2}"),
-            format!("{unapplied_credit:.2}"),
+            format!("{unapplied_credit:.2}{recon}"),
         ]);
         if options.show_family_balance {
             values.push(format!("{family_balance:.2}"));
@@ -3931,6 +3938,26 @@ mod tests {
     }
 
     #[test]
+    fn pay_plan_detail_report_shows_dynamic_reconciliation() {
+        let patients = [patient(1, "Alvarez")];
+        let providers = [Provider { provider_num: 7, l_name: "Smith".into(), f_name: "Jo".into(), ..Default::default() }];
+        let plan = PayPlan {
+            pay_plan_num: 8, pat_num: 1, guarantor: 1, pay_plan_date: day(2026, 1, 1),
+            is_dynamic: true, pay_amt: 100.0, charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            date_pay_plan_start: Some(day(2026, 1, 1)), ..Default::default()
+        };
+        let links = [PayPlanLink { pay_plan_link_num: 1, pay_plan_num: 8, link_type: PayPlanLink::PROCEDURE, fkey: 100, ..Default::default() }];
+        let procedures = [Procedure { proc_num: 100, pat_num: 1, proc_status: ProcedureStatus::Complete, fee: 300.0, proc_date: day(2026, 1, 2), provider_num: 7, ..Default::default() }];
+        // Only Jan issued as of mid-Feb; Feb is due but missing, Mar future.
+        let charges = [PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 1, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, provider_num: 7, fkey: 100, link_type: PayPlanLink::PROCEDURE, ..Default::default() }];
+        let table = pay_plan_detail_report(&[plan], &charges, &[], &links, &procedures, &[], &patients, &providers, &[], day(2026, 1, 1), day(2026, 2, 15), false, PayPlanReportOptions::default());
+        let row = &table.rows[0];
+        assert!(row[8].contains("issued 1/2"), "reconciliation shows issued/expected-due: {:?}", row[8]);
+        assert!(row[8].contains("missing 1"), "reconciliation shows missing due: {:?}", row[8]);
+    }
+
+    #[test]
     fn payment_plan_report_partial_period_reconciliation() {
         let patients = [patient(1, "Alvarez")];
         let plan = PayPlan { pay_plan_num: 8, pat_num: 1, pay_plan_date: day(2026, 1, 1), ..Default::default() };
@@ -4527,6 +4554,7 @@ mod tests {
         );
         assert_eq!(table.rows[0][2], "300.00", "dynamic principal comes from linked production");
         assert_eq!(table.rows[0][6], "100.00", "due now from issued charges");
+        assert!(table.rows[0][8].contains("issued"), "dynamic detail includes reconciliation: {:?}", table.rows[0][8]);
     }
 
     #[test]
