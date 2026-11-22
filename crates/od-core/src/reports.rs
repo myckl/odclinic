@@ -280,19 +280,45 @@ pub fn payment_plan_report(
     let mut total_due = 0.0_f64;
     let mut total_future = 0.0_f64;
     let mut total_unapplied = 0.0_f64;
+    let mut dyn_issued_count = 0usize;
+    let mut dyn_expected_due_count = 0usize;
+    let mut dyn_issued_total = 0.0_f64;
+    let mut dyn_expected_due_total = 0.0_f64;
+    let mut dyn_missing_due_count = 0usize;
+    let mut dyn_missing_due_total = 0.0_f64;
+    let mut dyn_count = 0usize;
     for p in plans {
         let b = crate::pay_plan_balance_breakdown(p, charges, splits, as_of);
         total_due += b.due_now - if b.due_now <= 0.005 { b.unapplied_credit } else { 0.0 };
         total_future += b.future_due;
         total_unapplied += b.unapplied_credit;
+        if p.is_dynamic {
+            dyn_count += 1;
+            let own_links: Vec<PayPlanLink> = links.iter().filter(|l| l.pay_plan_num == p.pay_plan_num).cloned().collect();
+            let r = crate::reconciliation(p, &own_links, procedures, adjustments, splits, charges, as_of);
+            dyn_issued_count += r.issued_count;
+            dyn_expected_due_count += r.expected_due_count;
+            dyn_issued_total += r.issued_total;
+            dyn_expected_due_total += r.expected_due_total;
+            dyn_missing_due_count += r.missing_due_count;
+            dyn_missing_due_total += r.missing_due_total;
+        }
     }
+    let dyn_summary = if dyn_count > 0 {
+        format!(
+            " · dynamic {dyn_count}: issued {dyn_issued_count}/{dyn_expected_due_count} due {:.2}/{:.2} · missing due {dyn_missing_due_count} {:.2}",
+            dyn_issued_total, dyn_expected_due_total, dyn_missing_due_total
+        )
+    } else {
+        String::new()
+    };
     let mut rows: Vec<ReportRow> = entries.into_iter().map(|(_, row)| row).collect();
     rows.push(ReportRow::new(
         "Total outstanding",
         format!("{total:.2}"),
         format!(
-            "{} plan(s) · due now {:.2} · future {:.2} · unapplied {:.2}",
-            plans.len(), total_due, total_future, total_unapplied
+            "{} plan(s) · due now {:.2} · future {:.2} · unapplied {:.2}{}",
+            plans.len(), total_due, total_future, total_unapplied, dyn_summary
         ),
     ));
     rows
@@ -3997,6 +4023,9 @@ mod tests {
         assert!(rows[0].detail.contains("issued 1/2"), "detail: {}", rows[0].detail);
         assert!(rows[0].detail.contains("missing due 1"), "detail: {}", rows[0].detail);
         assert!(rows[0].detail.contains("100.00/200.00"), "detail: {}", rows[0].detail);
+        let total = rows.last().unwrap();
+        assert!(total.detail.contains("dynamic 1: issued 1/2 due 100.00/200.00"), "total: {}", total.detail);
+        assert!(total.detail.contains("missing due 1 100.00"), "total: {}", total.detail);
     }
 
     #[test]
