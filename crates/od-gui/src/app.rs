@@ -1671,6 +1671,68 @@ impl OdApp {
         }
     }
 
+    fn reconcile_dynamic_plans_due_portfolio(
+        &mut self,
+        plans: &[PayPlan],
+        plan_links: &[PayPlanLink],
+        procedures: &[Procedure],
+        adjustments: &[Adjustment],
+        splits: &[PaySplit],
+        plan_charges: &[PayPlanCharge],
+        as_of: chrono::NaiveDate,
+    ) {
+        let mut total_issued = 0usize;
+        let mut plans_touched = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        for p in plans {
+            if !p.is_dynamic {
+                continue;
+            }
+            let p_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == p.pay_plan_num).cloned().collect();
+            if let Some(reason) = od_core::issuance_block(p, &p_links) {
+                errors.push(format!("Plan #{}: {}", p.pay_plan_num, reason));
+                continue;
+            }
+            let existing: Vec<PayPlanCharge> = plan_charges.iter().filter(|c| c.pay_plan_num == p.pay_plan_num).cloned().collect();
+            let due = od_core::issue_charges_due(p, &p_links, procedures, adjustments, splits, &existing, as_of);
+            if due.is_empty() {
+                continue;
+            }
+            let mut plan_error = None;
+            let mut issued = 0usize;
+            for charge in due {
+                match self.store.upsert_pay_plan_charge(&charge) {
+                    Ok(_) => issued += 1,
+                    Err(e) => { plan_error = Some(e); break; }
+                }
+            }
+            if let Some(e) = plan_error {
+                errors.push(format!("Plan #{}: {}", p.pay_plan_num, e));
+            }
+            if issued > 0 {
+                plans_touched += 1;
+                total_issued += issued;
+                self.audit_if(
+                    FeatureKey::AuditBillingChanges,
+                    Permission::BILLING,
+                    p.pat_num,
+                    format!("Issued {} dynamic charge(s) for plan {} (portfolio reconcile as of {})", issued, p.pay_plan_num, as_of),
+                );
+            }
+        }
+        if errors.is_empty() {
+            self.error = None;
+            self.notice = Some(if total_issued == 0 {
+                "No dynamic charges due to issue".into()
+            } else {
+                format!("Issued {total_issued} charge(s) across {plans_touched} plan(s)")
+            });
+        } else {
+            self.notice = if total_issued > 0 { Some(format!("Issued {total_issued} charge(s) across {plans_touched} plan(s); some plans had errors")) } else { None };
+            self.error = Some(errors.join("; "));
+        }
+    }
+
     fn try_login(&mut self) {
         let name = self.login_name.trim();
         let Some(user) = self
@@ -3382,56 +3444,7 @@ impl OdApp {
                     ui.horizontal(|ui| {
                         ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Some dynamic plans have missing due charges for this as-of date.");
                         if self.can(Permission::BILLING) && ui.button("Reconcile/issue all due").clicked() {
-                            let mut total_issued = 0usize;
-                            let mut plans_touched = 0usize;
-                            let mut errors: Vec<String> = Vec::new();
-                            for p in &plans {
-                                if !p.is_dynamic {
-                                    continue;
-                                }
-                                let p_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == p.pay_plan_num).cloned().collect();
-                                if let Some(reason) = od_core::issuance_block(p, &p_links) {
-                                    errors.push(format!("Plan #{}: {}", p.pay_plan_num, reason));
-                                    continue;
-                                }
-                                let existing: Vec<PayPlanCharge> = plan_charges.iter().filter(|c| c.pay_plan_num == p.pay_plan_num).cloned().collect();
-                                let due = od_core::issue_charges_due(p, &p_links, &procedures, &adjustments, &splits, &existing, as_of);
-                                if due.is_empty() {
-                                    continue;
-                                }
-                                let mut plan_error = None;
-                                let mut issued = 0usize;
-                                for charge in due {
-                                    match self.store.upsert_pay_plan_charge(&charge) {
-                                        Ok(_) => issued += 1,
-                                        Err(e) => { plan_error = Some(e); break; }
-                                    }
-                                }
-                                if let Some(e) = plan_error {
-                                    errors.push(format!("Plan #{}: {}", p.pay_plan_num, e));
-                                }
-                                if issued > 0 {
-                                    plans_touched += 1;
-                                    total_issued += issued;
-                                    self.audit_if(
-                                        FeatureKey::AuditBillingChanges,
-                                        Permission::BILLING,
-                                        p.pat_num,
-                                        format!("Issued {} dynamic charge(s) for plan {} (portfolio reconcile as of {})", issued, p.pay_plan_num, as_of),
-                                    );
-                                }
-                            }
-                            if errors.is_empty() {
-                                self.error = None;
-                                self.notice = Some(if total_issued == 0 {
-                                    "No dynamic charges due to issue".into()
-                                } else {
-                                    format!("Issued {total_issued} charge(s) across {plans_touched} plan(s)")
-                                });
-                            } else {
-                                self.notice = if total_issued > 0 { Some(format!("Issued {total_issued} charge(s) across {plans_touched} plan(s); some plans had errors")) } else { None };
-                                self.error = Some(errors.join("; "));
-                            }
+                            self.reconcile_dynamic_plans_due_portfolio(&plans, &plan_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
                         }
                     });
                 }
@@ -9820,6 +9833,60 @@ mod tests {
         println!("ALIVE=True");
     }
 }
+
+    #[test]
+    fn reconcile_dynamic_plans_due_portfolio_issues_and_audits() {
+        let mut app = OdApp::new();
+        app.refresh();
+        let pat_num = app.patients[0].pat_num;
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let as_of = chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
+        let adj_num = app.store.upsert_adjustment(&od_domain::Adjustment {
+            pat_num,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            adj_amount: 300.0,
+            ..Default::default()
+        }).unwrap();
+        let plan_num = app.store.upsert_pay_plan(&PayPlan {
+            pat_num,
+            guarantor: pat_num,
+            pay_plan_date: start,
+            is_dynamic: true,
+            charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            pay_amt: 100.0,
+            date_pay_plan_start: Some(start),
+            ..Default::default()
+        }).unwrap();
+        let _ = app.store.upsert_pay_plan_link(&PayPlanLink {
+            pay_plan_num: plan_num,
+            link_type: PayPlanLink::ADJUSTMENT,
+            fkey: adj_num,
+            ..Default::default()
+        }).unwrap();
+        app.refresh();
+
+        let plans = app.store.list_pay_plans(pat_num).unwrap();
+        let links = app.store.list_pay_plan_links().unwrap();
+        let procedures = app.store.list_procedures(pat_num).unwrap();
+        let adjustments = app.store.list_adjustments(pat_num).unwrap();
+        let splits = app.store.list_pay_splits(pat_num).unwrap();
+        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &charges, as_of);
+
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Issued"), "notice: {notice}; err: {:?}", app.error);
+        let after = app.store.list_pay_plan_charges(pat_num).unwrap();
+        let own: Vec<_> = after.iter().filter(|c| c.pay_plan_num == plan_num).collect();
+        assert!(own.len() >= 2, "charges should be issued for Jan+Feb due periods, got {}", own.len());
+        let logs = app.store.list_security_log(200).unwrap();
+        assert!(logs.iter().any(|l| l.log_text.contains("portfolio reconcile") && l.log_text.contains(&format!("plan {plan_num}"))), "audit log missing");
+
+        // Idempotent second run.
+        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &after, as_of);
+        let notice2 = app.notice.clone().unwrap_or_default();
+        assert!(notice2.contains("No dynamic charges due to issue"), "notice2: {notice2}; err: {:?}", app.error);
+    }
 
     #[test]
     fn account_transfer_filter_and_export_respect_plan_target_and_date() {
