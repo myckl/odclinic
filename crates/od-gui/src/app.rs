@@ -17,7 +17,7 @@ use egui::{Color32, Ui};
 use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
-    birthday_report, broken_appointments_report, build_invoice_document, build_statement_document,
+    birthday_report, broken_appointments_report, build_invoice_document, build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
@@ -32,6 +32,7 @@ use od_core::{
     procedure_sheet_report, profit_loss_report, production_goal_report, production_by_provider,
     provider_payroll_report, recall_due_date, recall_due_state, recall_fields_report, recall_report,
     receivables_breakdown_report, referral_analysis_report, referrals_report, render_invoice_pdf,
+    render_refund_transfer_receipt_html, render_refund_transfer_receipt_pdf,
     render_report_csv, render_report_html, render_statement_html, render_statement_pdf,
     restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
     interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
@@ -441,6 +442,16 @@ fn default_invoice_pdf_path(pat_num: Id) -> String {
         .into_owned()
 }
 
+fn default_refund_transfer_receipt_pdf_path(pat_num: Id, pay_num: Id) -> String {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Documents")
+        .join(format!("odclinic-refund-transfer-receipt-{pat_num}-{pay_num}.pdf"))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// A sensible default location for an exported report.
 fn default_report_path(kind: ReportKind, extension: &str) -> String {
     std::env::var_os("USERPROFILE")
@@ -479,12 +490,15 @@ struct LedgerRow {
     credit: f64,
     plan_num: Id,
     transfer_target: Option<PaymentTarget>,
+    pay_num: Id,
+    note: String,
 }
 
 fn build_account_ledger_rows(
     procedures: &[Procedure],
     adjustments: &[Adjustment],
     splits: &[PaySplit],
+    payments: &[Payment],
     include_adjustments: bool,
 ) -> Vec<LedgerRow> {
     let mut rows: Vec<LedgerRow> = procedures
@@ -497,6 +511,8 @@ fn build_account_ledger_rows(
             credit: 0.0,
             plan_num: 0,
             transfer_target: None,
+            pay_num: 0,
+            note: String::new(),
         })
         .collect();
     if include_adjustments {
@@ -512,6 +528,8 @@ fn build_account_ledger_rows(
             credit: (-a.adj_amount).max(0.0),
             plan_num: 0,
             transfer_target: None,
+            pay_num: 0,
+            note: a.note.clone(),
         }));
     }
     rows.extend(splits.iter().map(|sp| {
@@ -579,6 +597,8 @@ fn build_account_ledger_rows(
             credit: sp.split_amount.max(0.0),
             plan_num: sp.pay_plan_num,
             transfer_target,
+            pay_num: sp.pay_num,
+            note: payments.iter().find(|p| p.pay_num == sp.pay_num).map(|p| p.note.clone()).unwrap_or_default(),
         }
     }));
     rows
@@ -620,7 +640,7 @@ fn filter_account_ledger_rows(
 }
 
 fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
-    let mut table = ReportTable::new(&["Date", "Type", "Description", "Charge", "Credit"]);
+    let mut table = ReportTable::new(&["Date", "Type", "Description", "Charge", "Credit", "Payment #", "Note"]);
     for r in rows {
         table.push(&[
             &r.date.to_string(),
@@ -628,6 +648,8 @@ fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
             &r.description,
             &format!("{:.2}", r.charge),
             &format!("{:.2}", r.credit),
+            &if r.pay_num == 0 { String::new() } else { r.pay_num.to_string() },
+            &r.note,
         ]);
     }
     table
@@ -3057,6 +3079,7 @@ impl OdApp {
             &procedures,
             &adjustments,
             &splits,
+            &payments,
             self.features.enabled(FeatureKey::AccountShowAdjustments),
         );
         rows.sort_by_key(|r| r.date);
@@ -3169,7 +3192,45 @@ impl OdApp {
                             PaymentTarget::PayPlanCharge { plan_num, charge_num } => format!("plan #{} charge #{}", plan_num, charge_num),
                             PaymentTarget::Unallocated => "patient account (unallocated)".to_string(),
                         };
-                        ui.weak("audited").on_hover_text(format!("Transfer target: {}", target));
+                        ui.horizontal(|ui| {
+                            ui.weak("audited").on_hover_text(format!("Transfer target: {}", target));
+                            if row.pay_num != 0 {
+                                if ui.small_button("Receipt").clicked() {
+                                    if let Some(payment) = payments.iter().find(|p| p.pay_num == row.pay_num) {
+                                        let patient_name = self.store.get_patient(num).ok().flatten().map(|p| p.display_name()).unwrap_or_else(|| format!("Patient #{num}"));
+                                        let recorded_by = self.session.as_ref().map(|s| s.user_name.clone()).unwrap_or_else(|| "unknown".into());
+                                        if let Some(doc) = build_refund_transfer_receipt(num, &patient_name, payment, &splits, &recorded_by, chrono::Local::now().date_naive()) {
+                                            let html = render_refund_transfer_receipt_html(&doc);
+                                            let path = std::env::temp_dir().join(format!("odclinic-refund-transfer-receipt-{}-{}.html", num, row.pay_num));
+                                            match std::fs::write(&path, html) {
+                                                Ok(()) => match open_in_browser(&path.to_string_lossy()) {
+                                                    Ok(()) => { self.notice = Some(format!("Refund/transfer receipt opened ({})", path.display())); self.error = None; }
+                                                    Err(e) => self.error = Some(format!("Receipt saved but could not open browser: {e}")),
+                                                },
+                                                Err(e) => self.error = Some(format!("Could not write refund/transfer receipt: {e}")),
+                                            }
+                                        } else {
+                                            self.error = Some("No refund/transfer lines found for this payment".into());
+                                        }
+                                    }
+                                }
+                                if ui.small_button("PDF").clicked() {
+                                    if let Some(payment) = payments.iter().find(|p| p.pay_num == row.pay_num) {
+                                        let patient_name = self.store.get_patient(num).ok().flatten().map(|p| p.display_name()).unwrap_or_else(|| format!("Patient #{num}"));
+                                        let recorded_by = self.session.as_ref().map(|s| s.user_name.clone()).unwrap_or_else(|| "unknown".into());
+                                        if let Some(doc) = build_refund_transfer_receipt(num, &patient_name, payment, &splits, &recorded_by, chrono::Local::now().date_naive()) {
+                                            let path = default_refund_transfer_receipt_pdf_path(num, row.pay_num);
+                                            match std::fs::write(&path, render_refund_transfer_receipt_pdf(&doc)) {
+                                                Ok(()) => { self.notice = Some(format!("Refund/transfer receipt PDF saved to {}", path)); self.error = None; }
+                                                Err(e) => self.error = Some(format!("Could not save refund/transfer receipt PDF: {e}")),
+                                            }
+                                        } else {
+                                            self.error = Some("No refund/transfer lines found for this payment".into());
+                                        }
+                                    }
+                                }
+                            }
+                        });
                     } else if row.plan_num != 0 && row.credit > 0.005 {
                         if ui.small_button("Refund/transfer").clicked() {
                             quick_refund_plan = Some((row.plan_num, row.credit));
@@ -9627,6 +9688,8 @@ mod tests {
                 credit: 0.0,
                 plan_num: 1,
                 transfer_target: Some(PaymentTarget::Procedure(10)),
+                pay_num: 101,
+                note: "moved to proc".into(),
             },
             LedgerRow {
                 date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
@@ -9636,6 +9699,8 @@ mod tests {
                 credit: 0.0,
                 plan_num: 2,
                 transfer_target: Some(PaymentTarget::Unallocated),
+                pay_num: 102,
+                note: "refund reason".into(),
             },
             LedgerRow {
                 date: chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
@@ -9645,6 +9710,8 @@ mod tests {
                 credit: 20.0,
                 plan_num: 2,
                 transfer_target: None,
+                pay_num: 103,
+                note: String::new(),
             },
         ];
         let filtered = filter_account_ledger_rows(
@@ -9662,6 +9729,8 @@ mod tests {
         let html = render_report_html("Account ledger (filtered)", "", &table);
         assert!(csv.contains("Refund/Transfer"));
         assert!(csv.contains("plan #2"));
+        assert!(csv.contains("Payment #,Note"));
+        assert!(csv.contains("102,refund reason"));
         assert!(!csv.contains("procedure #10"));
         assert!(html.contains("patient account (unallocated)"));
     }

@@ -7,7 +7,7 @@
 //! multiple pages, A4 for statements and A5 for invoices, and a correct
 //! cross-reference table.
 
-use crate::StatementDocument;
+use crate::{RefundTransferReceipt, StatementDocument};
 use od_domain::{Id, InvoiceDocument};
 
 /// Page geometry in PDF points (72 per inch). A5 is 148 x 210 mm.
@@ -233,6 +233,71 @@ pub fn render_statement_pdf(doc: &StatementDocument) -> Vec<u8> {
     }
 
     assemble_pdf(&writer.finish(), doc.pat_num, page, "Statement")
+}
+
+/// Render a refund/transfer receipt as A4 PDF bytes.
+pub fn render_refund_transfer_receipt_pdf(doc: &RefundTransferReceipt) -> Vec<u8> {
+    let title = format!("Refund/Transfer Receipt - {}", doc.patient_name);
+    let mut writer = Writer::new(&title);
+    let page = writer.page;
+    writer.line(
+        "F1",
+        9.0,
+        &format!(
+            "Patient #{}  |  Payment #{}  |  Date {}  |  Generated {}",
+            doc.pat_num, doc.payment_num, doc.pay_date, doc.generated_on
+        ),
+        16.0,
+    );
+    if !doc.recorded_by.trim().is_empty() {
+        writer.line("F1", 9.0, &format!("Recorded by: {}", doc.recorded_by), 14.0);
+    }
+    if !doc.note.trim().is_empty() {
+        writer.line("F2", 10.0, "Reason / note", 14.0);
+        for note_line in doc.note.lines().take(4) {
+            let note_line: String = note_line.chars().take(90).collect();
+            writer.line("F1", 9.0, &note_line, 12.0);
+        }
+    }
+    writer.line("F2", 11.0, "Details", 18.0);
+    writer.columns(
+        "F2",
+        8.5,
+        &[
+            (page.left, "Date".into()),
+            (85.0, "Direction".into()),
+            (310.0, "Amount".into()),
+            (360.0, "Pay#".into()),
+            (405.0, "Plan".into()),
+            (450.0, "Charge".into()),
+        ],
+        14.0,
+    );
+    for line in &doc.lines {
+        let direction: String = line.direction.chars().take(42).collect();
+        writer.columns(
+            "F1",
+            8.5,
+            &[
+                (page.left, line.date.to_string()),
+                (85.0, direction),
+                (right_x(&money(line.amount), 8.5, 345.0), money(line.amount)),
+                (360.0, if line.payment_num == 0 { String::new() } else { line.payment_num.to_string() }),
+                (405.0, if line.plan_num == 0 { String::new() } else { line.plan_num.to_string() }),
+                (450.0, if line.charge_num == 0 { String::new() } else { line.charge_num.to_string() }),
+            ],
+            12.0,
+        );
+    }
+    writer.y -= 6.0;
+    writer.line(
+        "F2",
+        11.0,
+        &format!("Total moved/refunded: {:.2}", doc.total_moved),
+        18.0,
+    );
+    writer.line("F1", 8.0, "odclinic - refund/transfer receipt", 12.0);
+    assemble_pdf(&writer.finish(), doc.pat_num, A4, "RefundTransferReceipt")
 }
 
 /// Render a simplified patient invoice on A5 paper, ready to write to disk.
@@ -516,5 +581,36 @@ mod tests {
         let count: usize = text[start..end].parse().unwrap();
         assert!(count >= 2, "long invoices need more than one A5 page");
         assert!(text.contains("\\(continued\\)"));
+    }
+
+    #[test]
+    fn refund_transfer_receipt_pdf_is_valid() {
+        let doc = crate::RefundTransferReceipt {
+            pat_num: 1,
+            patient_name: "Ada".into(),
+            payment_num: 77,
+            pay_date: NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            generated_on: NaiveDate::from_ymd_opt(2026, 1, 6).unwrap(),
+            note: "Moved credit".into(),
+            recorded_by: "admin".into(),
+            total_moved: 25.0,
+            lines: vec![crate::RefundTransferReceiptLine {
+                date: NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                direction: "Plan #9 -> Patient account (unallocated)".into(),
+                source: "Plan #9".into(),
+                target: "Patient account (unallocated)".into(),
+                amount: 25.0,
+                payment_num: 77,
+                plan_num: 9,
+                charge_num: 0,
+                note: "Moved credit".into(),
+            }],
+        };
+        let bytes = render_refund_transfer_receipt_pdf(&doc);
+        assert_valid_pdf(&bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Refund/Transfer Receipt - Ada"));
+        assert!(text.contains("Total moved/refunded: 25.00"));
+        assert!(text.contains("/Title (RefundTransferReceipt 1)"));
     }
 }

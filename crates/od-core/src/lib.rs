@@ -459,6 +459,34 @@ pub struct StatementLine {
     pub credit: f64,
 }
 
+/// Print-ready content for one patient refund/transfer receipt.
+#[derive(Clone, Debug)]
+pub struct RefundTransferReceipt {
+    pub pat_num: Id,
+    pub patient_name: String,
+    pub payment_num: Id,
+    pub pay_date: chrono::NaiveDate,
+    pub generated_on: chrono::NaiveDate,
+    pub note: String,
+    pub recorded_by: String,
+    pub lines: Vec<RefundTransferReceiptLine>,
+    pub total_moved: f64,
+}
+
+/// One line on a refund/transfer receipt.
+#[derive(Clone, Debug)]
+pub struct RefundTransferReceiptLine {
+    pub date: chrono::NaiveDate,
+    pub direction: String,
+    pub source: String,
+    pub target: String,
+    pub amount: f64,
+    pub payment_num: Id,
+    pub plan_num: Id,
+    pub charge_num: Id,
+    pub note: String,
+}
+
 /// Print-ready content for one patient statement.
 #[derive(Clone, Debug)]
 pub struct StatementDocument {
@@ -565,6 +593,156 @@ fn escape_html(input: &str) -> String {
     out
 }
 
+fn target_label(target: PaymentTarget) -> String {
+    match target {
+        PaymentTarget::Procedure(proc_num) => format!("Procedure #{}", proc_num),
+        PaymentTarget::PayPlan(plan_num) => format!("Plan #{}", plan_num),
+        PaymentTarget::PayPlanCharge { plan_num, charge_num } => {
+            format!("Plan #{} charge #{}", plan_num, charge_num)
+        }
+        PaymentTarget::Unallocated => "Patient account (unallocated)".to_string(),
+    }
+}
+
+/// Build a print-ready refund/transfer receipt from a recorded payment and its splits.
+pub fn build_refund_transfer_receipt(
+    pat_num: Id,
+    patient_name: &str,
+    payment: &Payment,
+    splits: &[PaySplit],
+    recorded_by: &str,
+    generated_on: chrono::NaiveDate,
+) -> Option<RefundTransferReceipt> {
+    let mut receipt_splits: Vec<&PaySplit> = splits
+        .iter()
+        .filter(|s| s.pay_num == payment.pay_num && s.split_amount < -0.005)
+        .collect();
+    receipt_splits.sort_by_key(|s| (s.date_pay, s.split_num));
+    if receipt_splits.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let mut total_moved = 0.0;
+    for split in &receipt_splits {
+        let amount = (-split.split_amount).max(0.0);
+        total_moved += amount;
+        let counterpart = splits.iter().find(|o| {
+            o.pay_num == split.pay_num
+                && o.split_num != split.split_num
+                && o.split_amount > 0.005
+        });
+        let target = counterpart
+            .map(|o| {
+                if o.proc_num != 0 {
+                    PaymentTarget::Procedure(o.proc_num)
+                } else if o.pay_plan_num != 0 && o.pay_plan_num != split.pay_plan_num {
+                    PaymentTarget::PayPlan(o.pay_plan_num)
+                } else if o.pay_plan_charge_num != 0 {
+                    PaymentTarget::PayPlanCharge {
+                        plan_num: o.pay_plan_num,
+                        charge_num: o.pay_plan_charge_num,
+                    }
+                } else {
+                    PaymentTarget::Unallocated
+                }
+            })
+            .unwrap_or(PaymentTarget::Unallocated);
+        let source = if split.pay_plan_charge_num != 0 {
+            format!("Plan #{} charge #{}", split.pay_plan_num, split.pay_plan_charge_num)
+        } else if split.pay_plan_num != 0 {
+            format!("Plan #{}", split.pay_plan_num)
+        } else if split.proc_num != 0 {
+            format!("Procedure #{}", split.proc_num)
+        } else {
+            "Patient account (unallocated)".to_string()
+        };
+        let direction = format!("{} -> {}", source, target_label(target));
+        lines.push(RefundTransferReceiptLine {
+            date: split.date_pay,
+            direction,
+            source,
+            target: target_label(target),
+            amount,
+            payment_num: split.pay_num,
+            plan_num: split.pay_plan_num,
+            charge_num: split.pay_plan_charge_num,
+            note: payment.note.clone(),
+        });
+    }
+
+    Some(RefundTransferReceipt {
+        pat_num,
+        patient_name: patient_name.to_string(),
+        payment_num: payment.pay_num,
+        pay_date: payment.pay_date,
+        generated_on,
+        note: payment.note.clone(),
+        recorded_by: recorded_by.to_string(),
+        lines,
+        total_moved,
+    })
+}
+
+/// Render a refund/transfer receipt as a self-contained HTML page.
+pub fn render_refund_transfer_receipt_html(doc: &RefundTransferReceipt) -> String {
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n");
+    html.push_str("<title>Refund/Transfer Receipt - ");
+    html.push_str(&escape_html(&doc.patient_name));
+    html.push_str("</title>\n<style>\n");
+    html.push_str("body{font-family:Arial,sans-serif;margin:32px;color:#222}\n");
+    html.push_str("h1{font-size:20px;margin:0 0 4px}\n");
+    html.push_str("h2{font-size:14px;margin:24px 0 8px}\n");
+    html.push_str(".muted{color:#666;font-size:12px}\n");
+    html.push_str("table{border-collapse:collapse;width:100%;font-size:13px}\n");
+    html.push_str("th,td{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top}\n");
+    html.push_str("th{background:#f4f4f4}\n");
+    html.push_str(".num{text-align:right;font-variant-numeric:tabular-nums}\n");
+    html.push_str(".total{font-weight:bold;font-size:15px}\n");
+    html.push_str("@media print{button{display:none}}\n");
+    html.push_str("</style></head>\n<body>\n");
+    html.push_str("<button onclick=\"window.print()\">Print receipt</button>\n");
+    html.push_str("<h1>Refund / Transfer Receipt - ");
+    html.push_str(&escape_html(&doc.patient_name));
+    html.push_str("</h1>\n");
+    html.push_str(&format!(
+        "<div class=\"muted\">Patient #{} &middot; Payment #{} &middot; Date {} &middot; Generated {}</div>\n",
+        doc.pat_num, doc.payment_num, doc.pay_date, doc.generated_on
+    ));
+    if !doc.recorded_by.trim().is_empty() {
+        html.push_str(&format!("<div class=\"muted\">Recorded by: {}</div>\n", escape_html(&doc.recorded_by)));
+    }
+    if !doc.note.trim().is_empty() {
+        html.push_str("<h2>Reason / note</h2><p>");
+        html.push_str(&escape_html(&doc.note));
+        html.push_str("</p>\n");
+    }
+    html.push_str("<h2>Details</h2>\n<table><thead><tr><th>Date</th><th>Direction</th><th>Source</th><th>Target</th><th class=\"num\">Amount</th><th>Payment</th><th>Plan</th><th>Charge</th></tr></thead><tbody>\n");
+    for line in &doc.lines {
+        html.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class=\"num\">{:.2}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            line.date,
+            escape_html(&line.direction),
+            escape_html(&line.source),
+            escape_html(&line.target),
+            line.amount,
+            if line.payment_num == 0 { String::new() } else { line.payment_num.to_string() },
+            if line.plan_num == 0 { String::new() } else { line.plan_num.to_string() },
+            if line.charge_num == 0 { String::new() } else { line.charge_num.to_string() },
+        ));
+    }
+    html.push_str("</tbody></table>\n");
+    html.push_str(&format!("<p class=\"total\">Total moved/refunded: {:.2}</p>\n", doc.total_moved));
+    html.push_str("</body></html>\n");
+    html
+}
+
+/// Render a refund/transfer receipt as PDF bytes.
+pub fn render_refund_transfer_receipt_pdf(doc: &RefundTransferReceipt) -> Vec<u8> {
+    crate::pdf::render_refund_transfer_receipt_pdf(doc)
+}
+
 /// Render a statement as a self-contained HTML page. A print button calls
 /// `window.print()`, so opening the file in a browser gives a print preview.
 pub fn render_statement_html(doc: &StatementDocument) -> String {
@@ -663,6 +841,60 @@ mod tests {
             pay_amount: 100.0,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn refund_transfer_receipt_builds_html_and_pdf() {
+        let payment = Payment {
+            pay_num: 77,
+            pat_num: 1,
+            pay_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+            pay_amount: 0.0,
+            note: "Plan credit moved to account".into(),
+            ..Default::default()
+        };
+        let splits = vec![
+            PaySplit {
+                split_num: 1,
+                pay_num: 77,
+                pat_num: 1,
+                pay_plan_num: 9,
+                split_amount: -25.0,
+                date_pay: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                ..Default::default()
+            },
+            PaySplit {
+                split_num: 2,
+                pay_num: 77,
+                pat_num: 1,
+                proc_num: 0,
+                pay_plan_num: 0,
+                split_amount: 25.0,
+                date_pay: chrono::NaiveDate::from_ymd_opt(2026, 1, 5).unwrap(),
+                ..Default::default()
+            },
+        ];
+        let doc = build_refund_transfer_receipt(
+            1,
+            "Ada A",
+            &payment,
+            &splits,
+            "admin",
+            chrono::NaiveDate::from_ymd_opt(2026, 1, 6).unwrap(),
+        )
+        .expect("receipt");
+        assert_eq!(doc.payment_num, 77);
+        assert_eq!(doc.lines.len(), 1);
+        assert!((doc.total_moved - 25.0).abs() < 0.01);
+        assert!(doc.lines[0].direction.contains("Plan #9"));
+        assert!(doc.lines[0].target.contains("Patient account"));
+        let html = render_refund_transfer_receipt_html(&doc);
+        assert!(html.contains("Refund / Transfer Receipt"));
+        assert!(html.contains("Plan credit moved to account"));
+        assert!(html.contains("Total moved/refunded: 25.00"));
+        let pdf = render_refund_transfer_receipt_pdf(&doc);
+        assert!(pdf.starts_with(b"%PDF-1.4"));
+        assert!(pdf.ends_with(b"%%EOF\n"));
     }
 
     #[test]
