@@ -1687,7 +1687,14 @@ fn mysql_local_reports_build_from_live_data() {
         }
     }
 
-    let plan_rows = payment_plan_report(&plans, &charges, &splits, &patients, today);
+    let links = store.list_pay_plan_links().expect("list_pay_plan_links failed");
+    let mut procs = Vec::new();
+    let mut adjs = Vec::new();
+    for p in &patients {
+        procs.extend(store.list_procedures(p.pat_num).unwrap_or_default());
+        adjs.extend(store.list_adjustments(p.pat_num).unwrap_or_default());
+    }
+    let plan_rows = payment_plan_report(&plans, &charges, &splits, &patients, &links, &procs, &adjs, today);
     println!("payment-plan report: {} row(s)", plan_rows.len());
     assert_eq!(
         plan_rows.len(),

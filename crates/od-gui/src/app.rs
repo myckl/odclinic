@@ -6336,6 +6336,15 @@ impl OdApp {
                 let mut charges = Vec::new();
                 let mut seen_splits = HashSet::new();
                 let mut splits = Vec::new();
+                let mut seen_links = HashSet::new();
+                let mut links = Vec::new();
+                let mut procedures = Vec::new();
+                let mut adjustments = Vec::new();
+                for l in self.store.list_pay_plan_links().unwrap_or_default() {
+                    if seen_links.insert(l.pay_plan_link_num) {
+                        links.push(l);
+                    }
+                }
                 for patient in &patients {
                     plans.extend(self.store.list_pay_plans(patient.pat_num).unwrap_or_default());
                     charges.extend(
@@ -6343,6 +6352,8 @@ impl OdApp {
                             .list_pay_plan_charges(patient.pat_num)
                             .unwrap_or_default(),
                     );
+                    procedures.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+                    adjustments.extend(self.store.list_adjustments(patient.pat_num).unwrap_or_default());
                     for split in self.store.list_pay_splits(patient.pat_num).unwrap_or_default() {
                         if seen_splits.insert(split.split_num) {
                             splits.push(split);
@@ -6354,6 +6365,9 @@ impl OdApp {
                     &charges,
                     &splits,
                     &patients,
+                    &links,
+                    &procedures,
+                    &adjustments,
                     self.report_to,
                 ));
             }

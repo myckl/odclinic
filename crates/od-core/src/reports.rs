@@ -203,12 +203,16 @@ pub fn asap_report(
 /// Charges due come from OD `payplancharge` (`principal + interest`, with credit
 /// charges reducing the balance) and receipts from `paysplit.PayPlanNum`. This
 /// is the same calculation the Account module shows, so the report cannot
-/// disagree with the ledger.
+/// disagree with the ledger. Dynamic plans also include issued/expected-due/missing-due
+/// reconciliation as of `as_of`.
 pub fn payment_plan_report(
     plans: &[PayPlan],
     charges: &[PayPlanCharge],
     splits: &[PaySplit],
     patients: &[Patient],
+    links: &[PayPlanLink],
+    procedures: &[Procedure],
+    adjustments: &[Adjustment],
     as_of: NaiveDate,
 ) -> Vec<ReportRow> {
     let mut entries: Vec<(f64, ReportRow)> = plans
@@ -222,8 +226,35 @@ pub fn payment_plan_report(
                 .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_date <= as_of)
                 .count();
             let kind = if plan.is_dynamic { "dynamic" } else { "static" };
+            let recon = if plan.is_dynamic {
+                let own_links: Vec<PayPlanLink> = links
+                    .iter()
+                    .filter(|l| l.pay_plan_num == plan.pay_plan_num)
+                    .cloned()
+                    .collect();
+                let r = crate::reconciliation(
+                    plan,
+                    &own_links,
+                    procedures,
+                    adjustments,
+                    splits,
+                    charges,
+                    as_of,
+                );
+                format!(
+                    " · issued {}/{} due {:.2}/{:.2} · missing due {} {:.2}",
+                    r.issued_count,
+                    r.expected_due_count,
+                    r.issued_total,
+                    r.expected_due_total,
+                    r.missing_due_count,
+                    r.missing_due_total
+                )
+            } else {
+                String::new()
+            };
             let detail = format!(
-                "Plan #{} · {} · {} · {} charge(s) due to date · due now {:.2} · future {:.2} · unapplied {:.2} · {}",
+                "Plan #{} · {} · {} · {} charge(s) due to date · due now {:.2} · future {:.2} · unapplied {:.2}{} · {}",
                 plan.pay_plan_num,
                 kind,
                 if plan.is_closed { "closed" } else { "open" },
@@ -231,6 +262,7 @@ pub fn payment_plan_report(
                 due_now_signed,
                 breakdown.future_due,
                 breakdown.unapplied_credit,
+                recon,
                 plan.pay_plan_date
             );
             (
@@ -3888,6 +3920,9 @@ mod tests {
             &charges,
             &splits,
             &patients,
+            &[],
+            &[],
+            &[],
             day(2026, 11, 21),
         );
         assert_eq!(rows.len(), 2, "patient row plus total row");
@@ -3930,11 +3965,38 @@ mod tests {
             date_pay: day(2026, 1, 15),
             ..Default::default()
         }];
-        let rows = payment_plan_report(&[plan], &charges, &splits, &patients, day(2026, 2, 1));
+        let rows = payment_plan_report(&[plan], &charges, &splits, &patients, &[], &[], &[], day(2026, 2, 1));
         assert_eq!(rows[0].value, "160.00");
         assert!(rows[0].detail.contains("dynamic"));
         assert!(rows[0].detail.contains("due now 60.00"));
         assert!(rows[0].detail.contains("future 100.00"));
+    }
+
+    #[test]
+    fn payment_plan_report_shows_dynamic_reconciliation() {
+        let patients = [patient(1, "Alvarez")];
+        let plan = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 1,
+            pay_plan_date: day(2026, 1, 1),
+            is_dynamic: true,
+            pay_amt: 100.0,
+            charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            date_pay_plan_start: Some(day(2026, 1, 1)),
+            ..Default::default()
+        };
+        let links = [PayPlanLink { pay_plan_link_num: 1, pay_plan_num: 8, link_type: PayPlanLink::PROCEDURE, fkey: 100, ..Default::default() }];
+        let procedures = [Procedure { proc_num: 100, pat_num: 1, proc_status: ProcedureStatus::Complete, fee: 300.0, proc_date: day(2026, 1, 2), ..Default::default() }];
+        // Only Jan issued as of mid-Feb; Feb is due but missing, Mar future.
+        let charges = [PayPlanCharge {
+            pay_plan_num: 8, charge_date: day(2026, 1, 1), charge_type: PayPlanChargeType::Debit,
+            principal: 100.0, fkey: 100, link_type: PayPlanLink::PROCEDURE, ..Default::default()
+        }];
+        let rows = payment_plan_report(&[plan], &charges, &[], &patients, &links, &procedures, &[], day(2026, 2, 15));
+        assert!(rows[0].detail.contains("issued 1/2"), "detail: {}", rows[0].detail);
+        assert!(rows[0].detail.contains("missing due 1"), "detail: {}", rows[0].detail);
+        assert!(rows[0].detail.contains("100.00/200.00"), "detail: {}", rows[0].detail);
     }
 
     #[test]
@@ -3968,7 +4030,7 @@ mod tests {
         ];
         let splits = [PaySplit { pay_plan_num: 8, split_amount: 150.0, date_pay: day(2026, 2, 15), ..Default::default() }];
         let as_of_mid_period = day(2026, 2, 15);
-        let rows = payment_plan_report(&[plan], &charges, &splits, &patients, as_of_mid_period);
+        let rows = payment_plan_report(&[plan], &charges, &splits, &patients, &[], &[], &[], as_of_mid_period);
         assert_eq!(rows[0].value, "150.00");
         assert!(rows[0].detail.contains("due now 50.00"));
         assert!(rows[0].detail.contains("future 100.00"));
