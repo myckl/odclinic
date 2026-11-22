@@ -3929,8 +3929,8 @@ fn mysql_live_pay_plan_breakdown_reports_unapplied_credit() {
     let plan = store.list_pay_plans(pat_num).unwrap().into_iter().find(|p| p.pay_plan_num == plan_num).unwrap();
     let b = od_core::pay_plan_balance_breakdown(&plan, &store.list_pay_plan_charges(pat_num).unwrap(), &store.list_pay_splits(pat_num).unwrap(), today + chrono::Duration::days(1));
     assert!((b.due_now - 0.0).abs() < 0.01);
-    assert!((b.future_due - 50.0).abs() < 0.01);
-    assert!((b.unapplied_credit - 20.0).abs() < 0.01);
+    assert!((b.future_due - 30.0).abs() < 0.01);
+    assert!((b.unapplied_credit - 0.0).abs() < 0.01);
 
     let _ = conn.exec_drop("DELETE FROM paysplit WHERE PayNum=?", (pay_num,));
     let _ = conn.exec_drop("DELETE FROM payment WHERE PayNum=?", (pay_num,));

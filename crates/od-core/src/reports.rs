@@ -25,7 +25,7 @@ use od_domain::reports::{
 use od_domain::*;
 
 use crate::{
-    asap_appointments, pay_plan_balance, pay_plan_due_now, recall_due_date, recall_due_state,
+    asap_appointments, recall_due_date, recall_due_state,
     treat_plan_total, RecallDueState,
 };
 
@@ -214,20 +214,23 @@ pub fn payment_plan_report(
     let mut entries: Vec<(f64, ReportRow)> = plans
         .iter()
         .map(|plan| {
-            let balance = pay_plan_balance(plan, charges, splits, as_of);
-            let due_now = pay_plan_due_now(plan, charges, splits, as_of);
+            let breakdown = crate::pay_plan_balance_breakdown(plan, charges, splits, as_of);
+            let balance = breakdown.total_balance - breakdown.unapplied_credit;
+            let due_now_signed = breakdown.due_now - if breakdown.due_now <= 0.005 { breakdown.unapplied_credit } else { 0.0 };
             let charge_count = charges
                 .iter()
                 .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_date <= as_of)
                 .count();
             let kind = if plan.is_dynamic { "dynamic" } else { "static" };
             let detail = format!(
-                "Plan #{} · {} · {} · {} charge(s) due to date · due now {:.2} · {}",
+                "Plan #{} · {} · {} · {} charge(s) due to date · due now {:.2} · future {:.2} · unapplied {:.2} · {}",
                 plan.pay_plan_num,
                 kind,
                 if plan.is_closed { "closed" } else { "open" },
                 charge_count,
-                due_now,
+                due_now_signed,
+                breakdown.future_due,
+                breakdown.unapplied_credit,
                 plan.pay_plan_date
             );
             (
@@ -242,15 +245,23 @@ pub fn payment_plan_report(
         .collect();
     entries.sort_by(|a, b| b.0.total_cmp(&a.0));
     let total: f64 = entries.iter().map(|(balance, _)| *balance).sum();
-    let total_due: f64 = plans
-        .iter()
-        .map(|p| pay_plan_due_now(p, charges, splits, as_of))
-        .sum();
+    let mut total_due = 0.0_f64;
+    let mut total_future = 0.0_f64;
+    let mut total_unapplied = 0.0_f64;
+    for p in plans {
+        let b = crate::pay_plan_balance_breakdown(p, charges, splits, as_of);
+        total_due += b.due_now - if b.due_now <= 0.005 { b.unapplied_credit } else { 0.0 };
+        total_future += b.future_due;
+        total_unapplied += b.unapplied_credit;
+    }
     let mut rows: Vec<ReportRow> = entries.into_iter().map(|(_, row)| row).collect();
     rows.push(ReportRow::new(
         "Total outstanding",
         format!("{total:.2}"),
-        format!("{} plan(s) · due now {:.2}", plans.len(), total_due),
+        format!(
+            "{} plan(s) · due now {:.2} · future {:.2} · unapplied {:.2}",
+            plans.len(), total_due, total_future, total_unapplied
+        ),
     ));
     rows
 }
@@ -1136,35 +1147,11 @@ pub fn pay_plan_detail_report(
             .filter(|split| split.pay_plan_num == plan.pay_plan_num)
             .map(|split| split.split_amount)
             .sum();
-        let accum_due: f64 = debits
-            .iter()
-            .filter(|charge| charge.charge_date <= as_of)
-            .map(|charge| charge.principal + charge.interest)
-            .sum::<f64>()
-            - own_charges
-                .iter()
-                .filter(|charge| {
-                    charge.charge_type == PayPlanChargeType::Credit && charge.charge_date <= as_of
-                })
-                .map(|charge| charge.principal)
-                .sum::<f64>();
-        let due_raw = accum_due - paid;
-        let unapplied_credit = (-due_raw).max(0.0);
-        let due = due_raw.max(0.0);
-        let future_due: f64 = debits
-            .iter()
-            .filter(|charge| charge.charge_date > as_of)
-            .map(|charge| charge.principal + charge.interest)
-            .sum::<f64>()
-            - own_charges
-                .iter()
-                .filter(|charge| {
-                    charge.charge_type == PayPlanChargeType::Credit && charge.charge_date > as_of
-                })
-                .map(|charge| charge.principal)
-                .sum::<f64>();
-        let not_due = future_due.max(0.0);
-        let balance = due + not_due;
+        let breakdown = crate::pay_plan_balance_breakdown(plan, charges, splits, as_of);
+        let due = breakdown.due_now;
+        let unapplied_credit = breakdown.unapplied_credit;
+        let not_due = breakdown.future_due;
+        let balance = breakdown.total_balance;
         let family_balance = family_balances
             .iter()
             .find(|(pat_num, _)| *pat_num == plan.guarantor)
@@ -3886,6 +3873,7 @@ mod tests {
         let splits = [PaySplit {
             pay_plan_num: 5,
             split_amount: 30.0,
+            date_pay: day(2026, 11, 1),
             ..Default::default()
         }];
         let rows = payment_plan_report(
@@ -3932,12 +3920,31 @@ mod tests {
         let splits = [PaySplit {
             pay_plan_num: 7,
             split_amount: 40.0,
+            date_pay: day(2026, 1, 15),
             ..Default::default()
         }];
         let rows = payment_plan_report(&[plan], &charges, &splits, &patients, day(2026, 2, 1));
-        assert_eq!(rows[0].value, "60.00"); // only Jan due as of Feb 1: 100-40
+        assert_eq!(rows[0].value, "160.00");
         assert!(rows[0].detail.contains("dynamic"));
         assert!(rows[0].detail.contains("due now 60.00"));
+        assert!(rows[0].detail.contains("future 100.00"));
+    }
+
+    #[test]
+    fn payment_plan_report_partial_period_reconciliation() {
+        let patients = [patient(1, "Alvarez")];
+        let plan = PayPlan { pay_plan_num: 8, pat_num: 1, pay_plan_date: day(2026, 1, 1), ..Default::default() };
+        let charges = [
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 1, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 2, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 3, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, ..Default::default() },
+        ];
+        let splits = [PaySplit { pay_plan_num: 8, split_amount: 150.0, date_pay: day(2026, 2, 15), ..Default::default() }];
+        let as_of_mid_period = day(2026, 2, 15);
+        let rows = payment_plan_report(&[plan], &charges, &splits, &patients, as_of_mid_period);
+        assert_eq!(rows[0].value, "150.00");
+        assert!(rows[0].detail.contains("due now 50.00"));
+        assert!(rows[0].detail.contains("future 100.00"));
     }
 
     #[test]

@@ -79,6 +79,7 @@ pub use treatment_plan::{
     validate_treat_plan,
 };
 
+use chrono::Datelike;
 use od_domain::*;
 
 /// Appointment numbers that overlap `candidate` in the same operatory or with
@@ -287,55 +288,53 @@ pub fn allocate_plan_payment(
 
 /// Amount still owing on a payment plan as of `as_of`.
 ///
-/// Mirrors OD's account view: only charges due on or before `as_of` affect the
-/// balance, and paysplits with `PayPlanNum` are credits. `DownPayment` is not
-/// subtracted here because OD records it as a paysplit; subtracting it again
-/// would double-count. Credit charges (production moved onto the plan) reduce
-/// the amount due, as they do in payment-plan version 2.
+/// Mirrors OD's account view: charges due on or before `as_of` affect the due-now
+/// amount, and paysplits with `PayPlanNum` are credits. Payments are applied in
+/// payment date order (`date_pay`, then `split_num`) so backdated payments do not
+/// erase later-due charges that were not yet due at the payment date.
+/// `DownPayment` is not subtracted here because OD records it as a paysplit.
+/// Credit charges (production moved onto the plan) reduce the amount due.
 pub fn pay_plan_balance(
     plan: &PayPlan,
     charges: &[PayPlanCharge],
     splits: &[PaySplit],
     as_of: chrono::NaiveDate,
 ) -> f64 {
-    let charged: f64 = charges
-        .iter()
-        .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_date <= as_of)
-        .map(|c| match c.charge_type {
-            PayPlanChargeType::Debit => c.principal + c.interest,
-            PayPlanChargeType::Credit => -c.principal,
-        })
-        .sum();
-    let paid: f64 = splits
-        .iter()
-        .filter(|s| s.pay_plan_num == plan.pay_plan_num)
-        .map(|s| s.split_amount)
-        .sum();
-    charged - paid
+    let b = pay_plan_balance_breakdown(plan, charges, splits, as_of);
+    b.total_balance - b.unapplied_credit
 }
 
 /// Breakdown of payment-plan amounts for clear billing visibility.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PayPlanBalanceBreakdown {
-    /// Charges/credits due on or before `as_of`, minus payments applied to plan.
+    /// Charges/credits due on or before `as_of`, minus payments effectively applied by `as_of`.
     pub due_now: f64,
     /// Charges due after `as_of` (future schedule), not yet due.
     pub future_due: f64,
-    /// Payments applied beyond due-now amount; credit/overpaid on plan.
+    /// Payments applied beyond total plan charges as of `as_of`; credit/overpaid on plan.
     pub unapplied_credit: f64,
-    /// Total balance as of `as_of` including future-due charges: due_now + future_due.
+    /// Net plan balance as of `as_of`: max(due_now + future_due - unapplied_credit, 0).
     pub total_balance: f64,
 }
 
+fn round_money(amount: f64) -> f64 {
+    (amount * 100.0).round() / 100.0
+}
+
 /// Compute due-now / future-due / unapplied-credit for a payment plan.
+///
+/// Payments are applied chronologically. A payment can only reduce due-now up to
+/// charges that were due on/before that payment date; any remaining amount reduces
+/// future-due. This prevents backdated payments from incorrectly wiping later-due
+/// charges in "due now" and keeps partial-period reconciliation stable.
 pub fn pay_plan_balance_breakdown(
     plan: &PayPlan,
     charges: &[PayPlanCharge],
     splits: &[PaySplit],
     as_of: chrono::NaiveDate,
 ) -> PayPlanBalanceBreakdown {
-    let mut due_now_charges = 0.0;
-    let mut future_due = 0.0;
+    let mut due_now_charges = 0.0_f64;
+    let mut future_due_charges = 0.0_f64;
     for c in charges.iter().filter(|c| c.pay_plan_num == plan.pay_plan_num) {
         let amt = match c.charge_type {
             PayPlanChargeType::Debit => c.principal + c.interest,
@@ -344,22 +343,85 @@ pub fn pay_plan_balance_breakdown(
         if c.charge_date <= as_of {
             due_now_charges += amt;
         } else {
-            future_due += amt;
+            future_due_charges += amt;
         }
     }
-    let paid: f64 = splits
+
+    let mut plan_splits: Vec<&PaySplit> = splits
         .iter()
-        .filter(|s| s.pay_plan_num == plan.pay_plan_num)
-        .map(|s| s.split_amount)
-        .sum();
-    let raw_due_now = due_now_charges - paid;
-    let unapplied_credit = (-raw_due_now).max(0.0);
+        .filter(|s| {
+            s.pay_plan_num == plan.pay_plan_num
+                && (s.date_pay == chrono::NaiveDate::default() || s.date_pay.year() <= 1 || s.date_pay <= as_of)
+        })
+        .collect();
+    plan_splits.sort_by_key(|s| (s.date_pay, s.split_num));
+
+    let mut due_now_paid = 0.0_f64;
+    let mut future_paid = 0.0_f64;
+    for split in plan_splits {
+        let mut amt = split.split_amount;
+        if amt.abs() <= 0.000_005 {
+            continue;
+        }
+        if amt > 0.0 {
+            // Default/zero dates (legacy/test rows) are treated as as_of.
+            // Backdated payments can satisfy charges that were due on/before payment date,
+            // then charges that became due by as_of, then future charges.
+            let effective_date = if split.date_pay == chrono::NaiveDate::default() || split.date_pay.year() <= 1 { as_of } else { split.date_pay };
+            let due_at_payment: f64 = charges
+                .iter()
+                .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_date <= effective_date.min(as_of))
+                .map(|c| match c.charge_type {
+                    PayPlanChargeType::Debit => c.principal + c.interest,
+                    PayPlanChargeType::Credit => -c.principal,
+                })
+                .sum();
+            let due_now_as_of: f64 = charges
+                .iter()
+                .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_date <= as_of)
+                .map(|c| match c.charge_type {
+                    PayPlanChargeType::Debit => c.principal + c.interest,
+                    PayPlanChargeType::Credit => -c.principal,
+                })
+                .sum();
+            let can_apply_due_at_payment = (due_at_payment - due_now_paid).max(0.0);
+            let apply_due_at_payment = amt.min(can_apply_due_at_payment);
+            due_now_paid += apply_due_at_payment;
+            amt -= apply_due_at_payment;
+
+            if amt > 0.000_005 {
+                let can_apply_due_now_as_of = (due_now_as_of - due_now_paid).max(0.0);
+                let apply_due_now_as_of = amt.min(can_apply_due_now_as_of);
+                due_now_paid += apply_due_now_as_of;
+                amt -= apply_due_now_as_of;
+            }
+            if amt > 0.000_005 {
+                future_paid += amt;
+            }
+        } else {
+            // Negative split/refund increases balance; apply to due-now first.
+            let refund = -amt;
+            let restore_future = refund.min(future_paid.max(0.0));
+            future_paid -= restore_future;
+            let remaining_refund = refund - restore_future;
+            if remaining_refund > 0.000_005 {
+                due_now_paid -= remaining_refund;
+            }
+        }
+    }
+
+    let raw_due_now = due_now_charges - due_now_paid;
+    let raw_future = future_due_charges - future_paid;
     let due_now = raw_due_now.max(0.0);
+    let future_due = raw_future.max(0.0);
+    let unapplied_credit = (-raw_due_now).max(0.0) + (-raw_future).max(0.0);
+    let total_balance = (due_now + future_due).max(0.0);
+
     PayPlanBalanceBreakdown {
-        due_now,
-        future_due: future_due.max(0.0),
-        unapplied_credit,
-        total_balance: due_now + future_due.max(0.0),
+        due_now: round_money(due_now),
+        future_due: round_money(future_due),
+        unapplied_credit: round_money(unapplied_credit),
+        total_balance: round_money(total_balance),
     }
 }
 
@@ -1139,13 +1201,22 @@ mod tests {
         let splits = vec![PaySplit {
             pay_plan_num: 9,
             split_amount: 50.0,
+            date_pay: chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
             ..Default::default()
         }];
         let before = chrono::NaiveDate::from_ymd_opt(2026, 10, 14).unwrap();
         let after_first = chrono::NaiveDate::from_ymd_opt(2026, 10, 20).unwrap();
 
-        assert_eq!(pay_plan_balance(&plan, &charges, &splits, before), -50.0);
-        assert_eq!(pay_plan_balance(&plan, &charges, &splits, after_first), 100.0);
+        // Before first charge due: payment is unapplied/early credit against future schedule.
+        let b_before = pay_plan_balance_breakdown(&plan, &charges, &splits, before);
+        assert!((b_before.due_now - 0.0).abs() < 0.01);
+        assert!((b_before.future_due - 550.0).abs() < 0.01);
+        assert!((b_before.unapplied_credit - 0.0).abs() < 0.01);
+        assert!((pay_plan_balance(&plan, &charges, &splits, before) - 550.0).abs() < 0.01);
+
+        let b_after = pay_plan_balance_breakdown(&plan, &charges, &splits, after_first);
+        assert!((b_after.due_now - 100.0).abs() < 0.01);
+        assert!((pay_plan_balance(&plan, &charges, &splits, after_first) - 550.0).abs() < 0.01);
     }
 
     #[test]
@@ -1211,11 +1282,57 @@ mod tests {
             PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,1,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
             PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,3,1).unwrap(), principal: 50.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
         ];
-        let splits = vec![PaySplit { pay_plan_num: 1, split_amount: 120.0, ..Default::default() }];
+        let splits = vec![PaySplit { pay_plan_num: 1, split_amount: 120.0, date_pay: chrono::NaiveDate::from_ymd_opt(2026,2,1).unwrap(), ..Default::default() }];
         let b = pay_plan_balance_breakdown(&plan, &charges, &splits, chrono::NaiveDate::from_ymd_opt(2026,2,1).unwrap());
         assert!((b.due_now - 0.0).abs() < 0.01);
-        assert!((b.future_due - 50.0).abs() < 0.01);
-        assert!((b.unapplied_credit - 20.0).abs() < 0.01);
+        assert!((b.future_due - 30.0).abs() < 0.01);
+        assert!((b.unapplied_credit - 0.0).abs() < 0.01);
+        assert!((b.total_balance - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn backdated_payment_does_not_hide_later_due_now() {
+        let plan = PayPlan { pay_plan_num: 1, ..Default::default() };
+        let charges = vec![
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,1,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,2,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+        ];
+        let splits = vec![PaySplit { pay_plan_num: 1, split_amount: 100.0, date_pay: chrono::NaiveDate::from_ymd_opt(2026,1,5).unwrap(), split_num: 2, ..Default::default() }];
+        let b = pay_plan_balance_breakdown(&plan, &charges, &splits, chrono::NaiveDate::from_ymd_opt(2026,2,15).unwrap());
+        assert!((b.due_now - 100.0).abs() < 0.01);
+        assert!((b.future_due - 0.0).abs() < 0.01);
+        assert!((b.unapplied_credit - 0.0).abs() < 0.01);
+        assert!((b.total_balance - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn adjustment_credit_after_charges_reduces_due_now() {
+        let plan = PayPlan { pay_plan_num: 1, ..Default::default() };
+        let charges = vec![
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,1,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,1,15).unwrap(), principal: 20.0, charge_type: PayPlanChargeType::Credit, ..Default::default() },
+        ];
+        let splits = vec![PaySplit { pay_plan_num: 1, split_amount: 50.0, date_pay: chrono::NaiveDate::from_ymd_opt(2026,1,20).unwrap(), ..Default::default() }];
+        let b = pay_plan_balance_breakdown(&plan, &charges, &splits, chrono::NaiveDate::from_ymd_opt(2026,1,31).unwrap());
+        assert!((b.due_now - 30.0).abs() < 0.01);
+        assert!((b.total_balance - 30.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn partial_period_reconciliation_mid_period_as_of() {
+        let plan = PayPlan { pay_plan_num: 1, ..Default::default() };
+        let charges = vec![
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,1,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,2,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 1, charge_date: chrono::NaiveDate::from_ymd_opt(2026,3,1).unwrap(), principal: 100.0, charge_type: PayPlanChargeType::Debit, ..Default::default() },
+        ];
+        // Payment on Feb 15 applies to due-now through Feb 15 (Jan+Feb), not Mar.
+        let splits = vec![PaySplit { pay_plan_num: 1, split_amount: 150.0, date_pay: chrono::NaiveDate::from_ymd_opt(2026,2,15).unwrap(), ..Default::default() }];
+        let mid_feb = chrono::NaiveDate::from_ymd_opt(2026,2,15).unwrap();
+        let b = pay_plan_balance_breakdown(&plan, &charges, &splits, mid_feb);
+        assert!((b.due_now - 50.0).abs() < 0.01);
+        assert!((b.future_due - 100.0).abs() < 0.01);
+        assert!((b.total_balance - 150.0).abs() < 0.01);
     }
 
     #[test]
