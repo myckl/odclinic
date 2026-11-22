@@ -3379,7 +3379,61 @@ impl OdApp {
                     "Dynamic portfolio (as of {as_of}): {dyn_count} plan(s) · issued {dyn_issued_count}/{dyn_expected_due_count} due {dyn_issued_total:.2}/{dyn_expected_due_total:.2} · missing due {dyn_missing_due_count} {dyn_missing_due_total:.2}"
                 ));
                 if dyn_missing_due_count > 0 {
-                    ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Some dynamic plans have missing due charges for this as-of date.");
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Some dynamic plans have missing due charges for this as-of date.");
+                        if self.can(Permission::BILLING) && ui.button("Reconcile/issue all due").clicked() {
+                            let mut total_issued = 0usize;
+                            let mut plans_touched = 0usize;
+                            let mut errors: Vec<String> = Vec::new();
+                            for p in &plans {
+                                if !p.is_dynamic {
+                                    continue;
+                                }
+                                let p_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == p.pay_plan_num).cloned().collect();
+                                if let Some(reason) = od_core::issuance_block(p, &p_links) {
+                                    errors.push(format!("Plan #{}: {}", p.pay_plan_num, reason));
+                                    continue;
+                                }
+                                let existing: Vec<PayPlanCharge> = plan_charges.iter().filter(|c| c.pay_plan_num == p.pay_plan_num).cloned().collect();
+                                let due = od_core::issue_charges_due(p, &p_links, &procedures, &adjustments, &splits, &existing, as_of);
+                                if due.is_empty() {
+                                    continue;
+                                }
+                                let mut plan_error = None;
+                                let mut issued = 0usize;
+                                for charge in due {
+                                    match self.store.upsert_pay_plan_charge(&charge) {
+                                        Ok(_) => issued += 1,
+                                        Err(e) => { plan_error = Some(e); break; }
+                                    }
+                                }
+                                if let Some(e) = plan_error {
+                                    errors.push(format!("Plan #{}: {}", p.pay_plan_num, e));
+                                }
+                                if issued > 0 {
+                                    plans_touched += 1;
+                                    total_issued += issued;
+                                    self.audit_if(
+                                        FeatureKey::AuditBillingChanges,
+                                        Permission::BILLING,
+                                        p.pat_num,
+                                        format!("Issued {} dynamic charge(s) for plan {} (portfolio reconcile as of {})", issued, p.pay_plan_num, as_of),
+                                    );
+                                }
+                            }
+                            if errors.is_empty() {
+                                self.error = None;
+                                self.notice = Some(if total_issued == 0 {
+                                    "No dynamic charges due to issue".into()
+                                } else {
+                                    format!("Issued {total_issued} charge(s) across {plans_touched} plan(s)")
+                                });
+                            } else {
+                                self.notice = if total_issued > 0 { Some(format!("Issued {total_issued} charge(s) across {plans_touched} plan(s); some plans had errors")) } else { None };
+                                self.error = Some(errors.join("; "));
+                            }
+                        }
+                    });
                 }
                 ui.separator();
             }
