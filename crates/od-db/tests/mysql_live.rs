@@ -3987,7 +3987,9 @@ fn mysql_live_dynamic_plan_stale_resolution() {
     let after: Vec<PayPlanCharge> = store.list_pay_plan_charges(pat_num).unwrap().into_iter().filter(|c| c.pay_plan_num == plan_num).collect();
     let rec_after = od_core::reconciliation(&plan, &links, &procs, &adjs, &splits, &after, as_of);
     assert_eq!(rec_after.stale_issued_count, 0, "stale should be resolved: {rec_after:?}");
-    assert!(after.iter().any(|c| c.note.contains("Stale resolved") && (c.principal + c.interest).abs() < 0.01));
+    assert!(after.iter().any(|c| c.note.contains("Stale resolved")
+        && c.note.contains("live test production reduced")
+        && (c.principal + c.interest).abs() < 0.01));
 
     let _ = conn.exec_drop("DELETE FROM payplancharge WHERE PayPlanNum=?", (plan_num,));
     let _ = conn.exec_drop("DELETE FROM payplanlink WHERE PayPlanLinkNum=?", (link_num,));

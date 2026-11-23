@@ -9,7 +9,7 @@ mod eservices;
 
 use definitions::DefinitionsTab;
 use eservices::EServicesTab;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
@@ -1209,6 +1209,9 @@ struct OdApp {
 
     // Payment plan state.
     plan_recon_as_of_text: String,
+    /// Staff-entered reason for each plan's stale-charge resolution, keyed by
+    /// `PayPlanNum`; required before "Resolve stale charges (safe)" is allowed.
+    stale_resolution_reasons: HashMap<Id, String>,
     plan_edit: Option<PayPlan>,
     plan_edit_open: bool,
     plan_amount_text: String,
@@ -1455,6 +1458,7 @@ impl OdApp {
             account_ledger_export_path: String::new(),
             plan_refund_transfer_target: PaymentTarget::Unallocated,
             plan_recon_as_of_text: chrono::Local::now().format("%Y-%m-%d").to_string(),
+            stale_resolution_reasons: HashMap::new(),
             plan_edit: None,
             plan_edit_open: false,
             plan_amount_text: String::new(),
@@ -1759,14 +1763,21 @@ impl OdApp {
         adjustments: &[Adjustment],
         splits: &[PaySplit],
         plan_charges: &[PayPlanCharge],
+        reason: &str,
         as_of: chrono::NaiveDate,
     ) {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            self.notice = None;
+            self.error = Some("Enter a resolution reason before resolving stale charges.".into());
+            return;
+        }
         let (_own, _due, _full, stale) = od_core::reconciliation_detail(plan, own_links, procedures, adjustments, splits, plan_charges, as_of);
         if stale.is_empty() {
             self.notice = Some("No stale dynamic charges to resolve".into());
             return;
         }
-        let res = od_core::resolve_stale_issued_charges(&stale, as_of, "production/terms changed");
+        let res = od_core::resolve_stale_issued_charges(&stale, as_of, reason);
         let mut resolved = 0usize;
         let mut errors = Vec::new();
         for c in &res.resolved {
@@ -1780,7 +1791,7 @@ impl OdApp {
                 FeatureKey::AuditBillingChanges,
                 Permission::BILLING,
                 plan.pat_num,
-                format!("Resolved {resolved} stale dynamic charge(s) for plan {} (as of {}, blocked {})", plan.pay_plan_num, as_of, res.blocked_with_splits.len()),
+                format!("Resolved {resolved} stale dynamic charge(s) for plan {} (as of {}, reason: {}, blocked {})", plan.pay_plan_num, as_of, reason, res.blocked_with_splits.len()),
             );
         }
         if errors.is_empty() {
@@ -3631,8 +3642,32 @@ impl OdApp {
                                             ui.label(line);
                                         }
                                     });
-                                if self.can(Permission::BILLING) && ui.small_button("Resolve stale charges (safe)").clicked() {
-                                    self.resolve_stale_dynamic_plan_charges(plan, &own_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
+                                if self.can(Permission::BILLING) {
+                                    let reason = self
+                                        .stale_resolution_reasons
+                                        .entry(plan.pay_plan_num)
+                                        .or_default();
+                                    ui.horizontal(|ui| {
+                                        ui.label("Resolution reason");
+                                        ui.add(
+                                            egui::TextEdit::singleline(reason)
+                                                .desired_width(280.0)
+                                                .hint_text("Required; saved on charges and audit log"),
+                                        );
+                                    });
+                                    let reason = reason.trim().to_string();
+                                    if ui.small_button("Resolve stale charges (safe)").clicked() {
+                                        self.resolve_stale_dynamic_plan_charges(
+                                            plan,
+                                            &own_links,
+                                            &procedures,
+                                            &adjustments,
+                                            &splits,
+                                            &plan_charges,
+                                            &reason,
+                                            as_of,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -10089,14 +10124,25 @@ mod tests {
         assert!(evidence.iter().any(|line| line.contains("issued")
             && line.contains("expected")
             && line.contains("no splits")), "stale evidence preview missing: {evidence:?}");
-        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
+        // Empty reason must block resolution before any row is changed.
+        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, "", as_of);
+        assert!(app.error.as_deref().unwrap_or("").contains("resolution reason"));
+        assert!(app.notice.is_none());
+        let unchanged = app.store.list_pay_plan_charges(pat_num).unwrap();
+        assert!(unchanged.iter().any(|c| c.pay_plan_num == plan_num && !od_core::is_stale_resolved_charge(c)));
+
+        let reason = "procedure fee corrected after chart review";
+        app.stale_resolution_reasons.insert(plan_num, reason.into());
+        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, reason, as_of);
         let notice = app.notice.clone().unwrap_or_default();
         assert!(notice.contains("Resolved"), "notice: {notice}; err: {:?}", app.error);
         let after = app.store.list_pay_plan_charges(pat_num).unwrap();
-        let stale_zeroed = after.iter().any(|c| c.pay_plan_num == plan_num && c.note.contains("Stale resolved") && (c.principal + c.interest).abs() < 0.01);
-        assert!(stale_zeroed, "stale charge should be zeroed and annotated");
+        let stale_zeroed = after.iter().any(|c| c.pay_plan_num == plan_num && c.note.contains("Stale resolved") && c.note.contains(reason) && (c.principal + c.interest).abs() < 0.01);
+        assert!(stale_zeroed, "stale charge should be zeroed and annotated with the staff reason");
         let logs = app.store.list_security_log(200).unwrap();
-        assert!(logs.iter().any(|l| l.log_text.contains("Resolved") && l.log_text.contains("stale dynamic charge")), "audit missing");
+        assert!(logs.iter().any(|l| l.log_text.contains("Resolved")
+            && l.log_text.contains("stale dynamic charge")
+            && l.log_text.contains(reason)), "audit log missing staff reason");
     }
 
     #[test]

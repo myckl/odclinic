@@ -585,8 +585,9 @@ pub fn stale_charge_evidence(stale: &[StaleIssuedCharge]) -> Vec<String> {
 
 /// Explicit staff resolution for stale/over-issued dynamic-plan debits.
 /// Safe behavior: only charges with no applied splits are resolved by zeroing
-/// principal/interest and annotating the note; financial history row is kept.
-/// Charges with applied splits are reported as blocked.
+/// principal/interest and annotating the note with the staff-supplied `reason`;
+/// the financial history row is kept. Callers should require a non-empty
+/// reason. Charges with applied splits are reported as blocked.
 #[derive(Clone, Debug, Default)]
 pub struct StaleResolutionResult {
     pub resolved: Vec<PayPlanCharge>,
@@ -600,7 +601,7 @@ pub fn resolve_stale_issued_charges(
 ) -> StaleResolutionResult {
     let mut out = StaleResolutionResult::default();
     let reason = reason.trim();
-    let reason = if reason.is_empty() { "production/terms changed" } else { reason };
+    let reason = if reason.is_empty() { "reason not recorded" } else { reason };
     for s in stale {
         if s.has_splits {
             out.blocked_with_splits.push(s.charge.pay_plan_charge_num);
@@ -991,6 +992,7 @@ mod tests {
         for c in &res.resolved {
             assert_eq!(round2(c.principal + c.interest), 0.0);
             assert!(c.note.contains("Stale resolved"));
+            assert!(c.note.contains("production reduced"), "reason missing from annotation: {}", c.note);
         }
     }
 
