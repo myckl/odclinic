@@ -1733,6 +1733,52 @@ impl OdApp {
         }
     }
 
+    fn resolve_stale_dynamic_plan_charges(
+        &mut self,
+        plan: &PayPlan,
+        own_links: &[PayPlanLink],
+        procedures: &[Procedure],
+        adjustments: &[Adjustment],
+        splits: &[PaySplit],
+        plan_charges: &[PayPlanCharge],
+        as_of: chrono::NaiveDate,
+    ) {
+        let (_own, _due, _full, stale) = od_core::reconciliation_detail(plan, own_links, procedures, adjustments, splits, plan_charges, as_of);
+        if stale.is_empty() {
+            self.notice = Some("No stale dynamic charges to resolve".into());
+            return;
+        }
+        let res = od_core::resolve_stale_issued_charges(&stale, as_of, "production/terms changed");
+        let mut resolved = 0usize;
+        let mut errors = Vec::new();
+        for c in &res.resolved {
+            match self.store.upsert_pay_plan_charge(c) {
+                Ok(_) => resolved += 1,
+                Err(e) => errors.push(format!("#{}: {e}", c.pay_plan_charge_num)),
+            }
+        }
+        if resolved > 0 {
+            self.audit_if(
+                FeatureKey::AuditBillingChanges,
+                Permission::BILLING,
+                plan.pat_num,
+                format!("Resolved {resolved} stale dynamic charge(s) for plan {} (as of {}, blocked {})", plan.pay_plan_num, as_of, res.blocked_with_splits.len()),
+            );
+        }
+        if errors.is_empty() {
+            self.error = None;
+            let blocked = res.blocked_with_splits.len();
+            self.notice = Some(if blocked > 0 {
+                format!("Resolved {resolved} stale charge(s); {blocked} blocked because splits are applied")
+            } else {
+                format!("Resolved {resolved} stale charge(s)")
+            });
+        } else {
+            self.notice = if resolved > 0 { Some(format!("Resolved {resolved} stale charge(s); some updates failed")) } else { None };
+            self.error = Some(errors.join("; "));
+        }
+    }
+
     fn try_login(&mut self) {
         let name = self.login_name.trim();
         let Some(user) = self
@@ -3423,6 +3469,8 @@ impl OdApp {
             let mut dyn_expected_due_total = 0.0_f64;
             let mut dyn_missing_due_count = 0usize;
             let mut dyn_missing_due_total = 0.0_f64;
+            let mut dyn_stale_count = 0usize;
+            let mut dyn_stale_total = 0.0_f64;
             for plan in &plans {
                 if plan.is_dynamic {
                     dyn_count += 1;
@@ -3434,16 +3482,24 @@ impl OdApp {
                     dyn_expected_due_total += r.expected_due_total;
                     dyn_missing_due_count += r.missing_due_count;
                     dyn_missing_due_total += r.missing_due_total;
+                    dyn_stale_count += r.stale_issued_count;
+                    dyn_stale_total += r.stale_issued_total;
                 }
             }
             if dyn_count > 0 {
+                let stale_suffix = if dyn_stale_count > 0 { format!(" · stale {dyn_stale_count} {dyn_stale_total:.2}") } else { String::new() };
                 ui.label(format!(
-                    "Dynamic portfolio (as of {as_of}): {dyn_count} plan(s) · issued {dyn_issued_count}/{dyn_expected_due_count} due {dyn_issued_total:.2}/{dyn_expected_due_total:.2} · missing due {dyn_missing_due_count} {dyn_missing_due_total:.2}"
+                    "Dynamic portfolio (as of {as_of}): {dyn_count} plan(s) · issued {dyn_issued_count}/{dyn_expected_due_count} due {dyn_issued_total:.2}/{dyn_expected_due_total:.2} · missing due {dyn_missing_due_count} {dyn_missing_due_total:.2}{stale_suffix}"
                 ));
-                if dyn_missing_due_count > 0 {
+                if dyn_missing_due_count > 0 || dyn_stale_count > 0 {
                     ui.horizontal(|ui| {
-                        ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Some dynamic plans have missing due charges for this as-of date.");
-                        if self.can(Permission::BILLING) && ui.button("Reconcile/issue all due").clicked() {
+                        if dyn_missing_due_count > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Missing due charges detected.");
+                        }
+                        if dyn_stale_count > 0 {
+                            ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Stale/over-issued charges detected.");
+                        }
+                        if dyn_missing_due_count > 0 && self.can(Permission::BILLING) && ui.button("Reconcile/issue all due").clicked() {
                             self.reconcile_dynamic_plans_due_portfolio(&plans, &plan_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
                         }
                     });
@@ -3501,7 +3557,7 @@ impl OdApp {
                         ));
                         if let Some(r) = recon {
                             ui.label(format!(
-                                "Dynamic reconciliation (as of {}): issued {}/{} due {:.2}/{:.2} · full {}/{} {:.2}/{:.2} · missing due {} {:.2}",
+                                "Dynamic reconciliation (as of {}): issued {}/{} due {:.2}/{:.2} · full {}/{} {:.2}/{:.2} · missing due {} {:.2} · stale {} {:.2}",
                                 as_of,
                                 r.issued_count,
                                 r.expected_due_count,
@@ -3513,9 +3569,17 @@ impl OdApp {
                                 r.expected_full_total,
                                 r.missing_due_count,
                                 r.missing_due_total,
+                                r.stale_issued_count,
+                                r.stale_issued_total,
                             ));
                             if r.missing_due_count > 0 {
                                 ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Due charges are missing for this as-of date. Use Issue charges due.");
+                            }
+                            if r.stale_issued_count > 0 {
+                                ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Stale/over-issued charges detected after production/term changes. Resolve explicitly; rows with applied splits are blocked.");
+                                if self.can(Permission::BILLING) && ui.small_button("Resolve stale charges (safe)").clicked() {
+                                    self.resolve_stale_dynamic_plan_charges(plan, &own_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
+                                }
                             }
                         }
                         if breakdown.unapplied_credit > 0.005 && !plan.is_closed {
@@ -9886,6 +9950,73 @@ mod tests {
         app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &after, as_of);
         let notice2 = app.notice.clone().unwrap_or_default();
         assert!(notice2.contains("No dynamic charges due to issue"), "notice2: {notice2}; err: {:?}", app.error);
+    }
+
+    #[test]
+    fn resolve_stale_dynamic_plan_charges_is_safe_and_audited() {
+        let mut app = OdApp::new();
+        app.refresh();
+        let pat_num = app.patients[0].pat_num;
+        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let as_of = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let adj_num = app.store.upsert_adjustment(&od_domain::Adjustment {
+            pat_num,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            adj_amount: 300.0,
+            ..Default::default()
+        }).unwrap();
+        let plan_num = app.store.upsert_pay_plan(&PayPlan {
+            pat_num,
+            guarantor: pat_num,
+            pay_plan_date: start,
+            is_dynamic: true,
+            charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            pay_amt: 100.0,
+            date_pay_plan_start: Some(start),
+            ..Default::default()
+        }).unwrap();
+        let _ = app.store.upsert_pay_plan_link(&PayPlanLink {
+            pay_plan_num: plan_num,
+            link_type: PayPlanLink::ADJUSTMENT,
+            fkey: adj_num,
+            ..Default::default()
+        }).unwrap();
+        app.refresh();
+        let plans = app.store.list_pay_plans(pat_num).unwrap();
+        let links = app.store.list_pay_plan_links().unwrap();
+        let procedures = app.store.list_procedures(pat_num).unwrap();
+        let adjustments = app.store.list_adjustments(pat_num).unwrap();
+        let splits = app.store.list_pay_splits(pat_num).unwrap();
+        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &charges, as_of);
+        // Reduce production so issued Mar charge becomes stale/over-issued.
+        let _ = app.store.upsert_adjustment(&od_domain::Adjustment {
+            adj_num,
+            pat_num,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            adj_amount: 200.0,
+            ..Default::default()
+        }).unwrap();
+        app.refresh();
+        let plans = app.store.list_pay_plans(pat_num).unwrap();
+        let plan = plans.iter().find(|p| p.pay_plan_num == plan_num).unwrap().clone();
+        let links = app.store.list_pay_plan_links().unwrap();
+        let own_links: Vec<_> = links.iter().filter(|l| l.pay_plan_num == plan_num).cloned().collect();
+        let procedures = app.store.list_procedures(pat_num).unwrap();
+        let adjustments = app.store.list_adjustments(pat_num).unwrap();
+        let splits = app.store.list_pay_splits(pat_num).unwrap();
+        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+        let rec = od_core::reconciliation(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
+        assert!(rec.stale_issued_count > 0, "expected stale charges");
+        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("Resolved"), "notice: {notice}; err: {:?}", app.error);
+        let after = app.store.list_pay_plan_charges(pat_num).unwrap();
+        let stale_zeroed = after.iter().any(|c| c.pay_plan_num == plan_num && c.note.contains("Stale resolved") && (c.principal + c.interest).abs() < 0.01);
+        assert!(stale_zeroed, "stale charge should be zeroed and annotated");
+        let logs = app.store.list_security_log(200).unwrap();
+        assert!(logs.iter().any(|l| l.log_text.contains("Resolved") && l.log_text.contains("stale dynamic charge")), "audit missing");
     }
 
     #[test]

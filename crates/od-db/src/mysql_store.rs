@@ -1978,6 +1978,15 @@ impl Store for MySqlStore {
         .map_err(|e| e.to_string())
     }
 
+    fn delete_pay_plan_charge(&self, charge_num: Id) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        conn.exec_drop(
+            "DELETE FROM payplancharge WHERE PayPlanChargeNum=?",
+            (charge_num,),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     fn list_claim_snapshots(&self) -> Result<Vec<ClaimSnapshot>, String> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn
@@ -2880,27 +2889,55 @@ impl Store for MySqlStore {
 
     fn upsert_pay_plan_charge(&self, charge: &PayPlanCharge) -> Result<Id, String> {
         let mut conn = self.conn()?;
-        conn.exec_drop(
-            "INSERT INTO payplancharge \
-             (PayPlanNum,Guarantor,PatNum,ChargeDate,Principal,Interest,Note,ProvNum,ProcNum,ChargeType,FKey,LinkType) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                charge.pay_plan_num,
-                charge.guarantor,
-                charge.pat_num,
-                charge.charge_date.format("%Y-%m-%d").to_string(),
-                charge.principal,
-                charge.interest,
-                charge.note.clone(),
-                charge.provider_num,
-                charge.proc_num,
-                charge.charge_type.as_od(),
-                charge.fkey,
-                charge.link_type,
-            ),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_id() as Id)
+        // OD upsert semantics: PayPlanChargeNum=0 inserts, otherwise update the
+        // existing charge in place. This matters for safe stale resolution,
+        // where we zero/annotate a previously issued charge without deleting it.
+        if charge.pay_plan_charge_num == 0 {
+            conn.exec_drop(
+                "INSERT INTO payplancharge \
+                 (PayPlanNum,Guarantor,PatNum,ChargeDate,Principal,Interest,Note,ProvNum,ProcNum,ChargeType,FKey,LinkType) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    charge.pay_plan_num,
+                    charge.guarantor,
+                    charge.pat_num,
+                    charge.charge_date.format("%Y-%m-%d").to_string(),
+                    charge.principal,
+                    charge.interest,
+                    charge.note.clone(),
+                    charge.provider_num,
+                    charge.proc_num,
+                    charge.charge_type.as_od(),
+                    charge.fkey,
+                    charge.link_type,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_id() as Id)
+        } else {
+            conn.exec_drop(
+                "UPDATE payplancharge SET \
+                 PayPlanNum=?,Guarantor=?,PatNum=?,ChargeDate=?,Principal=?,Interest=?,Note=?,ProvNum=?,ProcNum=?,ChargeType=?,FKey=?,LinkType=? \
+                 WHERE PayPlanChargeNum=?",
+                mysql::Params::Positional(vec![
+                    Value::from(charge.pay_plan_num),
+                    Value::from(charge.guarantor),
+                    Value::from(charge.pat_num),
+                    Value::from(charge.charge_date.format("%Y-%m-%d").to_string()),
+                    Value::from(charge.principal),
+                    Value::from(charge.interest),
+                    Value::from(charge.note.clone()),
+                    Value::from(charge.provider_num),
+                    Value::from(charge.proc_num),
+                    Value::from(charge.charge_type.as_od()),
+                    Value::from(charge.fkey),
+                    Value::from(charge.link_type),
+                    Value::from(charge.pay_plan_charge_num),
+                ]),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(charge.pay_plan_charge_num)
+        }
     }
 
     fn upsert_adjustment(&self, adjustment: &Adjustment) -> Result<Id, String> {
@@ -2913,21 +2950,42 @@ impl Store for MySqlStore {
         } else {
             adjustment.adj_date
         };
-        conn.exec_drop(
-            "INSERT INTO adjustment (AdjDate,AdjAmt,PatNum,AdjType,ProvNum,ProcNum,AdjNote,ProcDate) VALUES (?,?,?,?,?,?,?,?)",
-            (
-                adjustment.adj_date.format("%Y-%m-%d").to_string(),
-                adjustment.adj_amount,
-                adjustment.pat_num,
-                adjustment.adj_type,
-                adjustment.provider_num,
-                adjustment.proc_num,
-                adjustment.note.clone(),
-                proc_date.format("%Y-%m-%d").to_string(),
-            ),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(conn.last_insert_id() as Id)
+        // OD's upsert semantics: AdjNum=0 inserts, otherwise update in place.
+        // A plain INSERT with an explicit key would not update linked production.
+        if adjustment.adj_num == 0 {
+            conn.exec_drop(
+                "INSERT INTO adjustment (AdjDate,AdjAmt,PatNum,AdjType,ProvNum,ProcNum,AdjNote,ProcDate) VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    adjustment.adj_date.format("%Y-%m-%d").to_string(),
+                    adjustment.adj_amount,
+                    adjustment.pat_num,
+                    adjustment.adj_type,
+                    adjustment.provider_num,
+                    adjustment.proc_num,
+                    adjustment.note.clone(),
+                    proc_date.format("%Y-%m-%d").to_string(),
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_id() as Id)
+        } else {
+            conn.exec_drop(
+                "UPDATE adjustment SET AdjDate=?,AdjAmt=?,PatNum=?,AdjType=?,ProvNum=?,ProcNum=?,AdjNote=?,ProcDate=? WHERE AdjNum=?",
+                (
+                    adjustment.adj_date.format("%Y-%m-%d").to_string(),
+                    adjustment.adj_amount,
+                    adjustment.pat_num,
+                    adjustment.adj_type,
+                    adjustment.provider_num,
+                    adjustment.proc_num,
+                    adjustment.note.clone(),
+                    proc_date.format("%Y-%m-%d").to_string(),
+                    adjustment.adj_num,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(adjustment.adj_num)
+        }
     }
 
     fn record_payment(

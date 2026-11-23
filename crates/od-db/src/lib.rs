@@ -166,6 +166,10 @@ pub trait Store: Send + Sync {
     fn list_pay_plan_charges(&self, pat_num: Id) -> Result<Vec<PayPlanCharge>, String>;
     fn upsert_pay_plan(&self, plan: &PayPlan) -> Result<Id, String>;
     fn upsert_pay_plan_charge(&self, charge: &PayPlanCharge) -> Result<Id, String>;
+    /// Delete an OD `payplancharge` row by primary key. Used only for
+    /// explicit staff-resolved stale dynamic-plan charge cleanup where no
+    /// splits are applied to the charge; never called implicitly.
+    fn delete_pay_plan_charge(&self, charge_num: Id) -> Result<(), String>;
     fn upsert_adjustment(&self, adjustment: &Adjustment) -> Result<Id, String>;
     /// Writes the `payment` row and one `paysplit` row linked to it.
     /// `pay_plan_num` is 0 for a one-off payment; otherwise the split credits
@@ -689,6 +693,12 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.upsert_pay_plan_charge(charge),
             Backend::MySql(s) => s.upsert_pay_plan_charge(charge),
+        }
+    }
+    fn delete_pay_plan_charge(&self, charge_num: Id) -> Result<(), String> {
+        match self {
+            Backend::Demo(s) => s.delete_pay_plan_charge(charge_num),
+            Backend::MySql(s) => s.delete_pay_plan_charge(charge_num),
         }
     }
     fn list_treat_plans(&self, pat_num: Id) -> Result<Vec<TreatPlan>, String> {

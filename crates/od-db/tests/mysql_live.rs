@@ -3880,6 +3880,124 @@ fn mysql_live_dynamic_plan_links_issue_due_charges() {
 
 #[test]
 #[ignore = "live MySQL: set ODCLINIC_DB_URL=mysql://user:pass@host:3306/db"]
+fn mysql_live_dynamic_plan_stale_resolution() {
+    use od_domain::{
+        Adjustment, DynamicPayPlanTPOption, PayPlan, PayPlanCharge, PayPlanFrequency, PayPlanLink,
+        PaymentSchedule,
+    };
+
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let pat_num = store
+        .list_patients()
+        .expect("list_patients failed")
+        .into_iter()
+        .next()
+        .expect("need at least one patient")
+        .pat_num;
+
+    let normalized = if url.contains("://") { url.trim().to_string() } else { format!("mysql://{}", url.trim()) };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+
+    // Clean debris from any earlier failed run of this test before starting.
+    for note in ["ODCLINIC_LIVE_STALE_PLAN%", "ODCLINIC_LIVE_STALE_DYN%"] {
+        let _ = conn.exec_drop(
+            "DELETE pc FROM payplancharge pc JOIN payplan pp ON pp.PayPlanNum=pc.PayPlanNum WHERE pp.Note LIKE ?",
+            (note,),
+        );
+        let _ = conn.exec_drop(
+            "DELETE pl FROM payplanlink pl JOIN payplan pp ON pp.PayPlanNum=pl.PayPlanNum WHERE pp.Note LIKE ?",
+            (note,),
+        );
+        let _ = conn.exec_drop("DELETE FROM payplan WHERE Note LIKE ?", (note,));
+        let _ = conn.exec_drop("DELETE FROM adjustment WHERE AdjNote LIKE ?", (note,));
+    }
+
+    let start = NaiveDate::from_ymd_opt(2098, 1, 1).unwrap();
+    let as_of = NaiveDate::from_ymd_opt(2098, 3, 1).unwrap();
+    let adj_num = store
+        .upsert_adjustment(&Adjustment {
+            pat_num,
+            adj_date: NaiveDate::from_ymd_opt(2098, 1, 2).unwrap(),
+            adj_amount: 300.0,
+            note: "ODCLINIC_LIVE_STALE_DYN".into(),
+            ..Default::default()
+        })
+        .expect("upsert_adjustment");
+    let plan_num = store
+        .upsert_pay_plan(&PayPlan {
+            pat_num,
+            guarantor: pat_num,
+            pay_plan_date: start,
+            date_pay_plan_start: Some(start),
+            is_dynamic: true,
+            charge_frequency: PayPlanFrequency::Monthly,
+            pay_schedule: PaymentSchedule::Monthly,
+            pay_amt: 100.0,
+            dynamic_pay_plan_tp_option: DynamicPayPlanTPOption::None,
+            note: "ODCLINIC_LIVE_STALE_PLAN".into(),
+            ..Default::default()
+        })
+        .expect("upsert_pay_plan");
+    let link_num = store
+        .upsert_pay_plan_link(&PayPlanLink {
+            pay_plan_num: plan_num,
+            link_type: PayPlanLink::ADJUSTMENT,
+            fkey: adj_num,
+            ..Default::default()
+        })
+        .expect("upsert_pay_plan_link");
+
+    let plan = store.list_pay_plans(pat_num).unwrap().into_iter().find(|p| p.pay_plan_num == plan_num).expect("plan");
+    let links: Vec<_> = store.list_pay_plan_links().unwrap().into_iter().filter(|l| l.pay_plan_num == plan_num).collect();
+    let procs = store.list_procedures(pat_num).unwrap();
+    let adjs = store.list_adjustments(pat_num).unwrap();
+    let splits = store.list_pay_splits(pat_num).unwrap();
+    let existing: Vec<PayPlanCharge> = store.list_pay_plan_charges(pat_num).unwrap().into_iter().filter(|c| c.pay_plan_num == plan_num).collect();
+    let due = od_core::issue_charges_due(&plan, &links, &procs, &adjs, &splits, &existing, as_of);
+    for c in &due {
+        store.upsert_pay_plan_charge(c).expect("issue charge");
+    }
+
+    // Reduce production: makes already-issued late charges stale/over-issued.
+    store
+        .upsert_adjustment(&Adjustment {
+            adj_num,
+            pat_num,
+            adj_date: NaiveDate::from_ymd_opt(2098, 1, 2).unwrap(),
+            adj_amount: 100.0,
+            note: "ODCLINIC_LIVE_STALE_DYN_REDUCED".into(),
+            ..Default::default()
+        })
+        .expect("reduce adjustment");
+    let plan = store.list_pay_plans(pat_num).unwrap().into_iter().find(|p| p.pay_plan_num == plan_num).expect("plan");
+    let adjs = store.list_adjustments(pat_num).unwrap();
+    let charges: Vec<PayPlanCharge> = store.list_pay_plan_charges(pat_num).unwrap().into_iter().filter(|c| c.pay_plan_num == plan_num).collect();
+    let rec = od_core::reconciliation(&plan, &links, &procs, &adjs, &splits, &charges, as_of);
+    assert!(rec.stale_issued_count > 0, "expected stale charges, rec={rec:?}");
+
+    let (_own, _due, _full, stale) = od_core::reconciliation_detail(&plan, &links, &procs, &adjs, &splits, &charges, as_of);
+    let res = od_core::resolve_stale_issued_charges(&stale, as_of, "live test production reduced");
+    for c in &res.resolved {
+        store.upsert_pay_plan_charge(c).expect("resolve stale charge");
+    }
+    let after: Vec<PayPlanCharge> = store.list_pay_plan_charges(pat_num).unwrap().into_iter().filter(|c| c.pay_plan_num == plan_num).collect();
+    let rec_after = od_core::reconciliation(&plan, &links, &procs, &adjs, &splits, &after, as_of);
+    assert_eq!(rec_after.stale_issued_count, 0, "stale should be resolved: {rec_after:?}");
+    assert!(after.iter().any(|c| c.note.contains("Stale resolved") && (c.principal + c.interest).abs() < 0.01));
+
+    let _ = conn.exec_drop("DELETE FROM payplancharge WHERE PayPlanNum=?", (plan_num,));
+    let _ = conn.exec_drop("DELETE FROM payplanlink WHERE PayPlanLinkNum=?", (link_num,));
+    let _ = conn.exec_drop("DELETE FROM payplan WHERE PayPlanNum=?", (plan_num,));
+    let _ = conn.exec_drop("DELETE FROM adjustment WHERE AdjNum=?", (adj_num,));
+    println!("dynamic stale resolution live check: resolved {} stale charge(s)", res.resolved.len());
+}
+
+#[test]
+#[ignore = "live MySQL: set ODCLINIC_DB_URL=mysql://user:pass@host:3306/db"]
 fn mysql_live_plan_payment_applies_to_due_charges() {
     use od_core::allocate_plan_payment;
     use od_domain::{PayPlan, PayPlanCharge, PayPlanChargeType, PayPlanDebitType, Payment, PaymentTarget};

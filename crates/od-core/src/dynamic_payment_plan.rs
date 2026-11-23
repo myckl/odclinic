@@ -247,6 +247,10 @@ fn is_down_payment(charge: &PayPlanCharge) -> bool {
     charge.note.to_lowercase().contains("down payment")
 }
 
+fn is_stale_resolved(charge: &PayPlanCharge) -> bool {
+    (charge.principal + charge.interest).abs() < 0.005 && charge.note.contains("[Stale resolved")
+}
+
 fn has_charge_on(existing: &[PayPlanCharge], date: NaiveDate) -> bool {
     existing
         .iter()
@@ -438,10 +442,25 @@ pub struct DynamicPlanReconciliation {
     pub expected_full_total: f64,
     pub missing_due_count: usize,
     pub missing_due_total: f64,
+    /// Issued debits (not down payments) that no longer match the current
+    /// expected full schedule by (date,fkey,link_type) or whose amount changed.
+    /// These are stale/over-issued after production/link/term changes.
+    pub stale_issued_count: usize,
+    pub stale_issued_total: f64,
+}
+
+/// A single issued charge flagged as stale/over-issued.
+#[derive(Clone, Debug)]
+pub struct StaleIssuedCharge {
+    pub charge: PayPlanCharge,
+    /// Expected amount for same slot if any; None means orphan/no matching slot.
+    pub expected_amount: Option<f64>,
+    pub has_splits: bool,
 }
 
 /// Compare issued dynamic-plan charges against expected schedule through `as_of`.
 /// `missing_due_*` counts expected-due charges/amount not yet issued as of `as_of`.
+/// `stale_issued_*` counts issued debits that no longer match current expected schedule.
 pub fn reconciliation(
     plan: &PayPlan,
     links: &[PayPlanLink],
@@ -451,38 +470,24 @@ pub fn reconciliation(
     existing_charges: &[PayPlanCharge],
     as_of: NaiveDate,
 ) -> DynamicPlanReconciliation {
-    let plan_links: Vec<PayPlanLink> = links
-        .iter()
-        .filter(|l| l.pay_plan_num == plan.pay_plan_num)
-        .cloned()
-        .collect();
-    let entries = production_entries(&plan_links, procedures, adjustments, splits);
-    let own_existing: Vec<PayPlanCharge> = existing_charges
-        .iter()
-        .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_type == PayPlanChargeType::Debit && !is_down_payment(c))
-        .cloned()
-        .collect();
-    let issued: Vec<&PayPlanCharge> = own_existing.iter().filter(|c| c.charge_date <= as_of).collect();
-    let issued_total = issued.iter().map(|c| c.principal + c.interest).sum();
+    let (all_own, expected_due, expected_full, stale) =
+        reconciliation_detail(plan, links, procedures, adjustments, splits, existing_charges, as_of);
+    let own_active: Vec<&PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved(c)).collect();
+    let issued: Vec<&PayPlanCharge> = own_active.iter().copied().filter(|c| c.charge_date <= as_of).collect();
+    let issued_total: f64 = issued.iter().map(|c| c.principal + c.interest).sum();
+    let expected_due_total: f64 = expected_due.iter().map(|c| c.principal + c.interest).sum();
+    let expected_full_total: f64 = expected_full.iter().map(|c| c.principal + c.interest).sum();
 
-    // Expected due through as_of, ignoring existing dates so we see what should exist.
-    let expected_due = build_charges(plan, &entries, &[], as_of, true, false);
-    let expected_due_total = expected_due.iter().map(|c| c.principal + c.interest).sum();
-
-    // Full expected schedule for visibility.
-    let expected_full = build_charges(plan, &entries, &[], as_of, false, false);
-    let expected_full_total = expected_full.iter().map(|c| c.principal + c.interest).sum();
-
-    // Missing due: expected due dates/amounts not present in existing issued charges.
     let mut missing_due_count = 0usize;
     let mut missing_due_total = 0.0f64;
     for exp in &expected_due {
-        let covered = own_existing.iter().any(|c| c.charge_date == exp.charge_date && c.fkey == exp.fkey && c.link_type == exp.link_type);
+        let covered = all_own.iter().any(|c| c.charge_date == exp.charge_date && c.fkey == exp.fkey && c.link_type == exp.link_type);
         if !covered {
             missing_due_count += 1;
             missing_due_total += exp.principal + exp.interest;
         }
     }
+    let stale_issued_total: f64 = stale.iter().map(|s| s.charge.principal + s.charge.interest).sum();
 
     DynamicPlanReconciliation {
         issued_count: issued.len(),
@@ -493,7 +498,100 @@ pub fn reconciliation(
         expected_full_total: round2(expected_full_total),
         missing_due_count,
         missing_due_total: round2(missing_due_total),
+        stale_issued_count: stale.len(),
+        stale_issued_total: round2(stale_issued_total),
     }
+}
+
+/// Detailed reconciliation including stale/over-issued charge list.
+pub fn reconciliation_detail(
+    plan: &PayPlan,
+    links: &[PayPlanLink],
+    procedures: &[Procedure],
+    adjustments: &[Adjustment],
+    splits: &[od_domain::PaySplit],
+    existing_charges: &[PayPlanCharge],
+    as_of: NaiveDate,
+) -> (
+    Vec<PayPlanCharge>,
+    Vec<PayPlanCharge>,
+    Vec<PayPlanCharge>,
+    Vec<StaleIssuedCharge>,
+) {
+    let plan_links: Vec<PayPlanLink> = links
+        .iter()
+        .filter(|l| l.pay_plan_num == plan.pay_plan_num)
+        .cloned()
+        .collect();
+    let entries = production_entries(&plan_links, procedures, adjustments, splits);
+    let all_own: Vec<PayPlanCharge> = existing_charges
+        .iter()
+        .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_type == PayPlanChargeType::Debit && !is_down_payment(c))
+        .cloned()
+        .collect();
+    let own_existing: Vec<PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved(c)).cloned().collect();
+    let expected_due = build_charges(plan, &entries, &[], as_of, true, false);
+    let expected_full = build_charges(plan, &entries, &[], as_of, false, false);
+
+    let mut stale = Vec::new();
+    for c in &own_existing {
+        let amt = round2(c.principal + c.interest);
+        let matched = expected_full.iter().find(|e| e.charge_date == c.charge_date && e.fkey == c.fkey && e.link_type == c.link_type);
+        let is_stale = match matched {
+            None => true,
+            Some(e) => (round2(e.principal + e.interest) - amt).abs() > 0.01,
+        };
+        if is_stale {
+            // Conservative: any split explicitly targeting this charge means it has splits.
+            let has_splits = splits.iter().any(|s| s.pay_plan_charge_num == c.pay_plan_charge_num && c.pay_plan_charge_num != 0);
+            stale.push(StaleIssuedCharge {
+                charge: c.clone(),
+                expected_amount: matched.map(|e| round2(e.principal + e.interest)),
+                has_splits,
+            });
+        }
+    }
+    stale.sort_by_key(|s| (s.charge.charge_date, s.charge.pay_plan_charge_num));
+    (own_existing, expected_due, expected_full, stale)
+}
+
+/// Explicit staff resolution for stale/over-issued dynamic-plan debits.
+/// Safe behavior: only charges with no applied splits are resolved by zeroing
+/// principal/interest and annotating the note; financial history row is kept.
+/// Charges with applied splits are reported as blocked.
+#[derive(Clone, Debug, Default)]
+pub struct StaleResolutionResult {
+    pub resolved: Vec<PayPlanCharge>,
+    pub blocked_with_splits: Vec<Id>,
+}
+
+pub fn resolve_stale_issued_charges(
+    stale: &[StaleIssuedCharge],
+    as_of: NaiveDate,
+    reason: &str,
+) -> StaleResolutionResult {
+    let mut out = StaleResolutionResult::default();
+    let reason = reason.trim();
+    let reason = if reason.is_empty() { "production/terms changed" } else { reason };
+    for s in stale {
+        if s.has_splits {
+            out.blocked_with_splits.push(s.charge.pay_plan_charge_num);
+            continue;
+        }
+        let mut c = s.charge.clone();
+        c.principal = 0.0;
+        c.interest = 0.0;
+        let tag = format!("[Stale resolved {as_of}: {reason}]");
+        c.note = if c.note.trim().is_empty() {
+            tag
+        } else if c.note.contains("[Stale resolved") {
+            c.note.clone()
+        } else {
+            format!("{} {tag}", c.note.trim())
+        };
+        out.resolved.push(c);
+    }
+    out
 }
 
 /// Why a dynamic plan cannot issue charges right now. Returned to the UI so the
@@ -795,5 +893,76 @@ mod tests {
         assert_eq!(round2(rec.expected_full_total), 300.0);
         assert_eq!(rec.missing_due_count, 0);
         assert!(round2(rec.missing_due_total).abs() < 0.01);
+        assert_eq!(rec.stale_issued_count, 0);
+    }
+
+    #[test]
+    fn reconciliation_flags_stale_issued_after_production_reduction() {
+        let links = [link(1, PayPlanLink::PROCEDURE, 100)];
+        let procedures = [proc(100, 300.0, ProcedureStatus::Complete, 2)];
+        let mut p = plan(DynamicPayPlanTPOption::None);
+        p.pay_amt = 100.0;
+        let as_of = date(2026, 3, 1);
+        let mut issued = issue_charges_due(&p, &links, &procedures, &[], &[], &[], as_of);
+        for (i, c) in issued.iter_mut().enumerate() { c.pay_plan_charge_num = (i as Id) + 1; }
+        assert_eq!(issued.len(), 3);
+        // Production reduced below already-issued amount; expected full becomes 2x100.
+        let reduced = [proc(100, 200.0, ProcedureStatus::Complete, 2)];
+        let rec = reconciliation(&p, &links, &reduced, &[], &[], &issued, as_of);
+        assert!(rec.stale_issued_count >= 1, "stale={}", rec.stale_issued_count);
+        assert!(rec.stale_issued_total > 0.0);
+        let (_own, _due, _full, stale) = reconciliation_detail(&p, &links, &reduced, &[], &[], &issued, as_of);
+        assert!(stale.iter().any(|s| s.charge.pay_plan_charge_num == 3));
+    }
+
+    #[test]
+    fn reconciliation_flags_stale_amount_change() {
+        let links = [link(1, PayPlanLink::PROCEDURE, 100)];
+        let procedures = [proc(100, 300.0, ProcedureStatus::Complete, 2)];
+        let mut p = plan(DynamicPayPlanTPOption::None);
+        p.pay_amt = 100.0;
+        let as_of = date(2026, 2, 1);
+        let mut issued = issue_charges_due(&p, &links, &procedures, &[], &[], &[], as_of);
+        for (i, c) in issued.iter_mut().enumerate() { c.pay_plan_charge_num = (i as Id) + 1; }
+        let mut changed = p.clone();
+        changed.pay_amt = 150.0; // term change makes old issued amounts stale vs expected
+        let rec = reconciliation(&changed, &links, &procedures, &[], &[], &issued, as_of);
+        assert!(rec.stale_issued_count >= 1);
+    }
+
+    #[test]
+    fn resolve_stale_issued_charges_blocks_splits_and_zeroes_safe_rows() {
+        let links = [link(1, PayPlanLink::PROCEDURE, 100)];
+        let procedures = [proc(100, 300.0, ProcedureStatus::Complete, 2)];
+        let mut p = plan(DynamicPayPlanTPOption::None);
+        p.pay_amt = 100.0;
+        let as_of = date(2026, 3, 1);
+        let mut issued = issue_charges_due(&p, &links, &procedures, &[], &[], &[], as_of);
+        for (i, c) in issued.iter_mut().enumerate() { c.pay_plan_charge_num = (i as Id) + 1; }
+        let reduced = [proc(100, 100.0, ProcedureStatus::Complete, 2)];
+        let (_own, _due, _full, stale) = reconciliation_detail(&p, &links, &reduced, &[], &[], &issued, as_of);
+        assert!(!stale.is_empty());
+        let splits = vec![od_domain::PaySplit {
+            split_num: 1,
+            pay_num: 10,
+            pat_num: 2,
+            pay_plan_num: 1,
+            pay_plan_charge_num: 2,
+            pay_plan_debit_type: od_domain::PayPlanDebitType::Principal,
+            split_amount: 100.0,
+            date_pay: date(2026, 1, 10),
+            ..Default::default()
+        }];
+        let stale_with_split: Vec<_> = stale
+            .into_iter()
+            .map(|mut s| { s.has_splits = splits.iter().any(|sp| sp.pay_plan_charge_num == s.charge.pay_plan_charge_num); s })
+            .collect();
+        let res = resolve_stale_issued_charges(&stale_with_split, as_of, "production reduced");
+        assert!(res.blocked_with_splits.contains(&2));
+        assert!(res.resolved.iter().all(|c| c.pay_plan_charge_num != 2));
+        for c in &res.resolved {
+            assert_eq!(round2(c.principal + c.interest), 0.0);
+            assert!(c.note.contains("Stale resolved"));
+        }
     }
 }

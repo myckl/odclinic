@@ -720,6 +720,24 @@ fn demo_store_dynamic_plan_links_issue_due_charges() {
     assert!(rec.issued_count <= rec.expected_due_count);
     assert!(rec.expected_full_count >= rec.expected_due_count);
 
+    // Stale detection/resolution: reduce linked adjustment production so later issued charge is stale.
+    let mut reduced_adj = adjs.iter().find(|a| a.adj_num == adj_num).unwrap().clone();
+    reduced_adj.adj_amount = 100.0;
+    store.upsert_adjustment(&reduced_adj).unwrap();
+    let adjs2 = store.list_adjustments(1).unwrap();
+    let after2 = store.list_pay_plan_charges(1).unwrap();
+    let rec2 = od_core::reconciliation(&stored, &own_links, &procs, &adjs2, &splits, &after2, mid_feb);
+    if rec2.stale_issued_count > 0 {
+        let (_o, _d, _f, stale) = od_core::reconciliation_detail(&stored, &own_links, &procs, &adjs2, &splits, &after2, mid_feb);
+        let res = od_core::resolve_stale_issued_charges(&stale, mid_feb, "demo reduced production");
+        for c in &res.resolved {
+            store.upsert_pay_plan_charge(c).unwrap();
+        }
+        let after3 = store.list_pay_plan_charges(1).unwrap();
+        let rec3 = od_core::reconciliation(&stored, &own_links, &procs, &adjs2, &splits, &after3, mid_feb);
+        assert_eq!(rec3.stale_issued_count, 0);
+    }
+
     store.delete_pay_plan_link(link_num).unwrap();
     let remaining = store.list_pay_plan_links().unwrap();
     assert!(!remaining.iter().any(|l| l.pay_plan_link_num == link_num));

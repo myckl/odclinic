@@ -241,14 +241,20 @@ pub fn payment_plan_report(
                     charges,
                     as_of,
                 );
+                let stale = if r.stale_issued_count > 0 {
+                    format!(" · stale {} {:.2}", r.stale_issued_count, r.stale_issued_total)
+                } else {
+                    String::new()
+                };
                 format!(
-                    " · issued {}/{} due {:.2}/{:.2} · missing due {} {:.2}",
+                    " · issued {}/{} due {:.2}/{:.2} · missing due {} {:.2}{}",
                     r.issued_count,
                     r.expected_due_count,
                     r.issued_total,
                     r.expected_due_total,
                     r.missing_due_count,
-                    r.missing_due_total
+                    r.missing_due_total,
+                    stale
                 )
             } else {
                 String::new()
@@ -286,6 +292,8 @@ pub fn payment_plan_report(
     let mut dyn_expected_due_total = 0.0_f64;
     let mut dyn_missing_due_count = 0usize;
     let mut dyn_missing_due_total = 0.0_f64;
+    let mut dyn_stale_count = 0usize;
+    let mut dyn_stale_total = 0.0_f64;
     let mut dyn_count = 0usize;
     for p in plans {
         let b = crate::pay_plan_balance_breakdown(p, charges, splits, as_of);
@@ -302,11 +310,18 @@ pub fn payment_plan_report(
             dyn_expected_due_total += r.expected_due_total;
             dyn_missing_due_count += r.missing_due_count;
             dyn_missing_due_total += r.missing_due_total;
+            dyn_stale_count += r.stale_issued_count;
+            dyn_stale_total += r.stale_issued_total;
         }
     }
     let dyn_summary = if dyn_count > 0 {
+        let stale = if dyn_stale_count > 0 {
+            format!(" · stale {dyn_stale_count} {:.2}", dyn_stale_total)
+        } else {
+            String::new()
+        };
         format!(
-            " · dynamic {dyn_count}: issued {dyn_issued_count}/{dyn_expected_due_count} due {:.2}/{:.2} · missing due {dyn_missing_due_count} {:.2}",
+            " · dynamic {dyn_count}: issued {dyn_issued_count}/{dyn_expected_due_count} due {:.2}/{:.2} · missing due {dyn_missing_due_count} {:.2}{stale}",
             dyn_issued_total, dyn_expected_due_total, dyn_missing_due_total
         )
     } else {
@@ -1235,7 +1250,8 @@ pub fn pay_plan_detail_report(
         let recon = if plan.is_dynamic {
             let own_links: Vec<PayPlanLink> = links.iter().filter(|l| l.pay_plan_num == plan.pay_plan_num).cloned().collect();
             let r = crate::reconciliation(plan, &own_links, procedures, adjustments, splits, charges, as_of);
-            format!(" · issued {}/{} {:.2}/{:.2} · missing {} {:.2}", r.issued_count, r.expected_due_count, r.issued_total, r.expected_due_total, r.missing_due_count, r.missing_due_total)
+            let stale = if r.stale_issued_count > 0 { format!(" · stale {} {:.2}", r.stale_issued_count, r.stale_issued_total) } else { String::new() };
+            format!(" · issued {}/{} {:.2}/{:.2} · missing {} {:.2}{stale}", r.issued_count, r.expected_due_count, r.issued_total, r.expected_due_total, r.missing_due_count, r.missing_due_total)
         } else {
             String::new()
         };
@@ -4046,6 +4062,29 @@ mod tests {
         let row = &table.rows[0];
         assert!(row[8].contains("issued 1/2"), "reconciliation shows issued/expected-due: {:?}", row[8]);
         assert!(row[8].contains("missing 1"), "reconciliation shows missing due: {:?}", row[8]);
+    }
+
+    #[test]
+    fn payment_plan_report_shows_stale_dynamic_charges() {
+        let patients = [patient(1, "Alvarez")];
+        let plan = PayPlan {
+            pay_plan_num: 8, pat_num: 1, pay_plan_date: day(2026, 1, 1), is_dynamic: true,
+            pay_amt: 100.0, charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            date_pay_plan_start: Some(day(2026, 1, 1)), ..Default::default()
+        };
+        let links = [PayPlanLink { pay_plan_link_num: 1, pay_plan_num: 8, link_type: PayPlanLink::PROCEDURE, fkey: 100, ..Default::default() }];
+        let procedures = [Procedure { proc_num: 100, pat_num: 1, proc_status: ProcedureStatus::Complete, fee: 100.0, proc_date: day(2026, 1, 2), ..Default::default() }];
+        // Three issued charges exist, but production only supports 100 total now.
+        let charges = [
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 1, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, fkey: 100, link_type: PayPlanLink::PROCEDURE, pay_plan_charge_num: 1, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 2, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, fkey: 100, link_type: PayPlanLink::PROCEDURE, pay_plan_charge_num: 2, ..Default::default() },
+            PayPlanCharge { pay_plan_num: 8, charge_date: day(2026, 3, 1), charge_type: PayPlanChargeType::Debit, principal: 100.0, fkey: 100, link_type: PayPlanLink::PROCEDURE, pay_plan_charge_num: 3, ..Default::default() },
+        ];
+        let rows = payment_plan_report(&[plan], &charges, &[], &patients, &links, &procedures, &[], day(2026, 3, 1));
+        assert!(rows[0].detail.contains("stale "), "detail: {}", rows[0].detail);
+        let total = rows.last().unwrap();
+        assert!(total.detail.contains("stale "), "total: {}", total.detail);
     }
 
     #[test]

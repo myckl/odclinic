@@ -1805,6 +1805,12 @@ impl Store for DemoStore {
         }
         Ok(num)
     }
+    fn delete_pay_plan_charge(&self, charge_num: Id) -> Result<(), String> {
+        let mut data = self.data.lock().unwrap();
+        data.pay_plan_charges
+            .retain(|c| c.pay_plan_charge_num != charge_num);
+        Ok(())
+    }
     fn upsert_pay_plan_link(&self, link: &PayPlanLink) -> Result<Id, String> {
         let mut data = self.data.lock().unwrap();
         let num = if link.pay_plan_link_num == 0 {
