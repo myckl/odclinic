@@ -3561,6 +3561,21 @@ impl OdApp {
                 } else {
                     None
                 };
+                // Same detail used by resolution, surfaced before staff confirm.
+                let stale_detail = if plan.is_dynamic {
+                    od_core::reconciliation_detail(
+                        plan,
+                        &own_links,
+                        &procedures,
+                        &adjustments,
+                        &splits,
+                        &plan_charges,
+                        as_of,
+                    )
+                    .3
+                } else {
+                    Vec::new()
+                };
                 ui.collapsing(
                     format!(
                         "{} — {:.2} owing, {:.2} due now ({}, {:.2}% APR)",
@@ -3609,6 +3624,13 @@ impl OdApp {
                             }
                             if r.stale_issued_count > 0 {
                                 ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Stale/over-issued charges detected after production/term changes. Resolve explicitly; rows with applied splits are blocked.");
+                                egui::CollapsingHeader::new(format!("Stale charge evidence ({})", stale_detail.len()))
+                                    .default_open(true)
+                                    .show(ui, |ui| {
+                                        for line in od_core::stale_charge_evidence(&stale_detail) {
+                                            ui.label(line);
+                                        }
+                                    });
                                 if self.can(Permission::BILLING) && ui.small_button("Resolve stale charges (safe)").clicked() {
                                     self.resolve_stale_dynamic_plan_charges(plan, &own_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
                                 }
@@ -10061,6 +10083,12 @@ mod tests {
         let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
         let rec = od_core::reconciliation(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
         assert!(rec.stale_issued_count > 0, "expected stale charges");
+        let (_, _, _, stale) = od_core::reconciliation_detail(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
+        let evidence = od_core::stale_charge_evidence(&stale);
+        assert_eq!(evidence.len(), rec.stale_issued_count);
+        assert!(evidence.iter().any(|line| line.contains("issued")
+            && line.contains("expected")
+            && line.contains("no splits")), "stale evidence preview missing: {evidence:?}");
         app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
         let notice = app.notice.clone().unwrap_or_default();
         assert!(notice.contains("Resolved"), "notice: {notice}; err: {:?}", app.error);

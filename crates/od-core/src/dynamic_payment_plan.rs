@@ -558,6 +558,31 @@ pub fn reconciliation_detail(
     (own_existing, expected_due, expected_full, stale)
 }
 
+/// Staff-facing evidence for each stale charge, derived from the same
+/// reconciliation detail that gates resolution. Shown before a staff member
+/// confirms "Resolve stale charges (safe)"; it never changes stored rows.
+pub fn stale_charge_evidence(stale: &[StaleIssuedCharge]) -> Vec<String> {
+    stale
+        .iter()
+        .map(|s| {
+            let issued = round2(s.charge.principal + s.charge.interest);
+            let expected = match s.expected_amount {
+                Some(amount) => format!("{:.2}", round2(amount)),
+                None => "no matching slot".to_string(),
+            };
+            let splits = if s.has_splits {
+                "applied splits — blocked"
+            } else {
+                "no splits — safe to resolve"
+            };
+            format!(
+                "charge #{} dated {}: issued {:.2}, expected {}, {}",
+                s.charge.pay_plan_charge_num, s.charge.charge_date, issued, expected, splits
+            )
+        })
+        .collect()
+}
+
 /// Explicit staff resolution for stale/over-issued dynamic-plan debits.
 /// Safe behavior: only charges with no applied splits are resolved by zeroing
 /// principal/interest and annotating the note; financial history row is kept.
@@ -967,6 +992,42 @@ mod tests {
             assert_eq!(round2(c.principal + c.interest), 0.0);
             assert!(c.note.contains("Stale resolved"));
         }
+    }
+
+    #[test]
+    fn stale_charge_evidence_shows_issued_expected_and_split_blocking() {
+        let stale = vec![
+            StaleIssuedCharge {
+                charge: PayPlanCharge {
+                    pay_plan_charge_num: 12,
+                    charge_date: date(2026, 3, 1),
+                    principal: 100.0,
+                    ..Default::default()
+                },
+                expected_amount: Some(60.0),
+                has_splits: false,
+            },
+            StaleIssuedCharge {
+                charge: PayPlanCharge {
+                    pay_plan_charge_num: 13,
+                    charge_date: date(2026, 4, 1),
+                    principal: 75.0,
+                    ..Default::default()
+                },
+                expected_amount: None,
+                has_splits: true,
+            },
+        ];
+        let lines = stale_charge_evidence(&stale);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "charge #12 dated 2026-03-01: issued 100.00, expected 60.00, no splits — safe to resolve"
+        );
+        assert_eq!(
+            lines[1],
+            "charge #13 dated 2026-04-01: issued 75.00, expected no matching slot, applied splits — blocked"
+        );
     }
 
     #[test]
