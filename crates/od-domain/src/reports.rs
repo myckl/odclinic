@@ -317,8 +317,9 @@ pub struct PayPlanReportOptions {
     pub show_family_balance: bool,
     pub limit_date_range: bool,
     pub hide_completed: bool,
-    /// Show the audit count of zeroed/annotated "stale resolved" charge rows.
-    /// On by default so financial history stays visible; staff can hide it.
+    /// Show the audit count and recorded reasons for zeroed/annotated
+    /// "stale resolved" charge rows. On by default so financial history stays
+    /// visible; staff can hide it.
     pub show_stale_resolved: bool,
 }
 

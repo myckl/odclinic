@@ -254,6 +254,18 @@ pub fn is_stale_resolved_charge(charge: &PayPlanCharge) -> bool {
     (charge.principal + charge.interest).abs() < 0.005 && charge.note.contains("[Stale resolved")
 }
 
+/// Staff-entered reason recorded by [`resolve_stale_issued_charges`], extracted
+/// from the `[Stale resolved <as_of>: <reason>]` annotation for audit display.
+pub fn stale_resolution_reason(note: &str) -> Option<&str> {
+    let start = note.find("[Stale resolved")?;
+    let rest = &note[start + "[Stale resolved".len()..];
+    let colon = rest.find(": ")?;
+    let body = &rest[colon + 2..];
+    let end = body.rfind(']')?;
+    let reason = body[..end].trim();
+    (!reason.is_empty()).then_some(reason)
+}
+
 fn has_charge_on(existing: &[PayPlanCharge], date: NaiveDate) -> bool {
     existing
         .iter()
@@ -1029,6 +1041,20 @@ mod tests {
         assert_eq!(
             lines[1],
             "charge #13 dated 2026-04-01: issued 75.00, expected no matching slot, applied splits — blocked"
+        );
+    }
+
+    #[test]
+    fn stale_resolution_reason_extracts_staff_text_for_audit() {
+        assert_eq!(
+            stale_resolution_reason("[Stale resolved 2026-03-01: procedure fee corrected [chart review]]"),
+            Some("procedure fee corrected [chart review]")
+        );
+        assert_eq!(stale_resolution_reason("ordinary charge note"), None);
+        assert_eq!(stale_resolution_reason("[Stale resolved 2026-03-01: ]"), None);
+        assert_eq!(
+            stale_resolution_reason("Patient called [Stale resolved 2026-03-01: fee fixed] follow-up"),
+            Some("fee fixed")
         );
     }
 

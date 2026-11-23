@@ -1141,17 +1141,19 @@ pub fn pay_plan_detail_report(
     }
     if options.show_stale_resolved {
         headers.push("Resolved");
+        headers.push("Resolved reason");
     }
     let mut table = ReportTable::new(&headers);
 
     // Column layout: Provider, Guarantor, [Ins], six amounts, [Fam Balance],
-    // [Resolved]. This mirrors the order used when the headers were built above.
+    // [Resolved, Resolved reason]. This mirrors the order used when the headers
+    // were built above.
     let ins_offset = usize::from(insurance_enabled);
     let mut numeric_columns: Vec<usize> = (0..7).map(|index| 2 + ins_offset + index).collect();
     if options.show_family_balance {
         numeric_columns.push(9 + ins_offset);
     }
-    let resolved_column = options.show_stale_resolved.then(|| headers.len() - 1);
+    let resolved_column = options.show_stale_resolved.then(|| headers.len() - 2);
     if let Some(column) = resolved_column {
         numeric_columns.push(column);
     }
@@ -1195,6 +1197,14 @@ pub fn pay_plan_detail_report(
             .iter()
             .filter(|charge| crate::is_stale_resolved_charge(charge))
             .count();
+        let mut resolved_reasons: Vec<String> = Vec::new();
+        for charge in own_charges.iter().filter(|charge| crate::is_stale_resolved_charge(charge)) {
+            if let Some(reason) = crate::stale_resolution_reason(&charge.note) {
+                if !resolved_reasons.iter().any(|existing| existing == reason) {
+                    resolved_reasons.push(reason.to_string());
+                }
+            }
+        }
         let debits: Vec<&PayPlanCharge> = own_charges
             .iter()
             .copied()
@@ -1280,6 +1290,7 @@ pub fn pay_plan_detail_report(
         }
         if options.show_stale_resolved {
             values.push(resolved_count.to_string());
+            values.push(resolved_reasons.join("; "));
         }
         table.push(&values.iter().map(String::as_str).collect::<Vec<_>>());
 
@@ -4739,8 +4750,11 @@ mod tests {
             day(2026, 1, 1), day(2026, 3, 1), false, PayPlanReportOptions::default(),
         );
         let resolved_col = shown.headers.iter().position(|h| h == "Resolved").expect("Resolved column shown by default");
+        let reason_col = shown.headers.iter().position(|h| h == "Resolved reason").expect("Resolved reason column shown by default");
         assert_eq!(shown.rows[0][resolved_col], "1");
+        assert_eq!(shown.rows[0][reason_col], "production reduced");
         assert_eq!(shown.rows.last().unwrap()[resolved_col], "1", "footer totals resolved rows");
+        assert_eq!(shown.rows.last().unwrap()[reason_col], "");
 
         let hidden = pay_plan_detail_report(
             &[plan.clone()], &charges, &[], &[], &[], &[], &patients, &providers, &[],
@@ -4748,6 +4762,7 @@ mod tests {
             PayPlanReportOptions { show_stale_resolved: false, ..Default::default() },
         );
         assert!(!hidden.headers.contains(&"Resolved".to_string()));
+        assert!(!hidden.headers.contains(&"Resolved reason".to_string()));
         assert!(hidden.rows.iter().all(|row| row.len() == hidden.headers.len()));
     }
 

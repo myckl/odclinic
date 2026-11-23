@@ -4081,8 +4081,12 @@ impl OdApp {
                                     ui.label(format!("{:.2}", remaining));
                                     ui.label(apps);
                                     if od_core::is_stale_resolved_charge(charge) {
+                                        let hover = match od_core::stale_resolution_reason(&charge.note) {
+                                            Some(reason) => format!("Resolution reason: {reason}\n\n{}", charge.note),
+                                            None => charge.note.clone(),
+                                        };
                                         ui.colored_label(egui::Color32::from_rgb(150, 90, 20), "Resolved (stale)")
-                                            .on_hover_text(&charge.note);
+                                            .on_hover_text(hover);
                                     } else {
                                         ui.label("—");
                                     }
@@ -5122,7 +5126,7 @@ impl OdApp {
                             options_changed |= ui
                                 .checkbox(
                                     &mut self.report_prefs.pay_plans.show_stale_resolved,
-                                    "Show stale-resolved charge count",
+                                    "Show stale-resolved count and reasons",
                                 )
                                 .changed();
                         });
