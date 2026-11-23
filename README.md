@@ -509,7 +509,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   for numeric-aware sorting (totals sort as numbers, labels as text) and exports
   follow the displayed order. A practice name field is printed on every export
   and, along with the last export path per report, is persisted in
-  `%APPDATA%\odclinic\reports.txt`.
+  `%APPDATA%\odclinic\reports.txt`. The dedicated audit/export paths — account
+  audit bundle, filtered account ledger, payment-plan stale-resolved audit and
+  security-log extract — are saved there too, with patient-scoped exports keyed
+  by `PatNum` so two accounts keep separate filing locations across restarts.
 * Upstream `FormRp*` tranche 1: four reports ported from the public 24_3 C#
   source with OD's own column layout, each with its own toggle (on by default):
   * **Patient aging** (`FormRpAging` / `Ledgers.GetAgingQueryString`): balances
@@ -827,9 +830,11 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       patient/account record without associating two separate exports. A preview
       lists the exact rows before saving; **Refresh log** widens the in-memory log
       window, and CSV/HTML/Copy CSV/Open export folder actions mirror the other
-      report exports. Security-log rows are included only when the audit-log feature
-      and `AUDIT_TRAIL` permission are enabled; otherwise the bundle records that
-      omission explicitly instead of silently dropping them. For practice-wide
+      report exports. The chosen path is remembered per patient in `reports.txt`,
+      so reopening the account returns to the same filing location. Security-log
+      rows are included only when the audit-log feature and `AUDIT_TRAIL`
+      permission are enabled; otherwise the bundle records that omission
+      explicitly instead of silently dropping them. For practice-wide
       filing, the Payment plans report's **Filtered audit export** and the
       Setup/Security log's filtered export remain available and carry the same
       reason text.

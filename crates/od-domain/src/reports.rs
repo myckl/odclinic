@@ -1113,6 +1113,14 @@ impl Default for BrokenAppointmentReportOptions {
     }
 }
 
+/// Keys used to persist the dedicated (non-`FormRp*`) export paths alongside
+/// the per-report paths in `ReportPreferences`. Patient-scoped exports append
+/// `.PatNum` so two accounts keep separate filing locations in the same run.
+pub const EXPORT_KEY_ACCOUNT_AUDIT: &str = "account-audit";
+pub const EXPORT_KEY_ACCOUNT_LEDGER: &str = "account-ledger";
+pub const EXPORT_KEY_PAY_PLAN_AUDIT: &str = "pay-plan-audit";
+pub const EXPORT_KEY_SECURITY_LOG: &str = "security-log";
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportPreferences {
     /// Printed on exported CSV/HTML so a practice can identify its reports.
@@ -2093,6 +2101,41 @@ impl ReportPreferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_audit_export_paths_survive_preferences_text_round_trip() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_export_path(EXPORT_KEY_ACCOUNT_AUDIT, "C:\\Audit\\account.csv");
+        prefs.set_export_path(
+            format!("{EXPORT_KEY_ACCOUNT_AUDIT}.12"),
+            "C:\\Audit\\patient-12.csv",
+        );
+        prefs.set_export_path(EXPORT_KEY_ACCOUNT_LEDGER, "C:\\Audit\\ledger.csv");
+        prefs.set_export_path(EXPORT_KEY_PAY_PLAN_AUDIT, "C:\\Audit\\plans.csv");
+        prefs.set_export_path(EXPORT_KEY_SECURITY_LOG, "C:\\Audit\\security.csv");
+
+        let loaded = ReportPreferences::from_text(&prefs.to_text());
+        assert_eq!(
+            loaded.export_path(EXPORT_KEY_ACCOUNT_AUDIT),
+            Some("C:\\Audit\\account.csv")
+        );
+        assert_eq!(
+            loaded.export_path("account-audit.12"),
+            Some("C:\\Audit\\patient-12.csv")
+        );
+        assert_eq!(
+            loaded.export_path(EXPORT_KEY_ACCOUNT_LEDGER),
+            Some("C:\\Audit\\ledger.csv")
+        );
+        assert_eq!(
+            loaded.export_path(EXPORT_KEY_PAY_PLAN_AUDIT),
+            Some("C:\\Audit\\plans.csv")
+        );
+        assert_eq!(
+            loaded.export_path(EXPORT_KEY_SECURITY_LOG),
+            Some("C:\\Audit\\security.csv")
+        );
+    }
 
     #[test]
     fn round_trips_practice_name_per_report_paths_and_options() {

@@ -53,7 +53,8 @@ use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
     CustomAgingNegative, CustomAgingWriteoffDate, PlanTypeFilter, ProcedureSheetMode, ReferralFilter,
     ReportFilter, ReportFilterCondition,
-    ReportPreferences, CONFIRMATION_OTHER_FIELDS,
+    ReportPreferences, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
+    EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
     CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
     REFERRAL_REPORT_FIELDS,
 };
@@ -479,6 +480,48 @@ fn default_report_path(kind: ReportKind, extension: &str) -> String {
             chrono::Local::now().format("%Y-%m-%d"),
             extension
         ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A persisted practice-wide export path, blank when the clinic has never set one.
+fn persisted_export_path(prefs: &ReportPreferences, key: &str) -> String {
+    prefs.export_path(key).map(str::to_string).unwrap_or_default()
+}
+
+/// Dedicated exports that carry a patient number use one filing location per
+/// account. The unscoped key is honoured as a fallback for paths saved before
+/// per-patient keys existed.
+fn patient_export_key(base_key: &str, pat_num: Id) -> String {
+    format!("{base_key}.{pat_num}")
+}
+
+fn patient_export_path(
+    prefs: &ReportPreferences,
+    base_key: &str,
+    pat_num: Id,
+    fallback: String,
+) -> String {
+    prefs
+        .export_path(&patient_export_key(base_key, pat_num))
+        .or_else(|| prefs.export_path(base_key))
+        .map(str::to_string)
+        .unwrap_or(fallback)
+}
+
+/// The security-log export is practice-wide unless a patient filter is active.
+fn security_log_export_key(patient_num: Option<Id>) -> String {
+    match patient_num {
+        Some(num) => patient_export_key(EXPORT_KEY_SECURITY_LOG, num),
+        None => EXPORT_KEY_SECURITY_LOG.to_string(),
+    }
+}
+
+fn default_account_ledger_export_path(pat_num: Id) -> String {
+    std::env::current_dir()
+        .ok()
+        .unwrap_or_default()
+        .join(format!("account-ledger-patient-{pat_num}.csv"))
         .to_string_lossy()
         .into_owned()
 }
@@ -1383,8 +1426,13 @@ struct OdApp {
     account_transfer_from_text: String,
     account_transfer_to_text: String,
     account_ledger_export_path: String,
+    /// Patient whose ledger path is currently loaded, so switching accounts
+    /// reloads that account's own filing location.
+    account_ledger_export_patient: Id,
     /// Path for the patient-scoped audit bundle (reasons + security log).
     account_audit_export_path: String,
+    /// Patient whose audit-bundle path is currently loaded.
+    account_audit_export_patient: Id,
     plan_refund_transfer_target: PaymentTarget,
 
     // Payment plan state.
@@ -1494,6 +1542,9 @@ struct OdApp {
     /// scoped to one patient and filed against that record.
     security_log_patient_text: String,
     security_log_export_path: String,
+    /// Patient filter currently applied to the persisted security-log path
+    /// (`0` means the practice-wide, unscoped path).
+    security_log_export_patient: Id,
     login_name: String,
     login_pass: String,
     login_error: Option<String>,
@@ -1571,6 +1622,7 @@ impl OdApp {
         let group_permissions = store.list_group_permissions().unwrap_or_default();
         let group_attaches = store.list_user_group_attaches().unwrap_or_default();
         let security_log = store.list_security_log(50).unwrap_or_default();
+        let report_prefs = ReportPreferences::load();
         let mut app = Self {
             store,
             db_label,
@@ -1644,7 +1696,9 @@ impl OdApp {
             account_transfer_from_text: String::new(),
             account_transfer_to_text: String::new(),
             account_ledger_export_path: String::new(),
+            account_ledger_export_patient: 0,
             account_audit_export_path: String::new(),
+            account_audit_export_patient: 0,
             plan_refund_transfer_target: PaymentTarget::Unallocated,
             plan_recon_as_of_text: chrono::Local::now().format("%Y-%m-%d").to_string(),
             stale_resolution_reasons: HashMap::new(),
@@ -1704,8 +1758,11 @@ impl OdApp {
             report_to: today,
             report_export_path: String::new(),
             report_export_kind: None,
-            pay_plan_audit_export_path: String::new(),
-            report_prefs: ReportPreferences::load(),
+            pay_plan_audit_export_path: persisted_export_path(
+                &report_prefs,
+                EXPORT_KEY_PAY_PLAN_AUDIT,
+            ),
+            report_prefs,
             report_sort_column: 0,
             report_sort_desc: false,
             referrals_filter_field: "LName".into(),
@@ -1727,6 +1784,7 @@ impl OdApp {
             security_log_filter: String::new(),
             security_log_patient_text: String::new(),
             security_log_export_path: String::new(),
+            security_log_export_patient: 0,
             login_name: String::new(),
             login_pass: String::new(),
             login_error: None,
@@ -1832,6 +1890,22 @@ impl OdApp {
         }
         if !self.appt_tab.enabled(&self.features) {
             self.appt_tab = ApptTab::Schedule;
+        }
+    }
+
+    // ------------------------------------------------------------ Export paths
+
+    /// Persist a dedicated export path next to the per-report paths in
+    /// `reports.txt`, so a clinic's filing location survives a restart. Skips
+    /// redundant writes; a failed save is surfaced without hiding a successful
+    /// file write that may already have happened.
+    fn remember_export_path(&mut self, key: &str, path: &str) {
+        if self.report_prefs.export_path(key) == Some(path) {
+            return;
+        }
+        self.report_prefs.set_export_path(key, path);
+        if let Err(err) = self.report_prefs.save() {
+            self.error = Some(format!("Could not save export path preference: {err}"));
         }
     }
 
@@ -3461,26 +3535,54 @@ impl OdApp {
             to_date,
         );
 
+        if self.account_ledger_export_patient != num {
+            self.account_ledger_export_patient = num;
+            let path = patient_export_path(
+                &self.report_prefs,
+                EXPORT_KEY_ACCOUNT_LEDGER,
+                num,
+                default_account_ledger_export_path(num),
+            );
+            self.account_ledger_export_path = path.clone();
+            self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_LEDGER, num), &path);
+        }
+        let mut ledger_path_changed: Option<String> = None;
+        let mut ledger_saved: Option<String> = None;
         ui.horizontal(|ui| {
             ui.label("Export filtered ledger");
-            if self.account_ledger_export_path.is_empty() {
-                self.account_ledger_export_path = std::env::current_dir().ok().unwrap_or_default().join(format!("account-ledger-patient-{num}.csv")).to_string_lossy().to_string();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.account_ledger_export_path)
+                    .desired_width(320.0),
+            );
+            if response.changed() {
+                ledger_path_changed = Some(self.account_ledger_export_path.clone());
             }
-            ui.add(egui::TextEdit::singleline(&mut self.account_ledger_export_path).desired_width(320.0));
             let table = account_ledger_export_table(&filtered_rows);
             let csv = render_report_csv("Account ledger (filtered)", "", &table);
             let html = render_report_html("Account ledger (filtered)", "", &table);
             if ui.button("Save CSV").clicked() {
                 let path = report_export_path(&self.account_ledger_export_path, "csv");
                 match std::fs::write(&path, &csv) {
-                    Ok(()) => { self.account_ledger_export_path = path.to_string_lossy().to_string(); self.notice = Some(format!("Ledger written to {}", self.account_ledger_export_path)); self.error = None; }
+                    Ok(()) => {
+                        let path_text = path.to_string_lossy().into_owned();
+                        self.account_ledger_export_path = path_text.clone();
+                        self.notice = Some(format!("Ledger written to {path_text}"));
+                        self.error = None;
+                        ledger_saved = Some(path_text);
+                    }
                     Err(e) => self.error = Some(format!("Could not write ledger CSV: {e}")),
                 }
             }
             if ui.button("Save HTML").clicked() {
                 let path = report_export_path(&self.account_ledger_export_path, "html");
                 match std::fs::write(&path, &html) {
-                    Ok(()) => { self.account_ledger_export_path = path.to_string_lossy().to_string(); self.notice = Some(format!("Ledger written to {}", self.account_ledger_export_path)); self.error = None; }
+                    Ok(()) => {
+                        let path_text = path.to_string_lossy().into_owned();
+                        self.account_ledger_export_path = path_text.clone();
+                        self.notice = Some(format!("Ledger written to {path_text}"));
+                        self.error = None;
+                        ledger_saved = Some(path_text);
+                    }
                     Err(e) => self.error = Some(format!("Could not write ledger HTML: {e}")),
                 }
             }
@@ -3498,6 +3600,9 @@ impl OdApp {
                 }
             }
         });
+        if let Some(path) = ledger_path_changed.or(ledger_saved) {
+            self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_LEDGER, num), &path);
+        }
 
         let mut quick_refund_plan: Option<(Id, f64)> = None;
         egui::Grid::new("account_ledger")
@@ -3702,8 +3807,16 @@ impl OdApp {
             // account's charges and the matching security-log rows in one file.
             ui.separator();
             let audit_patient = patient_name(&self.patients, num);
-            if self.account_audit_export_path.is_empty() {
-                self.account_audit_export_path = default_account_audit_export_path(num);
+            if self.account_audit_export_patient != num {
+                self.account_audit_export_patient = num;
+                let path = patient_export_path(
+                    &self.report_prefs,
+                    EXPORT_KEY_ACCOUNT_AUDIT,
+                    num,
+                    default_account_audit_export_path(num),
+                );
+                self.account_audit_export_path = path.clone();
+                self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num), &path);
             }
             let audit_includes_log = self.features.enabled(FeatureKey::ShowAuditLog)
                 && self.can(Permission::AUDIT_TRAIL);
@@ -3743,12 +3856,16 @@ impl OdApp {
             let audit_practice = self.report_prefs.practice_name.clone();
             let audit_csv = render_report_csv(&audit_title, &audit_practice, &audit_table);
             let audit_html = render_report_html(&audit_title, &audit_practice, &audit_table);
+            let mut audit_path_changed: Option<String> = None;
             ui.horizontal(|ui| {
                 ui.strong("Export account audit");
-                ui.add(
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut self.account_audit_export_path)
                         .desired_width(300.0),
                 );
+                if response.changed() {
+                    audit_path_changed = Some(self.account_audit_export_path.clone());
+                }
                 if ui.button("Refresh log").clicked() {
                     self.security_log = self.store.list_security_log(500).unwrap_or_default();
                 }
@@ -3780,6 +3897,7 @@ impl OdApp {
                 }
             });
             let mut audit_saved: Option<String> = None;
+            let mut audit_file_saved: Option<String> = None;
             ui.horizontal(|ui| {
                 if ui.button("Save CSV").clicked() {
                     let path = report_export_path(&self.account_audit_export_path, "csv");
@@ -3789,6 +3907,7 @@ impl OdApp {
                             self.account_audit_export_path = path_text.clone();
                             self.notice = Some(format!("Account audit written to {path_text}"));
                             self.error = None;
+                            audit_file_saved = Some(path_text.clone());
                             audit_saved = Some(path_text);
                         }
                         Err(err) => self.error = Some(format!("Could not write account audit CSV: {err}")),
@@ -3802,6 +3921,7 @@ impl OdApp {
                             self.account_audit_export_path = path_text.clone();
                             self.notice = Some(format!("Account audit written to {path_text}"));
                             self.error = None;
+                            audit_file_saved = Some(path_text.clone());
                             audit_saved = Some(path_text);
                         }
                         Err(err) => self.error = Some(format!("Could not write account audit HTML: {err}")),
@@ -3826,6 +3946,9 @@ impl OdApp {
                     }
                 }
             });
+            if let Some(path) = audit_path_changed.or(audit_file_saved) {
+                self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num), &path);
+            }
             if let Some(destination) = audit_saved {
                 self.audit(
                     Permission::AUDIT_TRAIL,
@@ -7988,8 +8111,13 @@ impl OdApp {
                 render_report_html("Payment plans (stale resolved)", &practice, &audit_table);
             if self.pay_plan_audit_export_path.is_empty() {
                 self.pay_plan_audit_export_path = default_pay_plan_audit_export_path();
+                self.remember_export_path(
+                    EXPORT_KEY_PAY_PLAN_AUDIT,
+                    &self.pay_plan_audit_export_path.clone(),
+                );
             }
             let mut audit_export: Option<String> = None;
+            let mut audit_path_changed: Option<String> = None;
             ui.separator();
             ui.heading("Filtered audit export");
             ui.label(
@@ -7998,10 +8126,13 @@ impl OdApp {
             );
             ui.horizontal(|ui| {
                 ui.label("Export filtered plans");
-                ui.add(
+                let response = ui.add(
                     egui::TextEdit::singleline(&mut self.pay_plan_audit_export_path)
                         .desired_width(320.0),
                 );
+                if response.changed() {
+                    audit_path_changed = Some(self.pay_plan_audit_export_path.clone());
+                }
             });
             ui.horizontal(|ui| {
                 if ui.button("Export filtered plans (CSV)").clicked() {
@@ -8037,6 +8168,9 @@ impl OdApp {
                     }
                 }
             });
+            if let Some(path) = audit_path_changed.or(audit_export.clone()) {
+                self.remember_export_path(EXPORT_KEY_PAY_PLAN_AUDIT, &path);
+            }
             if let Some(path_text) = audit_export {
                 self.audit(
                     Permission::BILLING,
@@ -8360,7 +8494,32 @@ impl OdApp {
         {
             let mut refresh_log = false;
             let mut export_audit: Option<(Id, String)> = None;
+            let mut log_path_changed: Option<String> = None;
+            let mut log_file_saved: Option<String> = None;
             let patient_filter = security_log_patient_filter(&self.security_log_patient_text);
+            let log_pat_num = patient_filter.unwrap_or(0);
+            if self.security_log_export_patient != log_pat_num {
+                self.security_log_export_patient = log_pat_num;
+                let path = match patient_filter {
+                    Some(num) => patient_export_path(
+                        &self.report_prefs,
+                        EXPORT_KEY_SECURITY_LOG,
+                        num,
+                        default_security_log_export_path(Some(num)),
+                    ),
+                    None => {
+                        let persisted =
+                            persisted_export_path(&self.report_prefs, EXPORT_KEY_SECURITY_LOG);
+                        if persisted.is_empty() {
+                            default_security_log_export_path(None)
+                        } else {
+                            persisted
+                        }
+                    }
+                };
+                self.security_log_export_path = path.clone();
+                self.remember_export_path(&security_log_export_key(patient_filter), &path);
+            }
             let log: Vec<&SecurityEvent> = self
                 .security_log
                 .iter()
@@ -8374,9 +8533,6 @@ impl OdApp {
             let practice = self.report_prefs.practice_name.clone();
             let csv = render_report_csv("Security log (filtered)", &practice, &table);
             let html = render_report_html("Security log (filtered)", &practice, &table);
-            if self.security_log_export_path.is_empty() {
-                self.security_log_export_path = default_security_log_export_path(patient_filter);
-            }
             ui.collapsing(
                 format!(
                     "Security log ({}/{})",
@@ -8436,10 +8592,13 @@ impl OdApp {
                     ui.separator();
                     ui.horizontal(|ui| {
                         ui.label("Export filtered log");
-                        ui.add(
+                        let response = ui.add(
                             egui::TextEdit::singleline(&mut self.security_log_export_path)
                                 .desired_width(320.0),
                         );
+                        if response.changed() {
+                            log_path_changed = Some(self.security_log_export_path.clone());
+                        }
                     });
                     ui.horizontal(|ui| {
                         if ui.button("Export filtered log (CSV)").clicked() {
@@ -8452,6 +8611,7 @@ impl OdApp {
                                         "Exported {export_count} security log row(s) to {path_text}"
                                     ));
                                     self.error = None;
+                                    log_file_saved = Some(path_text.clone());
                                     export_audit = Some((
                                         patient_filter.unwrap_or(0),
                                         format!(
@@ -8475,6 +8635,7 @@ impl OdApp {
                                         "Exported {export_count} security log row(s) to {path_text}"
                                     ));
                                     self.error = None;
+                                    log_file_saved = Some(path_text.clone());
                                     export_audit = Some((
                                         patient_filter.unwrap_or(0),
                                         format!(
@@ -8491,6 +8652,9 @@ impl OdApp {
                     });
                 },
             );
+            if let Some(path) = log_path_changed.or(log_file_saved) {
+                self.remember_export_path(&security_log_export_key(patient_filter), &path);
+            }
             if let Some((pat_num, text)) = export_audit {
                 self.audit(Permission::AUDIT_TRAIL, pat_num, text);
             }
@@ -10621,6 +10785,53 @@ mod tests {
             default_account_audit_export_path(12).contains("account-audit-patient-12.csv"),
             "default filename must carry the patient number"
         );
+    }
+
+    /// Dedicated audit/export paths are read from the persisted preferences,
+    /// with per-patient keys keeping two accounts' filing locations separate.
+    #[test]
+    fn dedicated_export_paths_load_from_preferences() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_export_path(EXPORT_KEY_ACCOUNT_AUDIT, "C:\\Audit\\account.csv");
+        prefs.set_export_path(
+            patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, 12),
+            "C:\\Audit\\patient-12.csv",
+        );
+        prefs.set_export_path(EXPORT_KEY_ACCOUNT_LEDGER, "C:\\Audit\\ledger.csv");
+        prefs.set_export_path(EXPORT_KEY_PAY_PLAN_AUDIT, "C:\\Audit\\plans.csv");
+        prefs.set_export_path(EXPORT_KEY_SECURITY_LOG, "C:\\Audit\\security.csv");
+        let prefs = ReportPreferences::from_text(&prefs.to_text());
+
+        assert_eq!(
+            persisted_export_path(&prefs, EXPORT_KEY_PAY_PLAN_AUDIT),
+            "C:\\Audit\\plans.csv"
+        );
+        assert_eq!(
+            persisted_export_path(&prefs, EXPORT_KEY_ACCOUNT_LEDGER),
+            "C:\\Audit\\ledger.csv"
+        );
+        assert_eq!(
+            persisted_export_path(&prefs, EXPORT_KEY_SECURITY_LOG),
+            "C:\\Audit\\security.csv"
+        );
+        assert_eq!(
+            patient_export_path(&prefs, EXPORT_KEY_ACCOUNT_AUDIT, 12, "fallback".into()),
+            "C:\\Audit\\patient-12.csv"
+        );
+        assert_eq!(
+            patient_export_path(&prefs, EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            "C:\\Audit\\account.csv",
+            "an account without its own path inherits the practice-wide default"
+        );
+        assert_eq!(
+            patient_export_path(&ReportPreferences::default(), EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            "fallback"
+        );
+        assert_eq!(
+            security_log_export_key(Some(12)),
+            patient_export_key(EXPORT_KEY_SECURITY_LOG, 12)
+        );
+        assert_eq!(security_log_export_key(None), EXPORT_KEY_SECURITY_LOG);
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the
