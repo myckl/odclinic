@@ -732,6 +732,77 @@ fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
     table
 }
 
+/// A sensible default filename for a patient-scoped account audit bundle.
+/// Including the patient number makes the file ready to file against that
+/// patient's/account's record.
+fn default_account_audit_export_path(pat_num: Id) -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join(format!("account-audit-patient-{pat_num}.csv"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// One patient's stale-resolution history and matching security-log rows in a
+/// single table, so staff can file one audit file against the account instead
+/// of associating two separate exports. Details always carry `reason: …` so
+/// the same text is searchable in both sections and in CSV/HTML.
+fn account_audit_export_table(
+    pat_num: Id,
+    patient_name: &str,
+    plans: &[PayPlan],
+    charges: &[PayPlanCharge],
+    log: &[SecurityEvent],
+) -> ReportTable {
+    let mut table = ReportTable::new(&[
+        "Section",
+        "When",
+        "Patient",
+        "Plan #",
+        "Source #",
+        "User",
+        "Details",
+    ]);
+    let patient = format!("{} (#{pat_num})", patient_name);
+    for charge in charges
+        .iter()
+        .filter(|charge| charge.pat_num == pat_num && od_core::is_stale_resolved_charge(charge))
+    {
+        let reason = od_core::stale_resolution_reason(&charge.note).unwrap_or("(not recorded)");
+        let plan_note = plans
+            .iter()
+            .find(|plan| plan.pay_plan_num == charge.pay_plan_num)
+            .map(|plan| plan.note.as_str())
+            .filter(|note| !note.is_empty())
+            .unwrap_or("—");
+        let details = format!(
+            "reason: {reason} · charge #{} · plan note: {} · {}",
+            charge.pay_plan_charge_num, plan_note, charge.note
+        );
+        table.push(&[
+            "Resolved charge",
+            &charge.charge_date.to_string(),
+            &patient,
+            &charge.pay_plan_num.to_string(),
+            &charge.pay_plan_charge_num.to_string(),
+            "",
+            &details,
+        ]);
+    }
+    for event in log.iter().filter(|event| event.pat_num == pat_num) {
+        table.push(&[
+            "Security log",
+            &event.log_datetime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            &patient,
+            "",
+            &event.security_log_num.to_string(),
+            &event.user_num.to_string(),
+            &event.log_text,
+        ]);
+    }
+    table
+}
+
 /// A sensible default filename for the payment-plan stale-resolved audit
 /// export. The name makes the file easy to file alongside the security-log
 /// extract for the same reconciliation.
@@ -1312,6 +1383,8 @@ struct OdApp {
     account_transfer_from_text: String,
     account_transfer_to_text: String,
     account_ledger_export_path: String,
+    /// Path for the patient-scoped audit bundle (reasons + security log).
+    account_audit_export_path: String,
     plan_refund_transfer_target: PaymentTarget,
 
     // Payment plan state.
@@ -1571,6 +1644,7 @@ impl OdApp {
             account_transfer_from_text: String::new(),
             account_transfer_to_text: String::new(),
             account_ledger_export_path: String::new(),
+            account_audit_export_path: String::new(),
             plan_refund_transfer_target: PaymentTarget::Unallocated,
             plan_recon_as_of_text: chrono::Local::now().format("%Y-%m-%d").to_string(),
             stale_resolution_reasons: HashMap::new(),
@@ -3623,6 +3697,145 @@ impl OdApp {
                     ui.small(format!("{resolved} resolved row(s) on file"));
                 }
             });
+
+            // Patient-scoped audit bundle: the recorded reasons on this
+            // account's charges and the matching security-log rows in one file.
+            ui.separator();
+            let audit_patient = patient_name(&self.patients, num);
+            if self.account_audit_export_path.is_empty() {
+                self.account_audit_export_path = default_account_audit_export_path(num);
+            }
+            let audit_includes_log = self.features.enabled(FeatureKey::ShowAuditLog)
+                && self.can(Permission::AUDIT_TRAIL);
+            let audit_events: Vec<SecurityEvent> = if audit_includes_log {
+                self.security_log
+                    .iter()
+                    .filter(|event| event.pat_num == num)
+                    .cloned()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let audit_log_count = audit_events.len();
+            let resolved_rows = plan_charges
+                .iter()
+                .filter(|charge| charge.pat_num == num && od_core::is_stale_resolved_charge(charge))
+                .count();
+            let mut audit_table = account_audit_export_table(
+                num,
+                &audit_patient,
+                &plans,
+                &plan_charges,
+                &audit_events,
+            );
+            if !audit_includes_log {
+                audit_table.push(&[
+                    "Security log",
+                    "",
+                    &format!("#{num}"),
+                    "",
+                    "",
+                    "",
+                    "Security-log rows omitted: enable the audit log feature and AUDIT_TRAIL permission.",
+                ]);
+            }
+            let audit_title = format!("Account audit — {audit_patient} (patient #{num})");
+            let audit_practice = self.report_prefs.practice_name.clone();
+            let audit_csv = render_report_csv(&audit_title, &audit_practice, &audit_table);
+            let audit_html = render_report_html(&audit_title, &audit_practice, &audit_table);
+            ui.horizontal(|ui| {
+                ui.strong("Export account audit");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.account_audit_export_path)
+                        .desired_width(300.0),
+                );
+                if ui.button("Refresh log").clicked() {
+                    self.security_log = self.store.list_security_log(500).unwrap_or_default();
+                }
+            });
+            ui.label(format!(
+                "One file with this account's {resolved_rows} stale-resolved charge row(s) and {audit_log_count} matching security-log row(s), ready to file against the patient record."
+            ));
+            ui.collapsing("Preview bundled rows", |ui| {
+                if audit_table.rows.is_empty() {
+                    ui.weak("No stale-resolved charges or patient-scoped log rows on file.");
+                } else {
+                    egui::Grid::new(format!("account_audit_preview_{num}"))
+                        .num_columns(4)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Section");
+                            ui.strong("When");
+                            ui.strong("Source #");
+                            ui.strong("Details");
+                            ui.end_row();
+                            for row in &audit_table.rows {
+                                ui.label(&row[0]);
+                                ui.label(&row[1]);
+                                ui.label(&row[4]);
+                                ui.label(&row[6]);
+                                ui.end_row();
+                            }
+                        });
+                }
+            });
+            let mut audit_saved: Option<String> = None;
+            ui.horizontal(|ui| {
+                if ui.button("Save CSV").clicked() {
+                    let path = report_export_path(&self.account_audit_export_path, "csv");
+                    match std::fs::write(&path, &audit_csv) {
+                        Ok(()) => {
+                            let path_text = path.to_string_lossy().into_owned();
+                            self.account_audit_export_path = path_text.clone();
+                            self.notice = Some(format!("Account audit written to {path_text}"));
+                            self.error = None;
+                            audit_saved = Some(path_text);
+                        }
+                        Err(err) => self.error = Some(format!("Could not write account audit CSV: {err}")),
+                    }
+                }
+                if ui.button("Save HTML").clicked() {
+                    let path = report_export_path(&self.account_audit_export_path, "html");
+                    match std::fs::write(&path, &audit_html) {
+                        Ok(()) => {
+                            let path_text = path.to_string_lossy().into_owned();
+                            self.account_audit_export_path = path_text.clone();
+                            self.notice = Some(format!("Account audit written to {path_text}"));
+                            self.error = None;
+                            audit_saved = Some(path_text);
+                        }
+                        Err(err) => self.error = Some(format!("Could not write account audit HTML: {err}")),
+                    }
+                }
+                if ui.button("Copy CSV").clicked() {
+                    ui.ctx().copy_text(audit_csv.clone());
+                    self.notice = Some("Account audit CSV copied to clipboard".into());
+                    self.error = None;
+                    audit_saved = Some("clipboard".into());
+                }
+                if ui.button("Open export folder").clicked() {
+                    let path = report_export_path(&self.account_audit_export_path, "csv");
+                    let folder = path.parent().map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    match std::process::Command::new("explorer").arg(&folder).spawn() {
+                        Ok(_) => {
+                            self.notice = Some(format!("Opened {}", folder.display()));
+                            self.error = None;
+                        }
+                        Err(err) => self.error = Some(format!("Could not open export folder: {err}")),
+                    }
+                }
+            });
+            if let Some(destination) = audit_saved {
+                self.audit(
+                    Permission::AUDIT_TRAIL,
+                    num,
+                    format!(
+                        "Exported account audit for patient {num} ({resolved_rows} resolved charge(s), {audit_log_count} log row(s)) to {destination}"
+                    ),
+                );
+            }
+
             let show_resolved = self.account_show_resolved_plan_charges;
             let mut dyn_count = 0usize;
             let mut dyn_issued_count = 0usize;
@@ -10312,6 +10525,102 @@ mod tests {
             render_report_html("Payment plans (stale resolved)", "Highland Dental", &filtered);
         assert!(html.contains("fee corrected after chart review"));
         assert!(!html.contains("Alvarez"));
+    }
+
+    #[test]
+    fn account_audit_export_bundles_reasons_and_patient_log_rows() {
+        let when = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let plan = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 12,
+            guarantor: 12,
+            note: "Crown plan".into(),
+            ..Default::default()
+        };
+        let charges = [
+            PayPlanCharge {
+                pay_plan_charge_num: 44,
+                pay_plan_num: 8,
+                pat_num: 12,
+                guarantor: 12,
+                charge_date: when,
+                charge_type: PayPlanChargeType::Debit,
+                note: "[Stale resolved 2026-03-01: fee corrected after chart review]".into(),
+                ..Default::default()
+            },
+            PayPlanCharge {
+                pay_plan_charge_num: 45,
+                pay_plan_num: 8,
+                pat_num: 12,
+                guarantor: 12,
+                charge_date: when,
+                charge_type: PayPlanChargeType::Debit,
+                principal: 100.0,
+                note: "ordinary charge".into(),
+                ..Default::default()
+            },
+            PayPlanCharge {
+                pay_plan_charge_num: 46,
+                pay_plan_num: 9,
+                pat_num: 99,
+                guarantor: 99,
+                charge_date: when,
+                charge_type: PayPlanChargeType::Debit,
+                note: "[Stale resolved 2026-03-01: another patient reason]".into(),
+                ..Default::default()
+            },
+        ];
+        let log = [
+            SecurityEvent {
+                security_log_num: 7,
+                perm_type: Permission::BILLING,
+                user_num: 3,
+                log_datetime: when.and_hms_opt(10, 30, 0).unwrap(),
+                log_text: "Resolved 1 stale dynamic charge(s) for plan 8 (as of 2026-03-01, reason: fee corrected after chart review, blocked 0)".into(),
+                pat_num: 12,
+            },
+            SecurityEvent {
+                security_log_num: 8,
+                perm_type: Permission::BILLING,
+                user_num: 3,
+                log_datetime: when.and_hms_opt(11, 0, 0).unwrap(),
+                log_text: "other patient audit row".into(),
+                pat_num: 99,
+            },
+        ];
+
+        let table = account_audit_export_table(12, "Alvarez, Ada", &[plan], &charges, &log);
+        assert_eq!(
+            table.headers,
+            vec!["Section", "When", "Patient", "Plan #", "Source #", "User", "Details"]
+        );
+        assert_eq!(table.rows.len(), 2, "one resolved charge and one matching log row");
+        assert_eq!(table.rows[0][0], "Resolved charge");
+        assert_eq!(table.rows[0][4], "44");
+        assert!(table.rows[0][6].contains("reason: fee corrected after chart review"));
+        assert!(table.rows[0][6].contains("Crown plan"), "plan note adds context");
+        assert_eq!(table.rows[1][0], "Security log");
+        assert_eq!(table.rows[1][4], "7");
+        assert_eq!(table.rows[1][5], "3");
+        assert!(table.rows[1][6].contains("reason: fee corrected after chart review"));
+
+        let title = "Account audit — Alvarez, Ada (patient #12)";
+        let csv = render_report_csv(title, "Highland Dental", &table);
+        assert!(csv.contains("Account audit"));
+        assert!(csv.contains("patient #12"));
+        assert!(csv.contains("fee corrected after chart review"));
+        assert!(!csv.contains("another patient reason"));
+        assert!(!csv.contains("other patient audit row"));
+        let html = render_report_html(title, "Highland Dental", &table);
+        assert!(html.contains("patient #12"));
+        assert!(html.contains("fee corrected after chart review"));
+        assert!(!html.contains("another patient reason"));
+        assert!(!html.contains("other patient audit row"));
+
+        assert!(
+            default_account_audit_export_path(12).contains("account-audit-patient-12.csv"),
+            "default filename must carry the patient number"
+        );
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the

@@ -344,6 +344,55 @@ fn mysql_backend_supports_security_tables() {
     assert!(deleted, "temporary audit row was not deleted");
 }
 
+/// The patient-scoped account audit bundle matches security-log rows by
+/// `PatNum`. Verify the live backend actually round-trips that field; the
+/// original audit write check above only used `pat_num: 0`.
+#[test]
+#[ignore = "live MySQL: set ODCLINIC_DB_URL=mysql://user:pass@host:3306/db"]
+fn mysql_live_security_log_round_trips_patient_number() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let patients = store.list_patients().expect("list_patients failed");
+    assert!(patients.len() >= 2, "need two demo patients for the patient-scoped audit check");
+    let owner = patients[0].pat_num;
+    let other = patients[1].pat_num;
+    assert_ne!(owner, other);
+
+    let marker = "ODCLINIC_LIVE_TEST_PATIENT_AUDIT";
+    let event = od_domain::SecurityEvent {
+        security_log_num: 0,
+        perm_type: od_domain::Permission::BILLING,
+        user_num: 7,
+        log_datetime: chrono::Local::now().naive_local(),
+        log_text: format!("{marker}: reason: live patient audit"),
+        pat_num: owner,
+    };
+    store.append_security_log(&event).expect("append_security_log failed");
+
+    let normalized = if url.contains("://") { url.trim().to_string() } else { format!("mysql://{}", url.trim()) };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+
+    let log = store.list_security_log(500).expect("list_security_log failed");
+    let matches: Vec<_> = log.iter().filter(|row| row.log_text.starts_with(marker)).collect();
+    assert_eq!(matches.len(), 1, "temporary patient-scoped log row is missing or duplicated");
+    assert_eq!(matches[0].pat_num, owner, "PatNum did not round-trip through MySQL");
+    assert_eq!(matches[0].user_num, 7);
+    assert!(matches[0].log_text.contains("reason: live patient audit"));
+    assert!(!matches[0].log_text.contains(&other.to_string()), "log row must not mention the other patient");
+
+    let deleted = conn
+        .exec_drop(
+            "DELETE FROM securitylog WHERE LogText LIKE ?",
+            (format!("{marker}%"),),
+        )
+        .is_ok();
+    assert!(deleted, "could not clean up the temporary patient-scoped log row");
+    println!("patient-scoped security log live check: pat_num {owner} round-tripped and cleaned up");
+}
+
 /// Writes a temporary adjustment and a payment+paysplit, reads them back
 /// through the Store API, then deletes them. The database is demo-only, so
 /// direct writes to OD tables are intentional.

@@ -815,6 +815,24 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       with required notes. Unapplied plan credit can be resolved to
       patient account and, if clean, the plan can be closed; closing is blocked while
       due/future/unapplied amounts remain.
+    * **Stale charge resolution and patient-scoped account audit** — dynamic plan
+      charges that no longer match the expected schedule are previewed with their
+      evidence before **Resolve stale charges (safe)** is allowed. Staff must enter a
+      non-empty reason; safe charges are zeroed and annotated
+      `[Stale resolved <as of>: <reason>]` rather than deleted, and the reason is
+      written to the audit log. Account plan history shows resolved rows and their
+      reasons on hover. **Export account audit** bundles that one patient's resolved
+      charge reasons and matching security-log rows into a single CSV or HTML file
+      (default `account-audit-patient-<PatNum>.csv`), so it can be filed against the
+      patient/account record without associating two separate exports. A preview
+      lists the exact rows before saving; **Refresh log** widens the in-memory log
+      window, and CSV/HTML/Copy CSV/Open export folder actions mirror the other
+      report exports. Security-log rows are included only when the audit-log feature
+      and `AUDIT_TRAIL` permission are enabled; otherwise the bundle records that
+      omission explicitly instead of silently dropping them. For practice-wide
+      filing, the Payment plans report's **Filtered audit export** and the
+      Setup/Security log's filtered export remain available and carry the same
+      reason text.
     * **Overpaid procedures** (`FormRpProcOverpaid`) — completed procedures
       where patient payments plus insurance exceed the fee, with an option to
       keep only overpayments that involved insurance.
