@@ -321,6 +321,9 @@ pub struct PayPlanReportOptions {
     /// "stale resolved" charge rows. On by default so financial history stays
     /// visible; staff can hide it.
     pub show_stale_resolved: bool,
+    /// Limit the report to plans that have at least one stale-resolved charge.
+    /// Used to produce an audit subset that can be exported with the reasons.
+    pub only_stale_resolved: bool,
 }
 
 impl Default for PayPlanReportOptions {
@@ -331,6 +334,7 @@ impl Default for PayPlanReportOptions {
             limit_date_range: true, // checked in the upstream form
             hide_completed: false,  // unchecked in the upstream form
             show_stale_resolved: true,
+            only_stale_resolved: false,
         }
     }
 }
@@ -1327,6 +1331,7 @@ impl ReportPreferences {
             ("pay_plans.show_family_balance", self.pay_plans.show_family_balance),
             ("pay_plans.limit_date_range", self.pay_plans.limit_date_range),
             ("pay_plans.hide_completed", self.pay_plans.hide_completed),
+            ("pay_plans.only_stale_resolved", self.pay_plans.only_stale_resolved),
             (
                 "pay_plan_charge_applications.only_refunds_transfers",
                 self.pay_plan_charge_applications.only_refunds_transfers,
@@ -1814,6 +1819,9 @@ impl ReportPreferences {
                     "pay_plans.show_family_balance" => prefs.pay_plans.show_family_balance = flag,
                     "pay_plans.limit_date_range" => prefs.pay_plans.limit_date_range = flag,
                     "pay_plans.hide_completed" => prefs.pay_plans.hide_completed = flag,
+                    "pay_plans.only_stale_resolved" => {
+                        prefs.pay_plans.only_stale_resolved = flag
+                    }
                     "pay_plan_charge_applications.only_refunds_transfers" => {
                         prefs.pay_plan_charge_applications.only_refunds_transfers = flag
                     }
@@ -2122,6 +2130,7 @@ mod tests {
         prefs.pay_plans.plan_type = PlanTypeFilter::Patient;
         prefs.pay_plans.show_family_balance = true;
         prefs.pay_plans.hide_completed = true;
+        prefs.pay_plans.only_stale_resolved = true;
         prefs.pay_plan_charge_applications.only_refunds_transfers = true;
         prefs.new_patients.exclude_no_production = true;
         prefs.appointments.date_basis = AppointmentDateBasis::Created;
@@ -2227,6 +2236,7 @@ mod tests {
         assert_eq!(prefs.pay_plans.plan_type, PlanTypeFilter::Both);
         assert!(prefs.pay_plans.limit_date_range);
         assert!(!prefs.pay_plans.hide_completed);
+        assert!(!prefs.pay_plans.only_stale_resolved);
         assert!(!prefs.pay_plan_charge_applications.only_refunds_transfers);
         assert!(!prefs.new_patients.include_address);
         assert_eq!(prefs.appointments.date_basis, AppointmentDateBasis::Appointment);

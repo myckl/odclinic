@@ -527,8 +527,12 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
     Balance and "Limit to plans created in date range" (on by default). A
     stale-resolved charge count and the staff-entered resolution reasons are
     shown per plan (toggleable) and flow into the CSV/HTML export/print path.
-    Patient plans are read from `payplan.PlanNum = 0`; insurance plans are hidden
-    entirely while **Insurance & claims** is off.
+    "Only plans with stale-resolved charges (audit view)" narrows the report to
+    that subset and forces the reasons column on; the **Filtered audit export**
+    toolbar saves only those plan rows as CSV or HTML with a
+    `pay-plan-stale-resolved-<date>` default filename, ready to file alongside
+    the security-log extract. Patient plans are read from `payplan.PlanNum = 0`;
+    insurance plans are hidden entirely while **Insurance & claims** is off.
   * **Birthdays** (`FormRpBirthday`): OD's `LName/FName/Preferred/Address/Add2/
     City/State/Zip/Birthdate/Age` columns, comparing month/day so the birth year
     is ignored and ranges wrapping the new year still work, with a "Next Month"

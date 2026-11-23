@@ -732,6 +732,51 @@ fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
     table
 }
 
+/// A sensible default filename for the payment-plan stale-resolved audit
+/// export. The name makes the file easy to file alongside the security-log
+/// extract for the same reconciliation.
+fn default_pay_plan_audit_export_path() -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join(format!(
+            "pay-plan-stale-resolved-{}.csv",
+            chrono::Local::now().format("%Y-%m-%d")
+        ))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Keep only plan rows with a positive `Resolved` count, dropping the report's
+/// total footer. This makes the exported file a genuine stale-resolved audit
+/// subset even if the staff member did not tick the report filter checkbox.
+fn stale_resolved_export_table(table: &ReportTable) -> ReportTable {
+    let Some(resolved_index) = table.headers.iter().position(|header| header == "Resolved") else {
+        return table.clone();
+    };
+    ReportTable {
+        headers: table.headers.clone(),
+        rows: table
+            .rows
+            .iter()
+            .filter(|row| {
+                // The report footer also carries the resolved total; it is a
+                // summary, not a plan row, so never export it as an audit row.
+                if row
+                    .first()
+                    .map_or(false, |value| value.starts_with("Total ("))
+                {
+                    return false;
+                }
+                row.get(resolved_index)
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0)
+                    > 0
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 /// A sensible default location for a patient's statement PDF.
 fn default_statement_pdf_path(pat_num: Id) -> String {
     std::env::var_os("USERPROFILE")
@@ -1341,6 +1386,9 @@ struct OdApp {
     report_to: NaiveDate,
     report_export_path: String,
     report_export_kind: Option<ReportKind>,
+    /// Dedicated path for the payment-plan stale-resolved audit export, kept
+    /// separate from the general report export so both files survive.
+    pay_plan_audit_export_path: String,
     /// Practice name printed on exports and persisted in reports.txt.
     report_prefs: ReportPreferences,
     /// Click-to-sort state for the report grid; the column index is validated
@@ -1582,6 +1630,7 @@ impl OdApp {
             report_to: today,
             report_export_path: String::new(),
             report_export_kind: None,
+            pay_plan_audit_export_path: String::new(),
             report_prefs: ReportPreferences::load(),
             report_sort_column: 0,
             report_sort_desc: false,
@@ -5199,6 +5248,18 @@ impl OdApp {
                                     "Show stale-resolved count and reasons",
                                 )
                                 .changed();
+                            let only_changed = ui
+                                .checkbox(
+                                    &mut self.report_prefs.pay_plans.only_stale_resolved,
+                                    "Only plans with stale-resolved charges (audit view)",
+                                )
+                                .changed();
+                            if only_changed && self.report_prefs.pay_plans.only_stale_resolved {
+                                // The recorded reasons are the point of the
+                                // audit view, so never hide them on this path.
+                                self.report_prefs.pay_plans.show_stale_resolved = true;
+                            }
+                            options_changed |= only_changed;
                         });
                     }
                     ReportKind::PayPlanChargeApplications => {
@@ -7703,6 +7764,74 @@ impl OdApp {
                 self.error = Some(format!("Could not save report preferences: {err}"));
             }
         }
+
+        if current == ReportKind::PayPlanDetail {
+            let audit_table = stale_resolved_export_table(&table);
+            let audit_count = audit_table.rows.len();
+            let practice = self.report_prefs.practice_name.clone();
+            let audit_csv =
+                render_report_csv("Payment plans (stale resolved)", &practice, &audit_table);
+            let audit_html =
+                render_report_html("Payment plans (stale resolved)", &practice, &audit_table);
+            if self.pay_plan_audit_export_path.is_empty() {
+                self.pay_plan_audit_export_path = default_pay_plan_audit_export_path();
+            }
+            let mut audit_export: Option<String> = None;
+            ui.separator();
+            ui.heading("Filtered audit export");
+            ui.label(
+                "Saves only plans with stale-resolved charges, including the recorded reasons, \
+                 for filing alongside the security-log extract.",
+            );
+            ui.horizontal(|ui| {
+                ui.label("Export filtered plans");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pay_plan_audit_export_path)
+                        .desired_width(320.0),
+                );
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Export filtered plans (CSV)").clicked() {
+                    let path = report_export_path(&self.pay_plan_audit_export_path, "csv");
+                    match std::fs::write(&path, &audit_csv) {
+                        Ok(()) => {
+                            let path_text = path.to_string_lossy().into_owned();
+                            self.pay_plan_audit_export_path = path_text.clone();
+                            self.notice = Some(format!(
+                                "Exported {audit_count} stale-resolved plan(s) to {path_text}"
+                            ));
+                            self.error = None;
+                            audit_export = Some(path_text);
+                        }
+                        Err(err) => self.error =
+                            Some(format!("Could not export stale-resolved plans CSV: {err}")),
+                    }
+                }
+                if ui.button("Export filtered plans (HTML)").clicked() {
+                    let path = report_export_path(&self.pay_plan_audit_export_path, "html");
+                    match std::fs::write(&path, &audit_html) {
+                        Ok(()) => {
+                            let path_text = path.to_string_lossy().into_owned();
+                            self.pay_plan_audit_export_path = path_text.clone();
+                            self.notice = Some(format!(
+                                "Exported {audit_count} stale-resolved plan(s) to {path_text}"
+                            ));
+                            self.error = None;
+                            audit_export = Some(path_text);
+                        }
+                        Err(err) => self.error =
+                            Some(format!("Could not export stale-resolved plans HTML: {err}")),
+                    }
+                }
+            });
+            if let Some(path_text) = audit_export {
+                self.audit(
+                    Permission::BILLING,
+                    0,
+                    format!("Exported {audit_count} stale-resolved plan(s) to {path_text}"),
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------- Discount plans
@@ -10132,6 +10261,57 @@ mod tests {
         assert!(html.contains("Patient"));
         assert!(html.contains("fee corrected after chart review"));
         assert!(html.contains("123"));
+    }
+
+    #[test]
+    fn pay_plan_audit_export_keeps_only_stale_resolved_plans() {
+        let mut table = ReportTable::new(&[
+            "Provider",
+            "Guarantor",
+            "Balance",
+            "Resolved",
+            "Resolved reason",
+        ]);
+        table.push(&[
+            "Smith, Jo",
+            "Alvarez, Ada",
+            "0.00",
+            "0",
+            "",
+        ]);
+        table.push(&[
+            "Smith, Jo",
+            "Bennett, Ada",
+            "0.00",
+            "2",
+            "fee corrected after chart review; fee rechecked",
+        ]);
+        table.push(&[
+            "Total (2 plan(s))",
+            "",
+            "0.00",
+            "2",
+            "",
+        ]);
+
+        let filtered = stale_resolved_export_table(&table);
+        assert_eq!(filtered.headers, table.headers);
+        assert_eq!(filtered.rows.len(), 1, "footer and clean plan are excluded");
+        assert_eq!(filtered.rows[0][1], "Bennett, Ada");
+        assert_eq!(
+            filtered.rows[0][4],
+            "fee corrected after chart review; fee rechecked"
+        );
+
+        let csv = render_report_csv("Payment plans (stale resolved)", "Highland Dental", &filtered);
+        assert!(csv.contains("Resolved reason"));
+        assert!(csv.contains("fee corrected after chart review"));
+        assert!(!csv.contains("Alvarez"), "clean plan must not be exported");
+        assert!(!csv.contains("Total ("), "footer must not be exported");
+        let html =
+            render_report_html("Payment plans (stale resolved)", "Highland Dental", &filtered);
+        assert!(html.contains("fee corrected after chart review"));
+        assert!(!html.contains("Alvarez"));
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the

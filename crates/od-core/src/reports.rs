@@ -1139,7 +1139,10 @@ pub fn pay_plan_detail_report(
     if options.show_family_balance {
         headers.push("Fam Balance");
     }
-    if options.show_stale_resolved {
+    // A stale-resolved-only audit export always needs the reasons, even if the
+    // staff member did not tick the separate "show reasons" box.
+    let show_reasons = options.show_stale_resolved || options.only_stale_resolved;
+    if show_reasons {
         headers.push("Resolved");
         headers.push("Resolved reason");
     }
@@ -1153,7 +1156,7 @@ pub fn pay_plan_detail_report(
     if options.show_family_balance {
         numeric_columns.push(9 + ins_offset);
     }
-    let resolved_column = options.show_stale_resolved.then(|| headers.len() - 2);
+    let resolved_column = show_reasons.then(|| headers.len() - 2);
     if let Some(column) = resolved_column {
         numeric_columns.push(column);
     }
@@ -1172,13 +1175,30 @@ pub fn pay_plan_detail_report(
             let is_insurance = plan.insurance_plan_num != 0;
             if !insurance_enabled {
                 // Ethiopia-style configuration: patient plans only.
-                return !is_insurance;
+                if is_insurance {
+                    return false;
+                }
+            } else {
+                let keep = match options.plan_type {
+                    PlanTypeFilter::Both => true,
+                    PlanTypeFilter::Patient => !is_insurance,
+                    PlanTypeFilter::Insurance => is_insurance,
+                };
+                if !keep {
+                    return false;
+                }
             }
-            match options.plan_type {
-                PlanTypeFilter::Both => true,
-                PlanTypeFilter::Patient => !is_insurance,
-                PlanTypeFilter::Insurance => is_insurance,
+            // Audit subset: keep only plans with at least one zeroed/annotated
+            // stale charge. The reasons are rendered in the Resolved columns.
+            if options.only_stale_resolved
+                && !charges.iter().any(|charge| {
+                    charge.pay_plan_num == plan.pay_plan_num
+                        && crate::is_stale_resolved_charge(charge)
+                })
+            {
+                return false;
             }
+            true
         })
         .collect();
     ordered.sort_by_key(|plan| {
@@ -1288,7 +1308,7 @@ pub fn pay_plan_detail_report(
         if options.show_family_balance {
             values.push(format!("{family_balance:.2}"));
         }
-        if options.show_stale_resolved {
+        if show_reasons {
             values.push(resolved_count.to_string());
             values.push(resolved_reasons.join("; "));
         }
@@ -4773,6 +4793,81 @@ mod tests {
         assert!(!hidden.headers.contains(&"Resolved".to_string()));
         assert!(!hidden.headers.contains(&"Resolved reason".to_string()));
         assert!(hidden.rows.iter().all(|row| row.len() == hidden.headers.len()));
+    }
+
+    #[test]
+    fn pay_plan_detail_report_only_stale_resolved_filters_and_forces_reasons() {
+        let patients = [patient(1, "Alvarez"), patient(2, "Bennett")];
+        let providers = [Provider {
+            provider_num: 7,
+            l_name: "Smith".into(),
+            f_name: "Jo".into(),
+            ..Default::default()
+        }];
+        let clean = PayPlan {
+            pay_plan_num: 5,
+            pat_num: 1,
+            guarantor: 1,
+            pay_plan_date: day(2026, 1, 1),
+            ..Default::default()
+        };
+        let resolved = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 2,
+            guarantor: 2,
+            pay_plan_date: day(2026, 1, 1),
+            ..Default::default()
+        };
+        let charges = [
+            PayPlanCharge {
+                pay_plan_num: 5,
+                charge_date: day(2026, 1, 1),
+                charge_type: PayPlanChargeType::Debit,
+                principal: 100.0,
+                ..Default::default()
+            },
+            PayPlanCharge {
+                pay_plan_num: 8,
+                charge_date: day(2026, 2, 1),
+                charge_type: PayPlanChargeType::Debit,
+                note: "[Stale resolved 2026-03-01: fee corrected after chart review]".into(),
+                ..Default::default()
+            },
+        ];
+        let table = pay_plan_detail_report(
+            &[clean, resolved],
+            &charges,
+            &[],
+            &[],
+            &[],
+            &[],
+            &patients,
+            &providers,
+            &[],
+            day(2026, 1, 1),
+            day(2026, 3, 1),
+            false,
+            PayPlanReportOptions {
+                only_stale_resolved: true,
+                show_stale_resolved: false,
+                ..Default::default()
+            },
+        );
+        let reason_col = table
+            .headers
+            .iter()
+            .position(|h| h == "Resolved reason")
+            .expect("audit export forces the reason column");
+        assert_eq!(table.rows.len(), 2, "one plan row plus the footer");
+        assert!(
+            table.rows[0][1].contains("Bennett"),
+            "only the stale-resolved plan is present: {:?}",
+            table.rows[0]
+        );
+        assert_eq!(table.rows[0][reason_col], "fee corrected after chart review");
+        let csv = crate::render_report_csv("Payment plans", "Highland Dental", &table);
+        assert!(csv.contains("fee corrected after chart review"));
+        assert!(!csv.contains("Alvarez"), "clean plan excluded from the audit export");
     }
 
     #[test]
