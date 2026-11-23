@@ -4756,6 +4756,15 @@ mod tests {
         assert_eq!(shown.rows.last().unwrap()[resolved_col], "1", "footer totals resolved rows");
         assert_eq!(shown.rows.last().unwrap()[reason_col], "");
 
+        // Reports export the same table as CSV/HTML (the print path), so the
+        // reason must survive both renderers without extra plumbing.
+        let csv = crate::render_report_csv("Payment plans", "Highland Dental", &shown);
+        assert!(csv.contains("Resolved reason"), "CSV header missing reason column");
+        assert!(csv.contains("production reduced"), "CSV missing recorded reason");
+        let html = crate::render_report_html("Payment plans", "Highland Dental", &shown);
+        assert!(html.contains("Resolved reason"), "HTML header missing reason column");
+        assert!(html.contains("production reduced"), "HTML missing recorded reason");
+
         let hidden = pay_plan_detail_report(
             &[plan.clone()], &charges, &[], &[], &[], &[], &patients, &providers, &[],
             day(2026, 1, 1), day(2026, 3, 1), false,

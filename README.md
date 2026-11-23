@@ -524,9 +524,11 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
     principal, accumulated interest, paid, balance, due now and balance not due,
     using the upstream accumulation formulas. The original options are present:
     plan type (Both / Patient / Insurance), Hide completed plans, Show Family
-    Balance and "Limit to plans created in date range" (on by default). Patient
-    plans are read from `payplan.PlanNum = 0`; insurance plans are hidden entirely
-    while **Insurance & claims** is off.
+    Balance and "Limit to plans created in date range" (on by default). A
+    stale-resolved charge count and the staff-entered resolution reasons are
+    shown per plan (toggleable) and flow into the CSV/HTML export/print path.
+    Patient plans are read from `payplan.PlanNum = 0`; insurance plans are hidden
+    entirely while **Insurance & claims** is off.
   * **Birthdays** (`FormRpBirthday`): OD's `LName/FName/Preferred/Address/Add2/
     City/State/Zip/Birthdate/Age` columns, comparing month/day so the birth year
     is ignored and ranges wrapping the new year still work, with a "Next Month"
@@ -912,7 +914,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       "above amount" filter is inert (documented fidelity gap). `Procedure.DateTP`
       is not stored separately, so `ProcDate` is used as the treatment-plan date.
 * Setup/Security: preferences, users, effective permissions, permission-code
-  reference and the security log. User and audit views require the relevant
+  reference and the security log. The log has a case-insensitive filter across
+  details, permission and user number, so a stale-charge resolution reason can
+  be found without scanning raw rows. User and audit views require the relevant
   Open Dental permission when enforcement is on.
 
 ## Not ported yet

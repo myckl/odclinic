@@ -496,6 +496,15 @@ fn report_export_path(path: &str, extension: &str) -> std::path::PathBuf {
     }
 }
 
+/// Case-insensitive security-log search across details, permission and user.
+fn security_log_matches(event: &SecurityEvent, filter: &str) -> bool {
+    let needle = filter.trim().to_lowercase();
+    needle.is_empty()
+        || event.log_text.to_lowercase().contains(&needle)
+        || event.perm_type.label().to_lowercase().contains(&needle)
+        || event.user_num.to_string().contains(&needle)
+}
+
 #[derive(Clone)]
 struct LedgerRow {
     date: NaiveDate,
@@ -1306,6 +1315,7 @@ struct OdApp {
     group_permissions: Vec<GroupPermission>,
     group_attaches: Vec<UserGroupAttach>,
     security_log: Vec<SecurityEvent>,
+    security_log_filter: String,
     login_name: String,
     login_pass: String,
     login_error: Option<String>,
@@ -1534,6 +1544,7 @@ impl OdApp {
             group_permissions,
             group_attaches,
             security_log,
+            security_log_filter: String::new(),
             login_name: String::new(),
             login_pass: String::new(),
             login_error: None,
@@ -7947,32 +7958,55 @@ impl OdApp {
             && self.can(Permission::AUDIT_TRAIL)
         {
             let mut refresh_log = false;
-            let log = self.security_log.clone();
-            ui.collapsing(format!("Security log ({})", log.len()), |ui| {
-                if ui.button("Refresh").clicked() {
-                    refresh_log = true;
-                }
-                if log.is_empty() {
-                    ui.weak("No entries yet. Saving a patient or appointment writes one.");
-                }
-                egui::Grid::new("security_log_grid")
-                    .num_columns(4)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.strong("Time");
-                        ui.strong("User");
-                        ui.strong("Type");
-                        ui.strong("Details");
-                        ui.end_row();
-                        for event in &log {
-                            ui.label(event.log_datetime.format("%Y-%m-%d %H:%M").to_string());
-                            ui.label(event.user_num.to_string());
-                            ui.label(event.perm_type.label());
-                            ui.label(&event.log_text);
-                            ui.end_row();
+            let log: Vec<&SecurityEvent> = self
+                .security_log
+                .iter()
+                .filter(|event| security_log_matches(event, &self.security_log_filter))
+                .collect();
+            ui.collapsing(
+                format!(
+                    "Security log ({}/{})",
+                    log.len(),
+                    self.security_log.len()
+                ),
+                |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Filter");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.security_log_filter)
+                                .desired_width(260.0)
+                                .hint_text("reason, user, permission, text..."),
+                        );
+                        if ui.button("Refresh").clicked() {
+                            refresh_log = true;
                         }
                     });
-            });
+                    if log.is_empty() {
+                        if self.security_log_filter.trim().is_empty() {
+                            ui.weak("No entries yet. Saving a patient or appointment writes one.");
+                        } else {
+                            ui.weak("No log entries match the filter.");
+                        }
+                    }
+                    egui::Grid::new("security_log_grid")
+                        .num_columns(4)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Time");
+                            ui.strong("User");
+                            ui.strong("Type");
+                            ui.strong("Details");
+                            ui.end_row();
+                            for event in log {
+                                ui.label(event.log_datetime.format("%Y-%m-%d %H:%M").to_string());
+                                ui.label(event.user_num.to_string());
+                                ui.label(event.perm_type.label());
+                                ui.label(&event.log_text);
+                                ui.end_row();
+                            }
+                        });
+                },
+            );
             if refresh_log {
                 self.security_log = self.store.list_security_log(50).unwrap_or_default();
             }
@@ -9900,6 +9934,27 @@ fn treat_plan_status_label(plan: &TreatPlan) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn security_log_search_finds_stale_resolution_reason() {
+        let event = SecurityEvent {
+            security_log_num: 1,
+            perm_type: Permission::BILLING,
+            user_num: 7,
+            log_datetime: chrono::NaiveDate::from_ymd_opt(2026, 3, 1)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+            log_text: "Resolved 2 stale dynamic charge(s) for plan 8 (as of 2026-03-01, reason: fee corrected after chart review, blocked 0)".into(),
+            pat_num: 1,
+        };
+        assert!(security_log_matches(&event, ""));
+        assert!(security_log_matches(&event, "fee corrected"));
+        assert!(security_log_matches(&event, "CHART REVIEW"));
+        assert!(security_log_matches(&event, "billing"));
+        assert!(security_log_matches(&event, "7"));
+        assert!(!security_log_matches(&event, "unrelated reason"));
+    }
 
     /// Headless smoke test: the full app constructs, loads demo data and the
     /// eServices slice is wired into the same state as every other module.
