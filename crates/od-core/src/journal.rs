@@ -8,16 +8,61 @@
 
 use od_domain::{Account, AccountType, Adjustment, Id, JournalEntry};
 
-/// Memo stored on both journal lines of a posted adjustment. Including the
-/// patient number makes the line identifiable in the General Ledger without
-/// opening the account, and the adjustment number ties it back to the source.
+/// Stable token included in every posted journal memo. It lets the account
+/// ledger detect an already-posted adjustment and refuse a duplicate posting,
+/// even when staff customise the human-readable part of the memo.
+pub fn adjustment_journal_reference(adj_num: Id, pat_num: Id) -> String {
+    format!("[Adj #{adj_num} pat #{pat_num}]")
+}
+
+/// Memo stored on both journal lines of a posted adjustment. The reference
+/// token ties the line back to its source adjustment; the note makes it
+/// readable in the General Ledger without opening the account.
 pub fn adjustment_journal_memo(adj: &Adjustment) -> String {
-    let note = adj.note.trim();
-    if note.is_empty() {
-        format!("Adjustment #{} patient #{}", adj.adj_num, adj.pat_num)
+    adjustment_journal_memo_with_note(adj, &adj.note)
+}
+
+/// Build a posted memo from a free-form note while always keeping the stable
+/// reference token. Staff can edit the readable part without breaking
+/// duplicate detection.
+pub fn adjustment_journal_memo_with_note(adj: &Adjustment, note: &str) -> String {
+    let reference = adjustment_journal_reference(adj.adj_num, adj.pat_num);
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        reference
     } else {
-        format!("Adjustment #{} patient #{}: {}", adj.adj_num, adj.pat_num, note)
+        format!("{reference}: {trimmed}")
     }
+}
+
+/// The memo format written before the stable reference token was introduced.
+/// Recognising it avoids a second posting of an adjustment booked by an older
+/// build of this port.
+fn legacy_adjustment_memo(adj_num: Id, pat_num: Id) -> String {
+    format!("Adjustment #{adj_num} patient #{pat_num}")
+}
+
+fn matches_adjustment(entry: &JournalEntry, adj_num: Id, pat_num: Id) -> bool {
+    entry.memo.contains(&adjustment_journal_reference(adj_num, pat_num))
+        || entry.memo.contains(&legacy_adjustment_memo(adj_num, pat_num))
+}
+
+/// Whether any journal line already carries this adjustment's reference.
+pub fn is_adjustment_posted(journal: &[JournalEntry], adj_num: Id, pat_num: Id) -> bool {
+    journal.iter().any(|e| matches_adjustment(e, adj_num, pat_num))
+}
+
+/// Transaction number of the first posting for this adjustment, for display in
+/// the ledger's hover text.
+pub fn journal_transaction_for_adjustment(
+    journal: &[JournalEntry],
+    adj_num: Id,
+    pat_num: Id,
+) -> Option<Id> {
+    journal
+        .iter()
+        .find(|e| matches_adjustment(e, adj_num, pat_num))
+        .map(|e| e.transaction_num)
 }
 
 fn first_active(accounts: &[Account], account_type: AccountType) -> Option<Id> {
@@ -214,8 +259,42 @@ mod tests {
         assert!(entries
             .iter()
             .all(|e| e.date_displayed == NaiveDate::from_ymd_opt(2026, 11, 23).unwrap()));
-        assert!(entries.iter().all(|e| e.memo.contains("patient #7")));
+        assert!(entries
+            .iter()
+            .all(|e| e.memo.contains("[Adj #12 pat #7]")));
         assert!(validate_balanced_journal(&entries).is_ok());
+    }
+
+    #[test]
+    fn posted_adjustment_is_detected_even_with_a_custom_memo() {
+        let adj = adjustment(10.0);
+        let mut entries = build_adjustment_journal(&adj, 2, 5, 3).unwrap();
+        assert!(is_adjustment_posted(&entries, 12, 7));
+        assert_eq!(journal_transaction_for_adjustment(&entries, 12, 7), Some(3));
+        assert_eq!(adjustment_journal_memo(&adj), adjustment_journal_memo_with_note(&adj, &adj.note));
+        for entry in &mut entries {
+            entry.memo = format!(
+                "{} posted by reception",
+                adjustment_journal_reference(adj.adj_num, adj.pat_num)
+            );
+        }
+        assert!(is_adjustment_posted(&entries, 12, 7));
+        assert_eq!(journal_transaction_for_adjustment(&entries, 12, 7), Some(3));
+        assert!(!is_adjustment_posted(&entries, 99, 7));
+
+        // A custom note must never drop the reference token.
+        let memo = adjustment_journal_memo_with_note(&adj, "  edited by reception  ");
+        assert!(memo.contains(&adjustment_journal_reference(12, 7)));
+        assert!(memo.ends_with("edited by reception"));
+
+        // Pre-fix postings remain detectable so they cannot be booked twice.
+        let legacy = [JournalEntry {
+            memo: "Adjustment #12 patient #7: old note".into(),
+            transaction_num: 8,
+            ..Default::default()
+        }];
+        assert!(is_adjustment_posted(&legacy, 12, 7));
+        assert_eq!(journal_transaction_for_adjustment(&legacy, 12, 7), Some(8));
     }
 
     #[test]

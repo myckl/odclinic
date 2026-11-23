@@ -17,15 +17,16 @@ use egui::{Color32, Ui};
 use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
-    adjustment_journal_memo, birthday_report, broken_appointments_report, build_adjustment_journal,
-    build_invoice_document,
+    adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
+    build_adjustment_journal, build_invoice_document,
     build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    is_waitlist, laser_labels_report, new_patient_report, next_definition_order,
-    next_journal_transaction_num, patient_label_addresses,
+    is_adjustment_posted, is_waitlist, journal_transaction_for_adjustment, laser_labels_report,
+    new_patient_report, next_definition_order, next_journal_transaction_num,
+    patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
     parse_appointment_datetime, parse_appointment_length, pattern_for_length, payment_plan_report,
@@ -3629,6 +3630,13 @@ impl OdApp {
 
         let mut quick_refund_plan: Option<(Id, f64)> = None;
         let mut ledger_post: Option<Adjustment> = None;
+        let posting_enabled = self.features.enabled(FeatureKey::LedgerJournalPosting)
+            && self.can(Permission::ADJUSTMENT_CREATE);
+        let ledger_journal: Vec<JournalEntry> = if posting_enabled {
+            self.store.list_journal_entries().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         egui::Grid::new("account_ledger")
             .num_columns(6)
             .striped(true)
@@ -3647,15 +3655,30 @@ impl OdApp {
                     ui.label(format!("{:.2}", row.charge));
                     ui.label(format!("{:.2}", row.credit));
                     if row.kind == "Adj" {
-                        if self.features.enabled(FeatureKey::LedgerJournalPosting)
-                            && self.can(Permission::ADJUSTMENT_CREATE)
-                        {
-                            if ui.small_button("Post to ledger").clicked() {
-                                if let Some(adj) =
-                                    adjustments.iter().find(|a| a.adj_num == row.adj_num)
-                                {
+                        if posting_enabled {
+                            if let Some(adj) =
+                                adjustments.iter().find(|a| a.adj_num == row.adj_num)
+                            {
+                                if is_adjustment_posted(
+                                    &ledger_journal,
+                                    adj.adj_num,
+                                    adj.pat_num,
+                                ) {
+                                    let txn = journal_transaction_for_adjustment(
+                                        &ledger_journal,
+                                        adj.adj_num,
+                                        adj.pat_num,
+                                    )
+                                    .unwrap_or(0);
+                                    ui.weak(format!("Posted #{txn}")).on_hover_text(format!(
+                                        "Adjustment #{} is already in journal transaction #{}. Posting again would duplicate it.",
+                                        adj.adj_num, txn
+                                    ));
+                                } else if ui.small_button("Post to ledger").clicked() {
                                     ledger_post = Some(adj.clone());
                                 }
+                            } else {
+                                ui.weak("—");
                             }
                         } else {
                             ui.weak("—").on_hover_text(
@@ -3721,14 +3744,15 @@ impl OdApp {
 
         if let Some(adj) = ledger_post {
             let accounts = self.store.list_accounts().unwrap_or_default();
-            let journal = self.store.list_journal_entries().unwrap_or_default();
             let (debit, credit) =
                 suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap_or((0, 0));
             self.journal_post_edit = Some(adj.clone());
             self.journal_debit_account = debit;
             self.journal_credit_account = credit;
-            self.journal_transaction_num = next_journal_transaction_num(&journal);
-            self.journal_memo_text = adjustment_journal_memo(&adj);
+            self.journal_transaction_num = next_journal_transaction_num(&ledger_journal);
+            // Only the readable note is edited; the window re-attaches the
+            // stable adjustment reference before writing.
+            self.journal_memo_text = adj.note.clone();
             self.journal_post_open = true;
             self.error = None;
         }
@@ -8879,10 +8903,24 @@ impl OdApp {
                 .unwrap_or_else(|| format!("Select an account (#{num})"))
         };
 
+        // The reference token is rebuilt on every write, so editing the note
+        // can never strip the link back to the source adjustment.
+        let memo = adjustment_journal_memo_with_note(&adj, &self.journal_memo_text);
+
         // Build the preview from the current selections so staff see exactly
         // which accounts, amounts and memo will be written before confirming.
         let mut preview_rows: Vec<[String; 5]> = Vec::new();
         let mut preview_error: Option<String> = None;
+        if is_adjustment_posted(
+            &self.store.list_journal_entries().unwrap_or_default(),
+            adj.adj_num,
+            adj.pat_num,
+        ) {
+            preview_error = Some(format!(
+                "Adjustment #{} is already posted to the ledger. Posting again would duplicate it.",
+                adj.adj_num
+            ));
+        }
         match build_adjustment_journal(
             &adj,
             self.journal_debit_account,
@@ -8896,14 +8934,12 @@ impl OdApp {
                         account_label(entry.account_num),
                         format!("{:.2}", entry.debit_amt),
                         format!("{:.2}", entry.credit_amt),
-                        self.journal_memo_text.clone(),
+                        memo.clone(),
                     ]);
                 }
                 let mut validated = entries;
-                if !self.journal_memo_text.trim().is_empty() {
-                    for entry in &mut validated {
-                        entry.memo = self.journal_memo_text.trim().to_string();
-                    }
+                for entry in &mut validated {
+                    entry.memo = memo.clone();
                 }
                 if let Err(err) = validate_balanced_journal(&validated) {
                     preview_error = Some(err);
@@ -8964,7 +9000,8 @@ impl OdApp {
                         ui.label("Transaction #");
                         ui.label(self.journal_transaction_num.to_string());
                         ui.end_row();
-                        ui.label("Memo");
+                        ui.label("Memo note")
+                            .on_hover_text("The adjustment reference is added automatically and cannot be removed.");
                         ui.text_edit_singleline(&mut self.journal_memo_text);
                         ui.end_row();
                     });
@@ -9013,8 +9050,20 @@ impl OdApp {
             return;
         }
 
-        // Re-check with the freshest values (a selection change and a click can
-        // land on the same frame) before any write.
+        // Re-check with the freshest values (a selection change, a click or a
+        // posting from another window can land on the same frame) before any
+        // write. This is the last line of defence against a duplicate pair.
+        if is_adjustment_posted(
+            &self.store.list_journal_entries().unwrap_or_default(),
+            adj.adj_num,
+            adj.pat_num,
+        ) {
+            self.error = Some(format!(
+                "Adjustment #{} is already posted to the ledger; nothing was written.",
+                adj.adj_num
+            ));
+            return;
+        }
         let mut entries = match build_adjustment_journal(
             &adj,
             self.journal_debit_account,
@@ -9027,11 +9076,8 @@ impl OdApp {
                 return;
             }
         };
-        let memo = self.journal_memo_text.trim().to_string();
-        if !memo.is_empty() {
-            for entry in &mut entries {
-                entry.memo = memo.clone();
-            }
+        for entry in &mut entries {
+            entry.memo = memo.clone();
         }
         if let Err(err) = validate_balanced_journal(&entries) {
             self.error = Some(err);
@@ -11169,6 +11215,56 @@ mod tests {
             .unwrap()
             .iter()
             .any(|e| e.log_text.contains("posted to journal")));
+    }
+
+    /// Adjustments already in the journal must not offer a second posting, and
+    /// a custom memo note must never strip the reference used for that check.
+    #[test]
+    fn gui_ledger_posting_refuses_a_duplicate_adjustment() {
+        use od_core::adjustment_journal_reference;
+        let mut app = OdApp::new();
+        let accounts = app.store.list_accounts().unwrap();
+        let adj = Adjustment {
+            adj_num: 88,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+            adj_amount: -6.25,
+            pat_num: app.patients[0].pat_num,
+            note: "First post".into(),
+            ..Default::default()
+        };
+        let (debit, credit) = suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap();
+        let journal_before = app.store.list_journal_entries().unwrap();
+        let transaction_num = next_journal_transaction_num(&journal_before);
+        let mut entries = build_adjustment_journal(&adj, debit, credit, transaction_num).unwrap();
+        let memo = adjustment_journal_memo_with_note(&adj, "edited by reception");
+        assert!(memo.contains(&adjustment_journal_reference(88, adj.pat_num)));
+        for entry in &mut entries {
+            entry.memo = memo.clone();
+        }
+        assert!(!is_adjustment_posted(&journal_before, 88, adj.pat_num));
+        app.store.post_journal_transaction(&entries).unwrap();
+
+        let after = app.store.list_journal_entries().unwrap();
+        assert!(is_adjustment_posted(&after, 88, adj.pat_num));
+        assert_eq!(
+            journal_transaction_for_adjustment(&after, 88, adj.pat_num),
+            Some(transaction_num)
+        );
+
+        // The window's guard: a second attempt is rejected before any write.
+        if is_adjustment_posted(
+            &app.store.list_journal_entries().unwrap_or_default(),
+            adj.adj_num,
+            adj.pat_num,
+        ) {
+            app.error = Some(format!(
+                "Adjustment #{} is already posted to the ledger; nothing was written.",
+                adj.adj_num
+            ));
+        }
+        assert!(app.error.is_some_and(|e| e.contains("already posted")));
+        let after_second = app.store.list_journal_entries().unwrap();
+        assert_eq!(after_second.len(), after.len(), "no duplicate lines written");
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the

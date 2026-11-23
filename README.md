@@ -802,7 +802,12 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       and credits A/R) and can be overridden. The two lines are previewed before
       confirmation, the patient balance is unchanged, and each posting writes an
       `Adjustment Create` security-log entry so the source adjustment stays
-      traceable from the ledger to the accounting reports.
+      traceable from the ledger to the accounting reports. Each memo carries a
+      stable `[Adj #… pat #…]` reference that is re-attached even when staff edit
+      the note, so an already-posted adjustment shows **Posted #⟨transaction⟩**
+      instead of the button and a second posting is refused at confirmation —
+      no duplicate journal pair can be booked (pre-reference memos are still
+      recognised).
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be

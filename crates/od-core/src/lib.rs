@@ -43,8 +43,9 @@ pub use payment_plan::{
     MAX_PLAN_CHARGES,
 };
 pub use journal::{
-    adjustment_journal_memo, build_adjustment_journal, next_journal_transaction_num,
-    suggest_ledger_accounts, validate_balanced_journal,
+    adjustment_journal_memo, adjustment_journal_memo_with_note, adjustment_journal_reference,
+    build_adjustment_journal, is_adjustment_posted, journal_transaction_for_adjustment,
+    next_journal_transaction_num, suggest_ledger_accounts, validate_balanced_journal,
 };
 pub use pdf::{render_invoice_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};
