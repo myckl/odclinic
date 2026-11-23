@@ -4000,6 +4000,145 @@ fn mysql_live_dynamic_plan_stale_resolution() {
 
 #[test]
 #[ignore = "live MySQL: set ODCLINIC_DB_URL=mysql://user:pass@host:3306/db"]
+fn mysql_live_payment_plan_audit_export_filters_stale_resolved() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let patients = store.list_patients().expect("list_patients failed");
+    assert!(patients.len() >= 2, "need two demo patients for the audit-export check");
+    let stale_pat = patients[0].clone();
+    let clean_pat = patients[1].clone();
+    let stale_name = stale_pat.display_name();
+    let clean_name = clean_pat.display_name();
+    assert_ne!(stale_name, clean_name, "distinct guarantors make the filter assertion meaningful");
+
+    let normalized = if url.contains("://") { url.trim().to_string() } else { format!("mysql://{}", url.trim()) };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+
+    // Clear debris from an earlier failed run before writing the fixtures.
+    for note in ["ODCLINIC_LIVE_AUDIT_STALE%", "ODCLINIC_LIVE_AUDIT_CLEAN%"] {
+        let _ = conn.exec_drop(
+            "DELETE pc FROM payplancharge pc JOIN payplan pp ON pp.PayPlanNum=pc.PayPlanNum WHERE pp.Note LIKE ?",
+            (note,),
+        );
+        let _ = conn.exec_drop("DELETE FROM payplan WHERE Note LIKE ?", (note,));
+    }
+
+    let start = NaiveDate::from_ymd_opt(2098, 1, 1).unwrap();
+    let as_of = NaiveDate::from_ymd_opt(2098, 6, 1).unwrap();
+    let reason = "live audit reason verified";
+    let stale_plan_num = store
+        .upsert_pay_plan(&PayPlan {
+            pat_num: stale_pat.pat_num,
+            guarantor: stale_pat.pat_num,
+            pay_plan_date: start,
+            note: "ODCLINIC_LIVE_AUDIT_STALE".into(),
+            ..Default::default()
+        })
+        .expect("upsert stale plan");
+    let clean_plan_num = store
+        .upsert_pay_plan(&PayPlan {
+            pat_num: clean_pat.pat_num,
+            guarantor: clean_pat.pat_num,
+            pay_plan_date: start,
+            note: "ODCLINIC_LIVE_AUDIT_CLEAN".into(),
+            ..Default::default()
+        })
+        .expect("upsert clean plan");
+    let stale_charge_num = store
+        .upsert_pay_plan_charge(&PayPlanCharge {
+            pay_plan_num: stale_plan_num,
+            pat_num: stale_pat.pat_num,
+            guarantor: stale_pat.pat_num,
+            charge_date: start,
+            charge_type: PayPlanChargeType::Debit,
+            // Zeroed + annotated is exactly what safe stale resolution writes.
+            principal: 0.0,
+            interest: 0.0,
+            note: format!("[Stale resolved 2098-05-01: {reason}]"),
+            ..Default::default()
+        })
+        .expect("upsert stale charge");
+    let clean_charge_num = store
+        .upsert_pay_plan_charge(&PayPlanCharge {
+            pay_plan_num: clean_plan_num,
+            pat_num: clean_pat.pat_num,
+            guarantor: clean_pat.pat_num,
+            charge_date: start,
+            charge_type: PayPlanChargeType::Debit,
+            principal: 250.0,
+            note: "ODCLINIC_LIVE_AUDIT_CLEAN charge".into(),
+            ..Default::default()
+        })
+        .expect("upsert clean charge");
+
+    // Static plans need only their own charges; keep the fixtures isolated from
+    // other demo plans so the row counts are deterministic.
+    let plans: Vec<PayPlan> = store
+        .list_pay_plans(stale_pat.pat_num)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(store.list_pay_plans(clean_pat.pat_num).unwrap_or_default())
+        .filter(|plan| plan.pay_plan_num == stale_plan_num || plan.pay_plan_num == clean_plan_num)
+        .collect();
+    let charges: Vec<PayPlanCharge> = store
+        .list_pay_plan_charges(stale_pat.pat_num)
+        .unwrap_or_default()
+        .into_iter()
+        .chain(store.list_pay_plan_charges(clean_pat.pat_num).unwrap_or_default())
+        .filter(|charge| charge.pay_plan_num == stale_plan_num || charge.pay_plan_num == clean_plan_num)
+        .collect();
+    assert_eq!(plans.len(), 2, "both temporary plans should be readable");
+    assert_eq!(charges.len(), 2, "both temporary charges should be readable");
+    let report_patients = vec![stale_pat.clone(), clean_pat.clone()];
+    let providers = store.list_providers().expect("list_providers failed");
+
+    let full = pay_plan_detail_report(
+        &plans, &charges, &[], &[], &[], &[], &report_patients, &providers, &[],
+        start, as_of, false, PayPlanReportOptions::default(),
+    );
+    assert_eq!(full.rows.len(), 3, "unfiltered report has both plans plus the footer");
+    assert!(full.rows.iter().any(|row| row[1] == stale_name));
+    assert!(full.rows.iter().any(|row| row[1] == clean_name));
+
+    let filtered = pay_plan_detail_report(
+        &plans, &charges, &[], &[], &[], &[], &report_patients, &providers, &[],
+        start, as_of, false,
+        PayPlanReportOptions {
+            only_stale_resolved: true,
+            show_stale_resolved: false,
+            ..Default::default()
+        },
+    );
+    assert_eq!(filtered.rows.len(), 2, "only the stale-resolved plan plus the footer");
+    assert!(filtered.headers.contains(&"Resolved reason".to_string()), "audit view forces reasons on");
+    let reason_col = filtered
+        .headers
+        .iter()
+        .position(|header| header == "Resolved reason")
+        .expect("Resolved reason column");
+    assert_eq!(filtered.rows[0][1], stale_name);
+    assert_eq!(filtered.rows[0][reason_col], reason);
+    assert!(!filtered.rows.iter().any(|row| row[1] == clean_name), "clean plan leaked into the filtered report");
+
+    let csv = render_report_csv("Payment plans (stale resolved)", "Live Demo Clinic", &filtered);
+    assert!(csv.contains(reason), "CSV is missing the recorded reason");
+    assert!(csv.contains(&stale_name), "CSV is missing the stale-resolved plan");
+    assert!(!csv.contains(&clean_name), "clean plan leaked into the CSV export");
+    let html = render_report_html("Payment plans (stale resolved)", "Live Demo Clinic", &filtered);
+    assert!(html.contains(reason), "HTML is missing the recorded reason");
+    assert!(html.contains(&stale_name), "HTML is missing the stale-resolved plan");
+    assert!(!html.contains(&clean_name), "clean plan leaked into the HTML export");
+
+    let _ = conn.exec_drop("DELETE FROM payplancharge WHERE PayPlanChargeNum IN (?,?)", (stale_charge_num, clean_charge_num));
+    let _ = conn.exec_drop("DELETE FROM payplan WHERE PayPlanNum IN (?,?)", (stale_plan_num, clean_plan_num));
+    println!("payment-plan audit export live check: stale plan {stale_plan_num}, clean plan {clean_plan_num} cleaned up");
+}
+
+#[test]
+#[ignore = "live MySQL: set ODCLINIC_DB_URL=mysql://user:pass@host:3306/db"]
 fn mysql_live_plan_payment_applies_to_due_charges() {
     use od_core::allocate_plan_payment;
     use od_domain::{PayPlan, PayPlanCharge, PayPlanChargeType, PayPlanDebitType, Payment, PaymentTarget};
