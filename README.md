@@ -916,8 +916,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
 * Setup/Security: preferences, users, effective permissions, permission-code
   reference and the security log. The log has a case-insensitive filter across
   details, permission and user number, so a stale-charge resolution reason can
-  be found without scanning raw rows. User and audit views require the relevant
-  Open Dental permission when enforcement is on.
+  be found without scanning raw rows. The filtered view can be exported as CSV
+  or HTML; with a patient-number filter the default filename includes that
+  number, ready to file against the patient/account record. User and audit views
+  require the relevant Open Dental permission when enforcement is on.
 
 ## Not ported yet
 

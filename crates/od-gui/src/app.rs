@@ -505,6 +505,59 @@ fn security_log_matches(event: &SecurityEvent, filter: &str) -> bool {
         || event.user_num.to_string().contains(&needle)
 }
 
+/// Optional patient/account filter for the audit log. Blank or non-numeric
+/// values leave the log unscoped; `0` is never a valid patient number.
+fn security_log_patient_filter(text: &str) -> Option<Id> {
+    text.trim().parse::<Id>().ok().filter(|num| *num > 0)
+}
+
+/// A sensible default path for an exported audit view. Including the patient
+/// number makes the file easy to attach to that patient's/account's record.
+fn default_security_log_export_path(patient_num: Option<Id>) -> String {
+    let file = match patient_num {
+        Some(num) => format!("security-log-patient-{num}.csv"),
+        None => "security-log.csv".to_string(),
+    };
+    std::env::current_dir()
+        .unwrap_or_default()
+        .join(file)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Security-log rows as an auditable export table. The patient number is kept
+/// as its own column so a stale-resolution row can be filed against the right
+/// patient/account record outside this app.
+fn security_log_export_table(log: &[&SecurityEvent]) -> ReportTable {
+    let mut table = ReportTable::new(&[
+        "Log #",
+        "Time",
+        "User",
+        "Type",
+        "Patient",
+        "Details",
+    ]);
+    for event in log {
+        let log_num = event.security_log_num.to_string();
+        let time = event.log_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
+        let user = event.user_num.to_string();
+        let patient = if event.pat_num == 0 {
+            String::new()
+        } else {
+            event.pat_num.to_string()
+        };
+        table.push(&[
+            &log_num,
+            &time,
+            &user,
+            event.perm_type.label(),
+            &patient,
+            &event.log_text,
+        ]);
+    }
+    table
+}
+
 #[derive(Clone)]
 struct LedgerRow {
     date: NaiveDate,
@@ -1316,6 +1369,10 @@ struct OdApp {
     group_attaches: Vec<UserGroupAttach>,
     security_log: Vec<SecurityEvent>,
     security_log_filter: String,
+    /// Optional patient/account number, so an exported audit view can be
+    /// scoped to one patient and filed against that record.
+    security_log_patient_text: String,
+    security_log_export_path: String,
     login_name: String,
     login_pass: String,
     login_error: Option<String>,
@@ -1545,6 +1602,8 @@ impl OdApp {
             group_attaches,
             security_log,
             security_log_filter: String::new(),
+            security_log_patient_text: String::new(),
+            security_log_export_path: String::new(),
             login_name: String::new(),
             login_pass: String::new(),
             login_error: None,
@@ -7958,11 +8017,24 @@ impl OdApp {
             && self.can(Permission::AUDIT_TRAIL)
         {
             let mut refresh_log = false;
+            let mut export_audit: Option<(Id, String)> = None;
+            let patient_filter = security_log_patient_filter(&self.security_log_patient_text);
             let log: Vec<&SecurityEvent> = self
                 .security_log
                 .iter()
-                .filter(|event| security_log_matches(event, &self.security_log_filter))
+                .filter(|event| {
+                    security_log_matches(event, &self.security_log_filter)
+                        && patient_filter.map_or(true, |num| event.pat_num == num)
+                })
                 .collect();
+            let export_count = log.len();
+            let table = security_log_export_table(&log);
+            let practice = self.report_prefs.practice_name.clone();
+            let csv = render_report_csv("Security log (filtered)", &practice, &table);
+            let html = render_report_html("Security log (filtered)", &practice, &table);
+            if self.security_log_export_path.is_empty() {
+                self.security_log_export_path = default_security_log_export_path(patient_filter);
+            }
             ui.collapsing(
                 format!(
                     "Security log ({}/{})",
@@ -7974,39 +8046,112 @@ impl OdApp {
                         ui.label("Filter");
                         ui.add(
                             egui::TextEdit::singleline(&mut self.security_log_filter)
-                                .desired_width(260.0)
+                                .desired_width(240.0)
                                 .hint_text("reason, user, permission, text..."),
+                        );
+                        ui.label("Patient #");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.security_log_patient_text)
+                                .desired_width(80.0)
+                                .hint_text("optional"),
                         );
                         if ui.button("Refresh").clicked() {
                             refresh_log = true;
                         }
                     });
                     if log.is_empty() {
-                        if self.security_log_filter.trim().is_empty() {
+                        if self.security_log_filter.trim().is_empty()
+                            && patient_filter.is_none()
+                        {
                             ui.weak("No entries yet. Saving a patient or appointment writes one.");
                         } else {
                             ui.weak("No log entries match the filter.");
                         }
                     }
                     egui::Grid::new("security_log_grid")
-                        .num_columns(4)
+                        .num_columns(5)
                         .striped(true)
                         .show(ui, |ui| {
                             ui.strong("Time");
                             ui.strong("User");
                             ui.strong("Type");
+                            ui.strong("Patient");
                             ui.strong("Details");
                             ui.end_row();
-                            for event in log {
+                            for event in &log {
                                 ui.label(event.log_datetime.format("%Y-%m-%d %H:%M").to_string());
                                 ui.label(event.user_num.to_string());
                                 ui.label(event.perm_type.label());
+                                ui.label(if event.pat_num == 0 {
+                                    "—".to_string()
+                                } else {
+                                    event.pat_num.to_string()
+                                });
                                 ui.label(&event.log_text);
                                 ui.end_row();
                             }
                         });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Export filtered log");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.security_log_export_path)
+                                .desired_width(320.0),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Export filtered log (CSV)").clicked() {
+                            let path = report_export_path(&self.security_log_export_path, "csv");
+                            match std::fs::write(&path, &csv) {
+                                Ok(()) => {
+                                    let path_text = path.to_string_lossy().into_owned();
+                                    self.security_log_export_path = path_text.clone();
+                                    self.notice = Some(format!(
+                                        "Exported {export_count} security log row(s) to {path_text}"
+                                    ));
+                                    self.error = None;
+                                    export_audit = Some((
+                                        patient_filter.unwrap_or(0),
+                                        format!(
+                                            "Exported {export_count} security log row(s) to {path_text} (filter: {}, patient: {})",
+                                            self.security_log_filter.trim(),
+                                            self.security_log_patient_text.trim(),
+                                        ),
+                                    ));
+                                }
+                                Err(err) => self.error =
+                                    Some(format!("Could not export security log CSV: {err}")),
+                            }
+                        }
+                        if ui.button("Export filtered log (HTML)").clicked() {
+                            let path = report_export_path(&self.security_log_export_path, "html");
+                            match std::fs::write(&path, &html) {
+                                Ok(()) => {
+                                    let path_text = path.to_string_lossy().into_owned();
+                                    self.security_log_export_path = path_text.clone();
+                                    self.notice = Some(format!(
+                                        "Exported {export_count} security log row(s) to {path_text}"
+                                    ));
+                                    self.error = None;
+                                    export_audit = Some((
+                                        patient_filter.unwrap_or(0),
+                                        format!(
+                                            "Exported {export_count} security log row(s) to {path_text} (filter: {}, patient: {})",
+                                            self.security_log_filter.trim(),
+                                            self.security_log_patient_text.trim(),
+                                        ),
+                                    ));
+                                }
+                                Err(err) => self.error =
+                                    Some(format!("Could not export security log HTML: {err}")),
+                            }
+                        }
+                    });
                 },
             );
+            if let Some((pat_num, text)) = export_audit {
+                self.audit(Permission::AUDIT_TRAIL, pat_num, text);
+            }
             if refresh_log {
                 self.security_log = self.store.list_security_log(50).unwrap_or_default();
             }
@@ -9954,6 +10099,39 @@ mod tests {
         assert!(security_log_matches(&event, "billing"));
         assert!(security_log_matches(&event, "7"));
         assert!(!security_log_matches(&event, "unrelated reason"));
+
+        assert_eq!(security_log_patient_filter(" 12 "), Some(12));
+        assert_eq!(security_log_patient_filter("0"), None);
+        assert_eq!(security_log_patient_filter("abc"), None);
+    }
+
+    #[test]
+    fn security_log_export_keeps_reason_and_patient_for_audit_attachment() {
+        let event = SecurityEvent {
+            security_log_num: 42,
+            perm_type: Permission::BILLING,
+            user_num: 7,
+            log_datetime: chrono::NaiveDate::from_ymd_opt(2026, 3, 1)
+                .unwrap()
+                .and_hms_opt(9, 30, 0)
+                .unwrap(),
+            log_text: "Resolved 2 stale dynamic charge(s) for plan 8 (as of 2026-03-01, reason: fee corrected after chart review, blocked 0)".into(),
+            pat_num: 123,
+        };
+        let table = security_log_export_table(&[&event]);
+        assert_eq!(
+            table.headers,
+            vec!["Log #", "Time", "User", "Type", "Patient", "Details"]
+        );
+        assert_eq!(table.rows[0][4], "123");
+        let csv = render_report_csv("Security log (filtered)", "Highland Dental", &table);
+        assert!(csv.contains("Patient"));
+        assert!(csv.contains("fee corrected after chart review"));
+        assert!(csv.contains("123"));
+        let html = render_report_html("Security log (filtered)", "Highland Dental", &table);
+        assert!(html.contains("Patient"));
+        assert!(html.contains("fee corrected after chart review"));
+        assert!(html.contains("123"));
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the
