@@ -80,6 +80,12 @@ pub trait Store: Send + Sync {
     fn list_accounts(&self) -> Result<Vec<Account>, String>;
     /// All OD `journalentry` rows; the builders apply the date filters.
     fn list_journal_entries(&self) -> Result<Vec<JournalEntry>, String>;
+    /// Writes one balanced `journalentry` transaction. Every line must carry the
+    /// same `TransactionNum` and date, and debit/credit totals must match; the
+    /// `od_core` builder guarantees this. Both backends insert atomically so a
+    /// partial pair can never reach the accounting reports. Returns that
+    /// transaction number.
+    fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String>;
 
     // --- Report fidelity tranche 3 ---------------------------------------
     // These source tables are read-only in the port. Defaults are empty so
@@ -456,6 +462,12 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.list_journal_entries(),
             Backend::MySql(s) => s.list_journal_entries(),
+        }
+    }
+    fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.post_journal_transaction(entries),
+            Backend::MySql(s) => s.post_journal_transaction(entries),
         }
     }
 

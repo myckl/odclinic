@@ -1134,3 +1134,45 @@ fn demo_store_transfer_to_procedure_visible_in_charge_application_report() {
     let report = od_core::pay_plan_charge_applications_report(&plans, &charges, &splits, &patients, &payments, today, today, true);
     assert!(report.rows.iter().any(|r| r[5] == "Transfer/Resolve" && r[9].contains(&format!("procedure #{proc_num}"))));
 }
+
+#[test]
+fn demo_store_posts_a_balanced_adjustment_journal() {
+    let store = seeded();
+    let accounts = store.list_accounts().unwrap();
+    let journal_before = store.list_journal_entries().unwrap();
+    let adj = Adjustment {
+        adj_num: 91,
+        adj_date: NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+        adj_amount: -18.0,
+        pat_num: 1,
+        note: "Demo write-off".into(),
+        ..Default::default()
+    };
+    let (debit, credit) = od_core::suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap();
+    let entries =
+        od_core::build_adjustment_journal(&adj, debit, credit, od_core::next_journal_transaction_num(&journal_before))
+            .unwrap();
+    let transaction_num = store.post_journal_transaction(&entries).unwrap();
+
+    let after = store.list_journal_entries().unwrap();
+    let posted: Vec<&JournalEntry> = after
+        .iter()
+        .filter(|e| e.transaction_num == transaction_num)
+        .collect();
+    assert_eq!(posted.len(), 2);
+    assert_eq!(posted[0].debit_amt, 18.0);
+    assert_eq!(posted[1].credit_amt, 18.0);
+    assert!(posted.iter().all(|e| e.memo.contains("Demo write-off")));
+    assert_eq!(after.len(), journal_before.len() + 2);
+
+    // The accounting reports that were previously read-only now see the pair.
+    let balance_sheet = od_core::balance_sheet_report(
+        &accounts,
+        &after,
+        NaiveDate::from_ymd_opt(2026, 12, 31).unwrap(),
+        false,
+    );
+    assert!(balance_sheet.rows.iter().any(|r| r[0] == "Total Expenses"));
+
+    assert!(store.post_journal_transaction(&[]).is_err());
+}

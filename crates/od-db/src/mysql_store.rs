@@ -1840,6 +1840,45 @@ impl Store for MySqlStore {
             .collect())
     }
 
+    fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String> {
+        if entries.is_empty() {
+            return Err("No journal lines to post".into());
+        }
+        let transaction_num = entries[0].transaction_num;
+        if transaction_num == 0 {
+            return Err("Transaction number must be positive".into());
+        }
+        if entries.iter().any(|e| e.transaction_num != transaction_num) {
+            return Err("All journal lines must share one transaction number".into());
+        }
+        let mut conn = self.conn()?;
+        // A journal transaction is only meaningful as a whole: inserting one
+        // side of the pair would make Balance Sheet and P&L disagree.
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| e.to_string())?;
+        for entry in entries {
+            tx.exec_drop(
+                "INSERT INTO journalentry \
+                 (AccountNum,DateDisplayed,DebitAmt,CreditAmt,Memo,Splits,CheckNumber,TransactionNum) \
+                 VALUES (?,?,?,?,?,?,?,?)",
+                (
+                    entry.account_num,
+                    entry.date_displayed.format("%Y-%m-%d").to_string(),
+                    entry.debit_amt,
+                    entry.credit_amt,
+                    &entry.memo,
+                    &entry.splits,
+                    &entry.check_number,
+                    entry.transaction_num,
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(transaction_num)
+    }
+
     // --- Report fidelity tranche 3 ---------------------------------------
 
     fn list_schedules(&self) -> Result<Vec<Schedule>, String> {

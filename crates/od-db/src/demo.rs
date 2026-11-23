@@ -1549,6 +1549,36 @@ impl Store for DemoStore {
         Ok(rows)
     }
 
+    fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String> {
+        if entries.is_empty() {
+            return Err("No journal lines to post".into());
+        }
+        let transaction_num = entries[0].transaction_num;
+        if transaction_num == 0 {
+            return Err("Transaction number must be positive".into());
+        }
+        if entries
+            .iter()
+            .any(|e| e.transaction_num != transaction_num)
+        {
+            return Err("All journal lines must share one transaction number".into());
+        }
+        let mut data = self.data.lock().unwrap();
+        let mut next = data
+            .journal_entries
+            .iter()
+            .map(|e| e.journal_entry_num)
+            .max()
+            .unwrap_or(0);
+        for entry in entries {
+            next += 1;
+            let mut stored = entry.clone();
+            stored.journal_entry_num = next;
+            data.journal_entries.push(stored);
+        }
+        Ok(transaction_num)
+    }
+
     fn list_schedules(&self) -> Result<Vec<Schedule>, String> {
         let mut rows = self.data.lock().unwrap().schedules.clone();
         rows.sort_by_key(|s| (s.sched_date, s.start_time));

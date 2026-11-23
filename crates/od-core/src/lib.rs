@@ -5,6 +5,7 @@ pub mod clinical;
 pub mod definitions;
 pub mod discount;
 pub mod dynamic_payment_plan;
+pub mod journal;
 pub mod payment_plan;
 pub mod pdf;
 pub mod recall;
@@ -40,6 +41,10 @@ pub use dynamic_payment_plan::{
 pub use payment_plan::{
     charge_generation_block, generate_plan_charges, next_period_date, period_rate,
     MAX_PLAN_CHARGES,
+};
+pub use journal::{
+    adjustment_journal_memo, build_adjustment_journal, next_journal_transaction_num,
+    suggest_ledger_accounts, validate_balanced_journal,
 };
 pub use pdf::{render_invoice_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};

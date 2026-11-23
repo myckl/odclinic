@@ -17,12 +17,15 @@ use egui::{Color32, Ui};
 use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
-    birthday_report, broken_appointments_report, build_invoice_document, build_refund_transfer_receipt, build_statement_document,
+    adjustment_journal_memo, birthday_report, broken_appointments_report, build_adjustment_journal,
+    build_invoice_document,
+    build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    is_waitlist, laser_labels_report, new_patient_report, next_definition_order, patient_label_addresses,
+    is_waitlist, laser_labels_report, new_patient_report, next_definition_order,
+    next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
     parse_appointment_datetime, parse_appointment_length, pattern_for_length, payment_plan_report,
@@ -36,6 +39,7 @@ use od_core::{
     render_report_csv, render_report_html, render_statement_html, render_statement_pdf,
     restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
     interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
+    suggest_ledger_accounts, validate_balanced_journal,
     sorted_definitions, statement_report, treatment_plan_report,
     treat_plan_presentation_statistics_report, unearned_income_report,
     validate_clinic_card_issue, validate_definition, validate_display_fields,
@@ -611,6 +615,8 @@ struct LedgerRow {
     plan_num: Id,
     transfer_target: Option<PaymentTarget>,
     pay_num: Id,
+    /// Set on adjustment rows so the ledger can offer "Post to ledger".
+    adj_num: Id,
     note: String,
 }
 
@@ -632,6 +638,7 @@ fn build_account_ledger_rows(
             plan_num: 0,
             transfer_target: None,
             pay_num: 0,
+            adj_num: 0,
             note: String::new(),
         })
         .collect();
@@ -649,6 +656,7 @@ fn build_account_ledger_rows(
             plan_num: 0,
             transfer_target: None,
             pay_num: 0,
+            adj_num: a.adj_num,
             note: a.note.clone(),
         }));
     }
@@ -718,6 +726,7 @@ fn build_account_ledger_rows(
             plan_num: sp.pay_plan_num,
             transfer_target,
             pay_num: sp.pay_num,
+            adj_num: 0,
             note: payments.iter().find(|p| p.pay_num == sp.pay_num).map(|p| p.note.clone()).unwrap_or_default(),
         }
     }));
@@ -1410,6 +1419,13 @@ struct OdApp {
     adj_date_text: String,
     adj_amount_text: String,
     adj_note_text: String,
+    /// Explicit "post adjustment to ledger" path into the double-entry journal.
+    journal_post_edit: Option<Adjustment>,
+    journal_post_open: bool,
+    journal_debit_account: Id,
+    journal_credit_account: Id,
+    journal_transaction_num: Id,
+    journal_memo_text: String,
     payment_edit: Option<Payment>,
     payment_edit_open: bool,
     payment_date_text: String,
@@ -1682,6 +1698,12 @@ impl OdApp {
             adj_date_text: String::new(),
             adj_amount_text: String::new(),
             adj_note_text: String::new(),
+            journal_post_edit: None,
+            journal_post_open: false,
+            journal_debit_account: 0,
+            journal_credit_account: 0,
+            journal_transaction_num: 0,
+            journal_memo_text: String::new(),
             payment_edit: None,
             payment_edit_open: false,
             payment_date_text: String::new(),
@@ -2228,6 +2250,7 @@ impl OdApp {
         self.appointment_history_window(&ctx);
         self.recall_window(&ctx);
         self.adjustment_window(&ctx);
+        self.journal_post_window(&ctx);
         self.payment_window(&ctx);
         self.plan_window(&ctx);
         self.plan_charge_window(&ctx);
@@ -3605,6 +3628,7 @@ impl OdApp {
         }
 
         let mut quick_refund_plan: Option<(Id, f64)> = None;
+        let mut ledger_post: Option<Adjustment> = None;
         egui::Grid::new("account_ledger")
             .num_columns(6)
             .striped(true)
@@ -3622,7 +3646,23 @@ impl OdApp {
                     ui.label(&row.description);
                     ui.label(format!("{:.2}", row.charge));
                     ui.label(format!("{:.2}", row.credit));
-                    if row.kind == "Refund/Transfer" {
+                    if row.kind == "Adj" {
+                        if self.features.enabled(FeatureKey::LedgerJournalPosting)
+                            && self.can(Permission::ADJUSTMENT_CREATE)
+                        {
+                            if ui.small_button("Post to ledger").clicked() {
+                                if let Some(adj) =
+                                    adjustments.iter().find(|a| a.adj_num == row.adj_num)
+                                {
+                                    ledger_post = Some(adj.clone());
+                                }
+                            }
+                        } else {
+                            ui.weak("—").on_hover_text(
+                                "Post adjustments to the ledger is off in Settings, or the Adjustment Create permission is missing.",
+                            );
+                        }
+                    } else if row.kind == "Refund/Transfer" {
                         let target = match row.transfer_target.unwrap_or(PaymentTarget::Unallocated) {
                             PaymentTarget::Procedure(pn) => format!("procedure #{}", pn),
                             PaymentTarget::PayPlan(pn) => format!("plan #{}", pn),
@@ -3678,6 +3718,20 @@ impl OdApp {
                     ui.end_row();
                 }
             });
+
+        if let Some(adj) = ledger_post {
+            let accounts = self.store.list_accounts().unwrap_or_default();
+            let journal = self.store.list_journal_entries().unwrap_or_default();
+            let (debit, credit) =
+                suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap_or((0, 0));
+            self.journal_post_edit = Some(adj.clone());
+            self.journal_debit_account = debit;
+            self.journal_credit_account = credit;
+            self.journal_transaction_num = next_journal_transaction_num(&journal);
+            self.journal_memo_text = adjustment_journal_memo(&adj);
+            self.journal_post_open = true;
+            self.error = None;
+        }
 
         let billing_edits = self.features.enabled(FeatureKey::AccountBillingEdits);
         if let Some((plan_num, amt)) = quick_refund_plan {
@@ -8804,6 +8858,211 @@ impl OdApp {
         }
     }
 
+    /// Explicit, audited path from a recorded account adjustment into OD's
+    /// double-entry journal. The two lines are previewed before anything is
+    /// written, and the accounts default from the chart by the adjustment's sign.
+    fn journal_post_window(&mut self, ctx: &egui::Context) {
+        let Some(adj) = self.journal_post_edit.clone() else {
+            return;
+        };
+        let accounts = self.store.list_accounts().unwrap_or_default();
+        let account_label = |num: Id| -> String {
+            accounts
+                .iter()
+                .find(|a| a.account_num == num)
+                .map(|a| {
+                    format!(
+                        "{} ({:?} #{})",
+                        a.description, a.account_type, a.account_num
+                    )
+                })
+                .unwrap_or_else(|| format!("Select an account (#{num})"))
+        };
+
+        // Build the preview from the current selections so staff see exactly
+        // which accounts, amounts and memo will be written before confirming.
+        let mut preview_rows: Vec<[String; 5]> = Vec::new();
+        let mut preview_error: Option<String> = None;
+        match build_adjustment_journal(
+            &adj,
+            self.journal_debit_account,
+            self.journal_credit_account,
+            self.journal_transaction_num,
+        ) {
+            Ok(entries) => {
+                for entry in &entries {
+                    preview_rows.push([
+                        entry.date_displayed.to_string(),
+                        account_label(entry.account_num),
+                        format!("{:.2}", entry.debit_amt),
+                        format!("{:.2}", entry.credit_amt),
+                        self.journal_memo_text.clone(),
+                    ]);
+                }
+                let mut validated = entries;
+                if !self.journal_memo_text.trim().is_empty() {
+                    for entry in &mut validated {
+                        entry.memo = self.journal_memo_text.trim().to_string();
+                    }
+                }
+                if let Err(err) = validate_balanced_journal(&validated) {
+                    preview_error = Some(err);
+                }
+            }
+            Err(err) => preview_error = Some(err),
+        }
+
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Post adjustment to ledger")
+            .open(&mut self.journal_post_open)
+            .resizable(true)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "Adjustment #{} · patient #{} · {} · {:.2}",
+                    adj.adj_num, adj.pat_num, adj.adj_date, adj.adj_amount
+                ));
+                if !adj.note.trim().is_empty() {
+                    ui.label(format!("Note: {}", adj.note));
+                }
+                ui.separator();
+                ui.label(
+                    "Writes one balanced debit/credit pair with a shared transaction number. \
+                     The patient balance is unchanged; the posting makes this adjustment visible \
+                     to the Balance Sheet, General Ledger and Profit & Loss reports.",
+                );
+                egui::Grid::new("journal_post_accounts")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Debit account");
+                        egui::ComboBox::from_id_salt("journal_debit_account")
+                            .selected_text(account_label(self.journal_debit_account))
+                            .show_ui(ui, |ui| {
+                                for account in &accounts {
+                                    ui.selectable_value(
+                                        &mut self.journal_debit_account,
+                                        account.account_num,
+                                        account_label(account.account_num),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Credit account");
+                        egui::ComboBox::from_id_salt("journal_credit_account")
+                            .selected_text(account_label(self.journal_credit_account))
+                            .show_ui(ui, |ui| {
+                                for account in &accounts {
+                                    ui.selectable_value(
+                                        &mut self.journal_credit_account,
+                                        account.account_num,
+                                        account_label(account.account_num),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Transaction #");
+                        ui.label(self.journal_transaction_num.to_string());
+                        ui.end_row();
+                        ui.label("Memo");
+                        ui.text_edit_singleline(&mut self.journal_memo_text);
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.strong("Preview — nothing is written until you confirm");
+                egui::Grid::new("journal_post_preview")
+                    .num_columns(5)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Date");
+                        ui.strong("Account");
+                        ui.strong("Debit");
+                        ui.strong("Credit");
+                        ui.strong("Memo");
+                        ui.end_row();
+                        for row in &preview_rows {
+                            for cell in row {
+                                ui.label(cell);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if let Some(err) = &preview_error {
+                    ui.colored_label(Color32::RED, err);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    save = ui
+                        .button("Post to ledger")
+                        .clicked()
+                        && preview_error.is_none();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel {
+            self.journal_post_edit = None;
+            self.journal_post_open = false;
+            return;
+        }
+        if !self.journal_post_open {
+            self.journal_post_edit = None;
+            return;
+        }
+        if !save {
+            return;
+        }
+
+        // Re-check with the freshest values (a selection change and a click can
+        // land on the same frame) before any write.
+        let mut entries = match build_adjustment_journal(
+            &adj,
+            self.journal_debit_account,
+            self.journal_credit_account,
+            self.journal_transaction_num,
+        ) {
+            Ok(entries) => entries,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        let memo = self.journal_memo_text.trim().to_string();
+        if !memo.is_empty() {
+            for entry in &mut entries {
+                entry.memo = memo.clone();
+            }
+        }
+        if let Err(err) = validate_balanced_journal(&entries) {
+            self.error = Some(err);
+            return;
+        }
+        let pat_num = adj.pat_num;
+        let adj_num = adj.adj_num;
+        let amount = adj.adj_amount.abs();
+        let debit = self.journal_debit_account;
+        let credit = self.journal_credit_account;
+        match self.store.post_journal_transaction(&entries) {
+            Ok(transaction_num) => {
+                self.audit_if(
+                    FeatureKey::AuditBillingChanges,
+                    Permission::ADJUSTMENT_CREATE,
+                    pat_num,
+                    format!(
+                        "Adjustment #{adj_num} posted to journal transaction #{transaction_num}: debit account #{debit}, credit account #{credit}, amount {amount:.2}"
+                    ),
+                );
+                self.notice = Some(format!(
+                    "Adjustment posted to ledger as journal transaction #{transaction_num} — now visible in the accounting reports"
+                ));
+                self.error = None;
+                self.journal_post_edit = None;
+                self.journal_post_open = false;
+            }
+            Err(err) => self.error = Some(format!("Could not post adjustment to ledger: {err}")),
+        }
+    }
+
     fn payment_window(&mut self, ctx: &egui::Context) {
         let Some(mut payment) = self.payment_edit.take() else {
             return;
@@ -10834,6 +11093,84 @@ mod tests {
         assert_eq!(security_log_export_key(None), EXPORT_KEY_SECURITY_LOG);
     }
 
+    /// The account ledger keeps the source adjustment number so its
+    /// "Post to ledger" action can open the right adjustment for posting.
+    #[test]
+    fn account_ledger_rows_expose_the_adjustment_number() {
+        let adj = Adjustment {
+            adj_num: 42,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+            adj_amount: -15.0,
+            note: "Courtesy".into(),
+            ..Default::default()
+        };
+        let rows = build_account_ledger_rows(&[], &[adj.clone()], &[], &[], true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "Adj");
+        assert_eq!(rows[0].adj_num, 42);
+        assert_eq!(rows[0].credit, 15.0);
+        assert!(build_account_ledger_rows(&[], &[adj], &[], &[], false).is_empty());
+    }
+
+    /// Posting is a first-class, default-on toggle and writes both the journal
+    /// pair and an auditable security-log entry through the real app state.
+    #[test]
+    fn gui_ledger_posting_writes_journal_pair_and_audit_entry() {
+        let mut app = OdApp::new();
+        assert!(
+            app.features.enabled(FeatureKey::LedgerJournalPosting),
+            "ledger posting starts on"
+        );
+        assert_eq!(
+            FeatureKey::from_config_key("ledger_journal_posting"),
+            Some(FeatureKey::LedgerJournalPosting)
+        );
+        let accounts = app.store.list_accounts().unwrap();
+        let journal_before = app.store.list_journal_entries().unwrap();
+        let adj = Adjustment {
+            adj_num: 77,
+            adj_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 23).unwrap(),
+            adj_amount: -9.5,
+            pat_num: app.patients[0].pat_num,
+            note: "GUI courtesy".into(),
+            ..Default::default()
+        };
+        let (debit, credit) = suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap();
+        let transaction_num = next_journal_transaction_num(&journal_before);
+        let mut entries = build_adjustment_journal(&adj, debit, credit, transaction_num).unwrap();
+        for entry in &mut entries {
+            entry.memo = "GUI posted memo".into();
+        }
+        validate_balanced_journal(&entries).unwrap();
+        assert_eq!(
+            app.store.post_journal_transaction(&entries).unwrap(),
+            transaction_num
+        );
+        app.audit_if(
+            FeatureKey::AuditBillingChanges,
+            Permission::ADJUSTMENT_CREATE,
+            adj.pat_num,
+            format!(
+                "Adjustment #{} posted to journal transaction #{}",
+                adj.adj_num, transaction_num
+            ),
+        );
+
+        let all_entries = app.store.list_journal_entries().unwrap();
+        let posted: Vec<&JournalEntry> = all_entries
+            .iter()
+            .filter(|e| e.transaction_num == transaction_num)
+            .collect();
+        assert_eq!(posted.len(), 2);
+        assert!(posted.iter().all(|e| e.memo == "GUI posted memo"));
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("posted to journal")));
+    }
+
     /// Headless smoke test: the full app constructs, loads demo data and the
     /// eServices slice is wired into the same state as every other module.
     #[test]
@@ -11130,6 +11467,7 @@ mod tests {
                 plan_num: 1,
                 transfer_target: Some(PaymentTarget::Procedure(10)),
                 pay_num: 101,
+                adj_num: 0,
                 note: "moved to proc".into(),
             },
             LedgerRow {
@@ -11141,6 +11479,7 @@ mod tests {
                 plan_num: 2,
                 transfer_target: Some(PaymentTarget::Unallocated),
                 pay_num: 102,
+                adj_num: 0,
                 note: "refund reason".into(),
             },
             LedgerRow {
@@ -11152,6 +11491,7 @@ mod tests {
                 plan_num: 2,
                 transfer_target: None,
                 pay_num: 103,
+                adj_num: 0,
                 note: String::new(),
             },
         ];

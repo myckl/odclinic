@@ -49,10 +49,10 @@ use od_domain::reports::{
     ReferralsReportOptions, PATIENT_REPORT_FIELDS,
 };
 use od_domain::{
-    Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
-    DiscountPlan, DiscountPlanSub, Gender, Patient, PatientCorrection, PayPlan, PayPlanCharge,
-    PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Procedure, ProcedureStatus,
-    Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine, TreatPlanStatus,
+    Account, Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
+    DiscountPlan, DiscountPlanSub, Gender, JournalEntry, Patient, PatientCorrection, PayPlan,
+    PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Procedure,
+    ProcedureStatus, Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine, TreatPlanStatus,
 };
 
 #[test]
@@ -4353,4 +4353,85 @@ fn mysql_live_plan_unapplied_credit_transfer_to_procedure() {
     let _ = conn.exec_drop("DELETE FROM payplan WHERE PayPlanNum=?", (plan_num,));
     let _ = conn.exec_drop("DELETE FROM procedurelog WHERE ProcNum=?", (proc_num,));
     println!("live xfer proc: plan {plan_num} cleaned up");
+}
+
+/// Posts a balanced adjustment pair into the live OD `journalentry` table,
+/// checks both lines appear in the accounting report, then removes the
+/// temporary transaction so the demo database is left unchanged.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes a temporary journal transaction"]
+fn mysql_live_journal_posting_round_trip() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let accounts: Vec<Account> = store.list_accounts().expect("list_accounts failed");
+    assert!(
+        accounts.len() >= 2,
+        "need at least two chart-of-accounts rows for a balanced pair"
+    );
+    let journal_before = store.list_journal_entries().unwrap();
+    let transaction_num = od_core::next_journal_transaction_num(&journal_before) + 50_000;
+    let pat_num = store.list_patients().unwrap()[0].pat_num;
+    let adj = Adjustment {
+        adj_date: NaiveDate::from_ymd_opt(2099, 3, 1).unwrap(),
+        adj_amount: -12.75,
+        pat_num,
+        note: "ODCLINIC_LIVE_TEST_JOURNAL".into(),
+        ..Default::default()
+    };
+    let (debit, credit) =
+        od_core::suggest_ledger_accounts(&accounts, adj.adj_amount).expect("two distinct accounts");
+    let entries =
+        od_core::build_adjustment_journal(&adj, debit, credit, transaction_num).unwrap();
+    od_core::validate_balanced_journal(&entries).unwrap();
+
+    store
+        .post_journal_transaction(&entries)
+        .expect("post_journal_transaction failed");
+    let after = store.list_journal_entries().unwrap();
+    let posted: Vec<&JournalEntry> = after
+        .iter()
+        .filter(|e| e.transaction_num == transaction_num)
+        .collect();
+    assert_eq!(posted.len(), 2, "both journal lines must be written atomically");
+    assert!(posted.iter().any(|e| e.debit_amt == 12.75));
+    assert!(posted.iter().any(|e| e.credit_amt == 12.75));
+    assert!(posted
+        .iter()
+        .all(|e| e.memo.contains("ODCLINIC_LIVE_TEST_JOURNAL")));
+
+    let report = general_ledger_report(
+        &accounts,
+        &after,
+        NaiveDate::from_ymd_opt(2099, 1, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2099, 12, 31).unwrap(),
+        false,
+    );
+    assert!(
+        report
+            .rows
+            .concat()
+            .join("|")
+            .contains("ODCLINIC_LIVE_TEST_JOURNAL"),
+        "the posting must reach the previously read-only General Ledger"
+    );
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    conn.query_drop(format!(
+        "DELETE FROM journalentry WHERE TransactionNum = {transaction_num}"
+    ))
+    .expect("journal cleanup failed");
+    assert!(store
+        .list_journal_entries()
+        .unwrap()
+        .iter()
+        .all(|e| e.transaction_num != transaction_num));
+    println!("live journal posting: transaction {transaction_num} round-tripped and cleaned up");
 }

@@ -791,7 +791,18 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       Liability/Equity/Income credit-positive), fold prior-year income/expense
       into retained earnings and derive current-year net income — never stored.
       The Balance Sheet uses the range's end date; the Ledger shows opening and
-      closing balances per account.
+      closing balances per account. Those reports are no longer read-only: the
+      Account ledger's adjustment rows have a **Post to ledger** action (toggle
+      `ledger_journal_posting`, on by default, plus the OD *Adjustment Create*
+      permission). It writes one balanced `journalentry` transaction — a debit
+      and a credit of the adjustment's absolute value sharing a `TransactionNum`
+      and date — through `Store::post_journal_transaction`, which inserts both
+      lines atomically in MySQL. Debit/credit accounts default from the chart by
+      sign (a charge debits A/R and credits income; a write-off debits expense
+      and credits A/R) and can be overridden. The two lines are previewed before
+      confirmation, the patient balance is unchanged, and each posting writes an
+      `Adjustment Create` security-log entry so the source adjustment stays
+      traceable from the ledger to the accounting reports.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be
