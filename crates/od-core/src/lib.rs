@@ -30,8 +30,9 @@ pub use discount::{
 };
 pub use dynamic_payment_plan::{
     calc_periods_for_frequency, calculate_period_payment, chargeable_entries, completed_amount,
-    expected_charges, issuance_block, issue_charges_due, principal_amount, production_entries,
-    reconciliation, reconciliation_detail, resolve_stale_issued_charges, with_amount_remaining,
+    expected_charges, issuance_block, issue_charges_due, is_stale_resolved_charge,
+    principal_amount, production_entries, reconciliation, reconciliation_detail,
+    resolve_stale_issued_charges, with_amount_remaining,
     DynamicPlanReconciliation, ProductionEntry, StaleIssuedCharge, StaleResolutionResult,
     MAX_CATCH_UP_PERIODS,
 };

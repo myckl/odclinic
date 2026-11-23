@@ -2643,7 +2643,7 @@ fn mysql_upstream_reports_build_from_live_data() {
         },
     );
     println!("payment-plan detail: {} row(s)", detail.rows.len());
-    assert_eq!(detail.headers.len(), 10, "no Ins column with insurance off, plus unapplied credit");
+    assert_eq!(detail.headers.len(), 11, "no Ins column with insurance off, plus unapplied credit and stale-resolved count");
     assert!(detail.rows.last().unwrap()[0].starts_with("Total ("));
     assert!(detail.rows.iter().all(|row| row.len() == detail.headers.len()));
 

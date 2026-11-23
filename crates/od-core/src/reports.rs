@@ -1139,14 +1139,21 @@ pub fn pay_plan_detail_report(
     if options.show_family_balance {
         headers.push("Fam Balance");
     }
+    if options.show_stale_resolved {
+        headers.push("Resolved");
+    }
     let mut table = ReportTable::new(&headers);
 
-    // Column layout: Provider, Guarantor, [Ins], six amounts, [Fam Balance].
-    // This mirrors the order used when the headers were built above.
+    // Column layout: Provider, Guarantor, [Ins], six amounts, [Fam Balance],
+    // [Resolved]. This mirrors the order used when the headers were built above.
     let ins_offset = usize::from(insurance_enabled);
     let mut numeric_columns: Vec<usize> = (0..7).map(|index| 2 + ins_offset + index).collect();
     if options.show_family_balance {
         numeric_columns.push(9 + ins_offset);
+    }
+    let resolved_column = options.show_stale_resolved.then(|| headers.len() - 1);
+    if let Some(column) = resolved_column {
+        numeric_columns.push(column);
     }
     let mut totals = vec![0.0_f64; numeric_columns.len()];
     let mut shown = 0usize;
@@ -1184,6 +1191,10 @@ pub fn pay_plan_detail_report(
             .iter()
             .filter(|charge| charge.pay_plan_num == plan.pay_plan_num)
             .collect();
+        let resolved_count = own_charges
+            .iter()
+            .filter(|charge| crate::is_stale_resolved_charge(charge))
+            .count();
         let debits: Vec<&PayPlanCharge> = own_charges
             .iter()
             .copied()
@@ -1267,6 +1278,9 @@ pub fn pay_plan_detail_report(
         if options.show_family_balance {
             values.push(format!("{family_balance:.2}"));
         }
+        if options.show_stale_resolved {
+            values.push(resolved_count.to_string());
+        }
         table.push(&values.iter().map(String::as_str).collect::<Vec<_>>());
 
         for (total_index, column) in numeric_columns.iter().enumerate() {
@@ -1280,7 +1294,12 @@ pub fn pay_plan_detail_report(
     let mut footer = vec![String::new(); headers.len()];
     footer[0] = format!("Total ({shown} plan(s))");
     for (total_index, column) in numeric_columns.iter().enumerate() {
-        footer[*column] = format!("{:.2}", totals[total_index]);
+        // Resolved is a row count, not a money amount.
+        footer[*column] = if Some(*column) == resolved_column {
+            format!("{}", totals[total_index] as usize)
+        } else {
+            format!("{:.2}", totals[total_index])
+        };
     }
     table.push(&footer.iter().map(String::as_str).collect::<Vec<_>>());
     table
@@ -4685,6 +4704,51 @@ mod tests {
         assert_eq!(table.rows[0][2], "300.00", "dynamic principal comes from linked production");
         assert_eq!(table.rows[0][6], "100.00", "due now from issued charges");
         assert!(table.rows[0][8].contains("issued"), "dynamic detail includes reconciliation: {:?}", table.rows[0][8]);
+    }
+
+    #[test]
+    fn pay_plan_detail_report_exposes_stale_resolved_count_and_honors_toggle() {
+        let patients = [patient(1, "Alvarez")];
+        let providers = [Provider { provider_num: 7, l_name: "Smith".into(), f_name: "Jo".into(), ..Default::default() }];
+        let plan = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 1,
+            guarantor: 1,
+            pay_plan_date: day(2026, 1, 1),
+            ..Default::default()
+        };
+        let charges = [
+            PayPlanCharge {
+                pay_plan_num: 8,
+                charge_date: day(2026, 1, 1),
+                charge_type: PayPlanChargeType::Debit,
+                principal: 100.0,
+                provider_num: 7,
+                ..Default::default()
+            },
+            PayPlanCharge {
+                pay_plan_num: 8,
+                charge_date: day(2026, 2, 1),
+                charge_type: PayPlanChargeType::Debit,
+                note: "[Stale resolved 2026-03-01: production reduced]".into(),
+                ..Default::default()
+            },
+        ];
+        let shown = pay_plan_detail_report(
+            &[plan.clone()], &charges, &[], &[], &[], &[], &patients, &providers, &[],
+            day(2026, 1, 1), day(2026, 3, 1), false, PayPlanReportOptions::default(),
+        );
+        let resolved_col = shown.headers.iter().position(|h| h == "Resolved").expect("Resolved column shown by default");
+        assert_eq!(shown.rows[0][resolved_col], "1");
+        assert_eq!(shown.rows.last().unwrap()[resolved_col], "1", "footer totals resolved rows");
+
+        let hidden = pay_plan_detail_report(
+            &[plan.clone()], &charges, &[], &[], &[], &[], &patients, &providers, &[],
+            day(2026, 1, 1), day(2026, 3, 1), false,
+            PayPlanReportOptions { show_stale_resolved: false, ..Default::default() },
+        );
+        assert!(!hidden.headers.contains(&"Resolved".to_string()));
+        assert!(hidden.rows.iter().all(|row| row.len() == hidden.headers.len()));
     }
 
     #[test]

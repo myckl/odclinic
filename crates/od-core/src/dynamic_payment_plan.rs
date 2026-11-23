@@ -247,7 +247,10 @@ fn is_down_payment(charge: &PayPlanCharge) -> bool {
     charge.note.to_lowercase().contains("down payment")
 }
 
-fn is_stale_resolved(charge: &PayPlanCharge) -> bool {
+/// True when a charge row was zeroed and annotated by
+/// [`resolve_stale_issued_charges`] rather than deleted. The financial history
+/// row is intentionally kept for audit; callers decide whether to display it.
+pub fn is_stale_resolved_charge(charge: &PayPlanCharge) -> bool {
     (charge.principal + charge.interest).abs() < 0.005 && charge.note.contains("[Stale resolved")
 }
 
@@ -472,7 +475,7 @@ pub fn reconciliation(
 ) -> DynamicPlanReconciliation {
     let (all_own, expected_due, expected_full, stale) =
         reconciliation_detail(plan, links, procedures, adjustments, splits, existing_charges, as_of);
-    let own_active: Vec<&PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved(c)).collect();
+    let own_active: Vec<&PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved_charge(c)).collect();
     let issued: Vec<&PayPlanCharge> = own_active.iter().copied().filter(|c| c.charge_date <= as_of).collect();
     let issued_total: f64 = issued.iter().map(|c| c.principal + c.interest).sum();
     let expected_due_total: f64 = expected_due.iter().map(|c| c.principal + c.interest).sum();
@@ -529,7 +532,7 @@ pub fn reconciliation_detail(
         .filter(|c| c.pay_plan_num == plan.pay_plan_num && c.charge_type == PayPlanChargeType::Debit && !is_down_payment(c))
         .cloned()
         .collect();
-    let own_existing: Vec<PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved(c)).cloned().collect();
+    let own_existing: Vec<PayPlanCharge> = all_own.iter().filter(|c| !is_stale_resolved_charge(c)).cloned().collect();
     let expected_due = build_charges(plan, &entries, &[], as_of, true, false);
     let expected_full = build_charges(plan, &entries, &[], as_of, false, false);
 
@@ -964,5 +967,25 @@ mod tests {
             assert_eq!(round2(c.principal + c.interest), 0.0);
             assert!(c.note.contains("Stale resolved"));
         }
+    }
+
+    #[test]
+    fn stale_resolved_charge_marker_is_recognized() {
+        let marker = "[Stale resolved 2026-03-01: production reduced]";
+        let mut charge = PayPlanCharge {
+            note: marker.into(),
+            ..Default::default()
+        };
+        assert!(is_stale_resolved_charge(&charge));
+
+        // The marker alone is not enough: a live charge may legitimately quote
+        // the resolution in its note while still carrying a balance.
+        charge.principal = 50.0;
+        assert!(!is_stale_resolved_charge(&charge));
+
+        // Nor is a zeroed charge without the annotation a resolved row.
+        charge.principal = 0.0;
+        charge.note.clear();
+        assert!(!is_stale_resolved_charge(&charge));
     }
 }

@@ -164,6 +164,21 @@ fn gather_pay_plan_charges(store: &dyn Store, patients: &[Patient]) -> Vec<PayPl
     out
 }
 
+/// Charge rows to show in the Account plan history. Stale-resolved rows are
+/// zeroed/annotated history kept for audit; hiding them is an explicit staff
+/// choice and never changes the stored rows or reconciliation.
+fn visible_plan_charge_rows<'a>(
+    charges: &'a [PayPlanCharge],
+    plan_num: Id,
+    show_stale_resolved: bool,
+) -> Vec<&'a PayPlanCharge> {
+    charges
+        .iter()
+        .filter(|charge| charge.pay_plan_num == plan_num)
+        .filter(|charge| show_stale_resolved || !od_core::is_stale_resolved_charge(charge))
+        .collect()
+}
+
 fn gather_treat_plans(store: &dyn Store, patients: &[Patient]) -> Vec<TreatPlan> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1183,6 +1198,8 @@ struct OdApp {
     statement_pdf_path: String,
     statement_pdf_patient: Id,
     account_show_refunds_transfers_only: bool,
+    /// Stale-resolved plan charge rows stay visible by default for audit.
+    account_show_resolved_plan_charges: bool,
     account_transfer_plan_filter: Id,
     account_transfer_target_filter: PaymentTarget,
     account_transfer_from_text: String,
@@ -1430,6 +1447,7 @@ impl OdApp {
             statement_pdf_path: String::new(),
             statement_pdf_patient: 0,
             account_show_refunds_transfers_only: false,
+            account_show_resolved_plan_charges: true,
             account_transfer_plan_filter: 0,
             account_transfer_target_filter: PaymentTarget::Unallocated,
             account_transfer_from_text: String::new(),
@@ -3462,6 +3480,20 @@ impl OdApp {
             });
             let as_of = chrono::NaiveDate::parse_from_str(&self.plan_recon_as_of_text, "%Y-%m-%d")
                 .unwrap_or(today);
+            ui.horizontal(|ui| {
+                ui.checkbox(
+                    &mut self.account_show_resolved_plan_charges,
+                    "Show stale-resolved charges in plan history",
+                );
+                let resolved = plan_charges
+                    .iter()
+                    .filter(|c| od_core::is_stale_resolved_charge(c))
+                    .count();
+                if resolved > 0 {
+                    ui.small(format!("{resolved} resolved row(s) on file"));
+                }
+            });
+            let show_resolved = self.account_show_resolved_plan_charges;
             let mut dyn_count = 0usize;
             let mut dyn_issued_count = 0usize;
             let mut dyn_expected_due_count = 0usize;
@@ -3953,12 +3985,14 @@ impl OdApp {
                             }
                         }
 
-                        let own_charges: Vec<&PayPlanCharge> = plan_charges
+                        let own_charges =
+                            visible_plan_charge_rows(&plan_charges, plan.pay_plan_num, show_resolved);
+                        let hidden_resolved = plan_charges
                             .iter()
-                            .filter(|c| c.pay_plan_num == plan.pay_plan_num)
-                            .collect();
+                            .filter(|c| c.pay_plan_num == plan.pay_plan_num && od_core::is_stale_resolved_charge(c))
+                            .count();
                         egui::Grid::new(format!("plan_charges_{}", plan.pay_plan_num))
-                            .num_columns(7)
+                            .num_columns(8)
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.strong("Due");
@@ -3968,6 +4002,7 @@ impl OdApp {
                                 ui.strong("Paid");
                                 ui.strong("Remaining");
                                 ui.strong("Applications");
+                                ui.strong("Status");
                                 ui.end_row();
                                 for charge in own_charges {
                                     let charge_splits: Vec<_> = splits
@@ -3988,9 +4023,20 @@ impl OdApp {
                                     ui.label(format!("{:.2}", paid));
                                     ui.label(format!("{:.2}", remaining));
                                     ui.label(apps);
+                                    if od_core::is_stale_resolved_charge(charge) {
+                                        ui.colored_label(egui::Color32::from_rgb(150, 90, 20), "Resolved (stale)")
+                                            .on_hover_text(&charge.note);
+                                    } else {
+                                        ui.label("—");
+                                    }
                                     ui.end_row();
                                 }
                             });
+                        if !show_resolved && hidden_resolved > 0 {
+                            ui.small(format!(
+                                "{hidden_resolved} stale-resolved charge row(s) hidden; audit history is retained."
+                            ));
+                        }
                         ui.label("To pay this plan, use Record payment and choose the plan in the dialog.");
                     },
                 );
@@ -5014,6 +5060,12 @@ impl OdApp {
                                 .checkbox(
                                     &mut self.report_prefs.pay_plans.limit_date_range,
                                     "Limit to plans created in date range",
+                                )
+                                .changed();
+                            options_changed |= ui
+                                .checkbox(
+                                    &mut self.report_prefs.pay_plans.show_stale_resolved,
+                                    "Show stale-resolved charge count",
                                 )
                                 .changed();
                         });
@@ -10017,6 +10069,42 @@ mod tests {
         assert!(stale_zeroed, "stale charge should be zeroed and annotated");
         let logs = app.store.list_security_log(200).unwrap();
         assert!(logs.iter().any(|l| l.log_text.contains("Resolved") && l.log_text.contains("stale dynamic charge")), "audit missing");
+    }
+
+    #[test]
+    fn stale_resolved_plan_charge_display_filter_respects_toggle() {
+        let active = PayPlanCharge {
+            pay_plan_num: 1,
+            charge_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            charge_type: PayPlanChargeType::Debit,
+            principal: 100.0,
+            pay_plan_charge_num: 1,
+            ..Default::default()
+        };
+        let resolved = PayPlanCharge {
+            pay_plan_num: 1,
+            charge_date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+            charge_type: PayPlanChargeType::Debit,
+            note: "[Stale resolved 2026-03-01: production reduced]".into(),
+            pay_plan_charge_num: 2,
+            ..Default::default()
+        };
+        let other_plan = PayPlanCharge {
+            pay_plan_num: 2,
+            note: "[Stale resolved 2026-03-01: production reduced]".into(),
+            pay_plan_charge_num: 3,
+            ..Default::default()
+        };
+        let charges = [active, resolved, other_plan];
+
+        let shown = visible_plan_charge_rows(&charges, 1, true);
+        assert_eq!(shown.len(), 2, "resolved rows are visible by default for audit");
+        assert!(shown.iter().any(|c| od_core::is_stale_resolved_charge(c)));
+
+        let hidden = visible_plan_charge_rows(&charges, 1, false);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(hidden[0].pay_plan_charge_num, 1);
+        assert!(!hidden.iter().any(|c| od_core::is_stale_resolved_charge(c)));
     }
 
     #[test]

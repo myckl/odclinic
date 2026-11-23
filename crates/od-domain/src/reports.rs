@@ -317,6 +317,9 @@ pub struct PayPlanReportOptions {
     pub show_family_balance: bool,
     pub limit_date_range: bool,
     pub hide_completed: bool,
+    /// Show the audit count of zeroed/annotated "stale resolved" charge rows.
+    /// On by default so financial history stays visible; staff can hide it.
+    pub show_stale_resolved: bool,
 }
 
 impl Default for PayPlanReportOptions {
@@ -326,6 +329,7 @@ impl Default for PayPlanReportOptions {
             show_family_balance: false,
             limit_date_range: true, // checked in the upstream form
             hide_completed: false,  // unchecked in the upstream form
+            show_stale_resolved: true,
         }
     }
 }
