@@ -86,6 +86,18 @@ pub trait Store: Send + Sync {
     /// partial pair can never reach the accounting reports. Returns that
     /// transaction number.
     fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String>;
+    /// Writes several journal transactions as one atomic batch. Each inner
+    /// slice is one transaction group (normally a balanced debit/credit pair)
+    /// with its own `TransactionNum`; every line across every group lands
+    /// together or none do. Returns the transaction numbers in the order
+    /// supplied. The default keeps external implementors working, but both
+    /// bundled backends override it to guarantee all-or-nothing writes.
+    fn post_journal_batch(&self, batches: &[Vec<JournalEntry>]) -> Result<Vec<Id>, String> {
+        batches
+            .iter()
+            .map(|entries| self.post_journal_transaction(entries))
+            .collect()
+    }
 
     // --- Report fidelity tranche 3 ---------------------------------------
     // These source tables are read-only in the port. Defaults are empty so
@@ -468,6 +480,12 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.post_journal_transaction(entries),
             Backend::MySql(s) => s.post_journal_transaction(entries),
+        }
+    }
+    fn post_journal_batch(&self, batches: &[Vec<JournalEntry>]) -> Result<Vec<Id>, String> {
+        match self {
+            Backend::Demo(s) => s.post_journal_batch(batches),
+            Backend::MySql(s) => s.post_journal_batch(batches),
         }
     }
 

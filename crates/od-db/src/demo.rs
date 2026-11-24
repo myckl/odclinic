@@ -1579,6 +1579,43 @@ impl Store for DemoStore {
         Ok(transaction_num)
     }
 
+    fn post_journal_batch(&self, batches: &[Vec<JournalEntry>]) -> Result<Vec<Id>, String> {
+        if batches.is_empty() {
+            return Err("No journal transactions to post".into());
+        }
+        let mut transaction_nums = Vec::with_capacity(batches.len());
+        for (index, entries) in batches.iter().enumerate() {
+            if entries.is_empty() {
+                return Err(format!("Journal batch {index} has no lines"));
+            }
+            let transaction_num = entries[0].transaction_num;
+            if transaction_num == 0 {
+                return Err(format!("Journal batch {index} has no transaction number"));
+            }
+            if entries.iter().any(|e| e.transaction_num != transaction_num) {
+                return Err(format!("Journal batch {index} mixes transaction numbers"));
+            }
+            transaction_nums.push(transaction_num);
+        }
+        // Hold the lock for the whole batch so no other write can interleave.
+        let mut data = self.data.lock().unwrap();
+        let mut next = data
+            .journal_entries
+            .iter()
+            .map(|e| e.journal_entry_num)
+            .max()
+            .unwrap_or(0);
+        for entries in batches {
+            for entry in entries {
+                next += 1;
+                let mut stored = entry.clone();
+                stored.journal_entry_num = next;
+                data.journal_entries.push(stored);
+            }
+        }
+        Ok(transaction_nums)
+    }
+
     fn list_schedules(&self) -> Result<Vec<Schedule>, String> {
         let mut rows = self.data.lock().unwrap().schedules.clone();
         rows.sort_by_key(|s| (s.sched_date, s.start_time));

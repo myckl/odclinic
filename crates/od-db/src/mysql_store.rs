@@ -1879,6 +1879,54 @@ impl Store for MySqlStore {
         Ok(transaction_num)
     }
 
+    fn post_journal_batch(&self, batches: &[Vec<JournalEntry>]) -> Result<Vec<Id>, String> {
+        if batches.is_empty() {
+            return Err("No journal transactions to post".into());
+        }
+        let mut transaction_nums = Vec::with_capacity(batches.len());
+        for (index, entries) in batches.iter().enumerate() {
+            if entries.is_empty() {
+                return Err(format!("Journal batch {index} has no lines"));
+            }
+            let transaction_num = entries[0].transaction_num;
+            if transaction_num == 0 {
+                return Err(format!("Journal batch {index} has no transaction number"));
+            }
+            if entries.iter().any(|e| e.transaction_num != transaction_num) {
+                return Err(format!("Journal batch {index} mixes transaction numbers"));
+            }
+            transaction_nums.push(transaction_num);
+        }
+        let mut conn = self.conn()?;
+        // One DB transaction for the whole batch: a failed charge can never
+        // leave the ledger with only part of the posting run booked.
+        let mut tx = conn
+            .start_transaction(mysql::TxOpts::default())
+            .map_err(|e| e.to_string())?;
+        for entries in batches {
+            for entry in entries {
+                tx.exec_drop(
+                    "INSERT INTO journalentry \
+                     (AccountNum,DateDisplayed,DebitAmt,CreditAmt,Memo,Splits,CheckNumber,TransactionNum) \
+                     VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        entry.account_num,
+                        entry.date_displayed.format("%Y-%m-%d").to_string(),
+                        entry.debit_amt,
+                        entry.credit_amt,
+                        &entry.memo,
+                        &entry.splits,
+                        &entry.check_number,
+                        entry.transaction_num,
+                    ),
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(transaction_nums)
+    }
+
     // --- Report fidelity tranche 3 ---------------------------------------
 
     fn list_schedules(&self) -> Result<Vec<Schedule>, String> {

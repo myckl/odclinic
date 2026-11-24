@@ -18,8 +18,8 @@ use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
     adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
-    build_adjustment_journal, build_invoice_document, build_payment_journal,
-    build_refund_transfer_receipt, build_statement_document,
+    build_adjustment_journal, build_charge_posting_plan, build_invoice_document,
+    build_payment_journal, build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
@@ -40,7 +40,7 @@ use od_core::{
     render_report_csv, render_report_html, render_statement_html, render_statement_pdf,
     restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
     interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
-    payment_journal_memo_with_note, suggest_ledger_accounts,
+    payment_journal_memo_with_note, suggest_charge_ledger_accounts, suggest_ledger_accounts,
     suggest_payment_ledger_accounts, validate_balanced_journal,
     sorted_definitions, statement_report, treatment_plan_report,
     treat_plan_presentation_statistics_report, unearned_income_report,
@@ -1534,6 +1534,11 @@ struct OdApp {
     journal_credit_account: Id,
     journal_transaction_num: Id,
     journal_memo_text: String,
+    /// Practice-wide batch posting of completed-procedure charges. The window
+    /// previews the plan, then writes every balanced pair in one DB transaction.
+    charge_post_open: bool,
+    charge_post_debit: Id,
+    charge_post_credit: Id,
     payment_edit: Option<Payment>,
     payment_edit_open: bool,
     payment_date_text: String,
@@ -1812,6 +1817,9 @@ impl OdApp {
             journal_credit_account: 0,
             journal_transaction_num: 0,
             journal_memo_text: String::new(),
+            charge_post_open: false,
+            charge_post_debit: 0,
+            charge_post_credit: 0,
             payment_edit: None,
             payment_edit_open: false,
             payment_date_text: String::new(),
@@ -2359,6 +2367,7 @@ impl OdApp {
         self.recall_window(&ctx);
         self.adjustment_window(&ctx);
         self.journal_post_window(&ctx);
+        self.charge_post_window(&ctx);
         self.payment_window(&ctx);
         self.plan_window(&ctx);
         self.plan_charge_window(&ctx);
@@ -5679,6 +5688,32 @@ impl OdApp {
         }
         if !current.uses_date_range() {
             ui.label("Balance and summary reports use the range end date as 'as of'; the start date is ignored.");
+        }
+        // Accounting reports read only `journalentry`, so completed-procedure
+        // charges must be posted before the Balance Sheet and P&L are complete.
+        if matches!(
+            current,
+            ReportKind::BalanceSheet | ReportKind::GeneralLedger | ReportKind::ProfitLoss
+        ) {
+            ui.horizontal(|ui| {
+                if self.features.enabled(FeatureKey::LedgerJournalPosting)
+                    && self.can(Permission::ADJUSTMENT_CREATE)
+                {
+                    if ui.button("Post all unposted charges").clicked() {
+                        let accounts = self.store.list_accounts().unwrap_or_default();
+                        let (debit, credit) =
+                            suggest_charge_ledger_accounts(&accounts).unwrap_or((0, 0));
+                        self.charge_post_debit = debit;
+                        self.charge_post_credit = credit;
+                        self.charge_post_open = true;
+                        self.error = None;
+                    }
+                    ui.weak("One balanced journal pair per completed procedure not already in the ledger.")
+                        .on_hover_text("A/R is debited and income credited for each charge; the whole run is written atomically.");
+                } else {
+                    ui.weak("Charge posting is off in Settings, or the Adjustment Create permission is missing.");
+                }
+            });
         }
         // The upstream reports expose the same option checkboxes/radios as the
         // original FormRp* dialogs. Changes are saved with the other report
@@ -9251,6 +9286,197 @@ impl OdApp {
         }
     }
 
+    /// Practice-wide batch posting of completed-procedure charges. The plan is
+    /// rebuilt from fresh store data each frame and again on confirm, so a
+    /// charge cannot be posted twice even if another window changed the ledger
+    /// while this one was open.
+    fn charge_post_window(&mut self, ctx: &egui::Context) {
+        if !self.charge_post_open {
+            return;
+        }
+        let accounts = self.store.list_accounts().unwrap_or_default();
+        let account_label = |num: Id| -> String {
+            accounts
+                .iter()
+                .find(|a| a.account_num == num)
+                .map(|a| {
+                    format!(
+                        "{} ({:?} #{})",
+                        a.description, a.account_type, a.account_num
+                    )
+                })
+                .unwrap_or_else(|| format!("Select an account (#{num})"))
+        };
+
+        // Gather every patient's completed procedures. Charge posting is
+        // practice-wide because the accounting reports it feeds are too.
+        let mut procedures = Vec::new();
+        for patient in &self.patients {
+            procedures.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+        }
+        let plan = build_charge_posting_plan(
+            &procedures,
+            &self.store.list_journal_entries().unwrap_or_default(),
+            self.charge_post_debit,
+            self.charge_post_credit,
+        );
+        let total: f64 = plan.iter().map(|charge| charge.procedure.fee.abs()).sum();
+        let accounts_ok = self.charge_post_debit != 0
+            && self.charge_post_credit != 0
+            && self.charge_post_debit != self.charge_post_credit;
+
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Post all unposted charges")
+            .open(&mut self.charge_post_open)
+            .resizable(true)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} completed procedure(s) ready to post, for {total:.2} of charges.",
+                    plan.len()
+                ));
+                if plan.is_empty() {
+                    ui.colored_label(
+                        Color32::GRAY,
+                        "Nothing to post — every completed procedure is already in the ledger (or has no fee).",
+                    );
+                }
+                ui.separator();
+                ui.label(
+                    "Writes one balanced journal pair per charge: debit Accounts Receivable, \
+                     credit Income, dated to the procedure. The patient balance is unchanged.",
+                );
+                egui::Grid::new("charge_post_accounts")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label("Debit account (A/R)");
+                        egui::ComboBox::from_id_salt("charge_post_debit_account")
+                            .selected_text(account_label(self.charge_post_debit))
+                            .show_ui(ui, |ui| {
+                                for account in &accounts {
+                                    ui.selectable_value(
+                                        &mut self.charge_post_debit,
+                                        account.account_num,
+                                        account_label(account.account_num),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Credit account (Income)");
+                        egui::ComboBox::from_id_salt("charge_post_credit_account")
+                            .selected_text(account_label(self.charge_post_credit))
+                            .show_ui(ui, |ui| {
+                                for account in &accounts {
+                                    ui.selectable_value(
+                                        &mut self.charge_post_credit,
+                                        account.account_num,
+                                        account_label(account.account_num),
+                                    );
+                                }
+                            });
+                        ui.end_row();
+                    });
+                ui.separator();
+                ui.strong("Preview — nothing is written until you confirm");
+                if plan.is_empty() {
+                    ui.label("No charges to post.");
+                } else {
+                    egui::Grid::new("charge_post_preview")
+                        .num_columns(5)
+                        .striped(true)
+                        .show(ui, |ui| {
+                            ui.strong("Date");
+                            ui.strong("Procedure");
+                            ui.strong("Patient");
+                            ui.strong("Fee");
+                            ui.strong("Transaction");
+                            ui.end_row();
+                            for charge in &plan {
+                                ui.label(charge.procedure.proc_date.to_string());
+                                ui.label(&charge.entries[0].memo);
+                                ui.label(format!("#{}", charge.procedure.pat_num));
+                                ui.label(format!("{:.2}", charge.procedure.fee));
+                                ui.label(charge.transaction_num.to_string());
+                                ui.end_row();
+                            }
+                        });
+                }
+                if !accounts_ok {
+                    ui.colored_label(Color32::RED, "Select two different accounts before posting.");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    save = ui.button("Post to ledger").clicked() && !plan.is_empty() && accounts_ok;
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel {
+            self.charge_post_open = false;
+            return;
+        }
+        if !self.charge_post_open || !save {
+            return;
+        }
+        // Rebuild from fresh data so the plan cannot go stale between the
+        // preview and the write: a charge posted elsewhere in the meantime is
+        // left out, and transaction numbers stay unique.
+        let mut procedures = Vec::new();
+        for patient in &self.patients {
+            procedures.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+        }
+        let plan = build_charge_posting_plan(
+            &procedures,
+            &self.store.list_journal_entries().unwrap_or_default(),
+            self.charge_post_debit,
+            self.charge_post_credit,
+        );
+        if plan.is_empty() {
+            self.notice = Some("No unposted charges remain; nothing was written.".into());
+            self.charge_post_open = false;
+            return;
+        }
+        // Last line of defence: never hand an unbalanced pair to the store.
+        for charge in &plan {
+            if let Err(err) = validate_balanced_journal(&charge.entries) {
+                self.error = Some(format!("Refusing to post an unbalanced charge: {err}"));
+                return;
+            }
+        }
+        let count = plan.len();
+        let total: f64 = plan.iter().map(|charge| charge.procedure.fee.abs()).sum();
+        let first_txn = plan.first().map(|c| c.transaction_num).unwrap_or(0);
+        let last_txn = plan.last().map(|c| c.transaction_num).unwrap_or(0);
+        let batches: Vec<Vec<JournalEntry>> = plan.iter().map(|c| c.entries.to_vec()).collect();
+        match self.store.post_journal_batch(&batches) {
+            Ok(written) => {
+                // One audit line per patient touched keeps every patient's
+                // security log traceable to this practice-wide run.
+                let mut audited = std::collections::BTreeSet::new();
+                for charge in &plan {
+                    audited.insert(charge.procedure.pat_num);
+                }
+                for pat_num in audited {
+                    self.audit_if(
+                        FeatureKey::AuditBillingChanges,
+                        Permission::ADJUSTMENT_CREATE,
+                        pat_num,
+                        format!(
+                            "Batch posted {count} completed-procedure charge(s) to journal transactions #{first_txn}–#{last_txn}: total {total:.2}"
+                        ),
+                    );
+                }
+                self.notice = Some(format!(
+                    "Posted {count} charge(s) for {total:.2} to the ledger as {written:?} — now visible in the accounting reports"
+                ));
+                self.error = None;
+                self.charge_post_open = false;
+            }
+            Err(err) => self.error = Some(format!("Could not post charges to ledger: {err}")),
+        }
+    }
+
     fn payment_window(&mut self, ctx: &egui::Context) {
         let Some(mut payment) = self.payment_edit.take() else {
             return;
@@ -11546,6 +11772,95 @@ mod tests {
             all.len(),
             "no duplicate payment lines written"
         );
+    }
+
+    /// A batch run writes every balanced pair in one call, audits each touched
+    /// patient, and cannot book the same charge twice on a second run.
+    #[test]
+    fn gui_charge_batch_writes_pairs_audits_and_guards_duplicates() {
+        use od_core::is_procedure_posted;
+        use od_domain::{Procedure, ProcedureStatus};
+        let mut app = OdApp::new();
+        let accounts = app.store.list_accounts().unwrap();
+        let (debit, credit) = suggest_charge_ledger_accounts(&accounts).unwrap();
+        let pat = app.patients[0].pat_num;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let procedures: Vec<Procedure> = (0..3)
+            .map(|i| Procedure {
+                proc_num: 500 + i,
+                pat_num: pat,
+                proc_date: date,
+                proc_status: ProcedureStatus::Complete,
+                fee: 25.0 + i as f64,
+                code_num: 3,
+                description_override: format!("Test filling {i}"),
+                ..Default::default()
+            })
+            .collect();
+        let before = app.store.list_journal_entries().unwrap();
+        let plan = build_charge_posting_plan(&procedures, &before, debit, credit);
+        assert_eq!(plan.len(), 3);
+        let batches: Vec<Vec<JournalEntry>> = plan.iter().map(|c| c.entries.to_vec()).collect();
+        let txns = app.store.post_journal_batch(&batches).unwrap();
+        assert_eq!(txns.len(), 3);
+
+        let all = app.store.list_journal_entries().unwrap();
+        assert_eq!(all.len(), before.len() + 6, "two lines per charge");
+        for charge in &plan {
+            let posted: Vec<&JournalEntry> = all
+                .iter()
+                .filter(|e| e.transaction_num == charge.transaction_num)
+                .collect();
+            assert_eq!(posted.len(), 2);
+            assert!(posted.iter().any(|e| e.debit_amt == charge.procedure.fee
+                && e.account_num == debit));
+            assert!(posted.iter().any(|e| e.credit_amt == charge.procedure.fee
+                && e.account_num == credit));
+            assert!(is_procedure_posted(&all, charge.procedure.proc_num, pat));
+        }
+        app.audit_if(
+            FeatureKey::AuditBillingChanges,
+            Permission::ADJUSTMENT_CREATE,
+            pat,
+            "Batch posted 3 completed-procedure charge(s)".into(),
+        );
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Batch posted 3")));
+
+        // A second run sees every procedure as posted and books nothing.
+        let after = app.store.list_journal_entries().unwrap();
+        assert!(build_charge_posting_plan(&procedures, &after, debit, credit).is_empty());
+        assert_eq!(app.store.list_journal_entries().unwrap().len(), all.len());
+    }
+
+    /// A batch containing a malformed transaction group is refused up front,
+    /// leaving the ledger untouched.
+    #[test]
+    fn gui_charge_batch_refuses_a_malformed_group_without_writing() {
+        let app = OdApp::new();
+        let before = app.store.list_journal_entries().unwrap();
+        let bad = vec![
+            vec![JournalEntry {
+                transaction_num: 900,
+                ..Default::default()
+            }],
+            vec![
+                JournalEntry {
+                    transaction_num: 901,
+                    ..Default::default()
+                },
+                JournalEntry {
+                    transaction_num: 902,
+                    ..Default::default()
+                },
+            ],
+        ];
+        assert!(app.store.post_journal_batch(&bad).is_err());
+        assert_eq!(app.store.list_journal_entries().unwrap().len(), before.len());
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the

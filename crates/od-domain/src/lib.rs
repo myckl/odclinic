@@ -107,7 +107,7 @@ pub enum FeatureKey {
     InsuranceEnabled,
     AccountShowStatements,
     AccountBillingEdits,
-    /// Explicitly post an account adjustment or patient payment into the double-entry journal.
+    /// Explicitly post a completed-procedure charge, patient payment or account adjustment into the double-entry journal.
     LedgerJournalPosting,
     PaymentPlansEnabled,
     DiscountPlans,
@@ -457,7 +457,7 @@ impl FeatureKey {
             Self::InsuranceEnabled => "Insurance & claims",
             Self::AccountShowStatements => "Statements in Account",
             Self::AccountBillingEdits => "Record payments and adjustments",
-            Self::LedgerJournalPosting => "Post adjustments and payments to the ledger",
+            Self::LedgerJournalPosting => "Post charges, payments and adjustments to the ledger",
             Self::PaymentPlansEnabled => "Payment plans",
             Self::DiscountPlans => "Discount plans in Setup",
             Self::DiscountPlanAutoAdjust => "Automatic discount-plan adjustments",
@@ -576,7 +576,7 @@ impl FeatureKey {
             Self::InsuranceEnabled => "Enable insurance claims, insurance payments/write-offs and estimates. Off by default for practices that use only patient payments and payment plans (e.g. Ethiopia). Turning it off hides insurance in Account and skips the claim queries entirely.",
             Self::AccountShowStatements => "Show statements in Account.",
             Self::AccountBillingEdits => "Allow recording a payment (with one paysplit) or an adjustment. Also requires the matching Open Dental permission when permission enforcement is on.",
-            Self::LedgerJournalPosting => "Allow posting a recorded account adjustment or patient payment into OD's double-entry journal, so the Balance Sheet, General Ledger and Profit & Loss reports include it. Writes one balanced debit/credit pair with a shared transaction number; also requires the OD Adjustment Create permission when enforcement is on. On by default.",
+            Self::LedgerJournalPosting => "Allow posting completed-procedure charges, patient payments and account adjustments into OD's double-entry journal, so the Balance Sheet, General Ledger and Profit & Loss reports include them. Writes one balanced debit/credit pair with a shared transaction number; charges can also be posted as an atomic batch from the accounting reports. Also requires the OD Adjustment Create permission when enforcement is on. On by default.",
             Self::PaymentPlansEnabled => "Show payment plans in Account, allow creating plans and charges, and allow applying payments to a plan. On by default because Ethiopian practices collect balances this way.",
             Self::DiscountPlans => "Show the discount-plan editor in Setup: define plans (fee schedule, adjustment type, annual maximum, frequency limits and note) and subscribe patients with effective/term dates. Discount plans are the patient-facing alternative to insurance. On by default.",
             Self::DiscountPlanAutoAdjust => "When a procedure is completed for a patient with an active discount subscription, price it from the plan's reduced fee schedule and post the difference as a negative adjustment of the plan's adjustment type. Mirrors OD Adjustments.CreateAdjustmentForDiscountPlan, including the annual maximum and frequency limits. Requires Discount plans.",
