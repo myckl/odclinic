@@ -19,7 +19,7 @@ use od_core::{
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
     adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
     build_adjustment_journal, build_invoice_document, build_journal_batches,
-    build_payment_journal, build_posting_batch_plan,
+    build_payment_journal, build_posting_batch_plan_with_closed,
     build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
@@ -27,7 +27,7 @@ use od_core::{
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
     is_adjustment_posted, is_payment_posted, is_waitlist, journal_posting_audit_report,
     journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
-    ledger_tie_out_report, new_patient_report,
+    ledger_tie_out_report, month_bounds, new_patient_report, tie_out_ready,
     next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
@@ -48,9 +48,9 @@ use od_core::{
     treat_plan_presentation_statistics_report, unearned_income_report,
     validate_clinic_card_issue, validate_definition, validate_display_fields,
     validate_payment_allocations, waitlist_status_definitions, waitlist_status_name,
-    AppointmentDateBasis, DiscountPlanSubscription, LabelAddress, PostingAccountDefaults,
-    PostingSourceKind, PaySheetGroupBy, ProdIncMode, PublicHealthRow, RecallDueState, ReportRow,
-    ReportTable,
+    AppointmentDateBasis, CLOSED_PERIODS_PREF, ClosedPeriods, DiscountPlanSubscription,
+    LabelAddress, PostingAccountDefaults, PostingSourceKind, PaySheetGroupBy, ProdIncMode,
+    PublicHealthRow, RecallDueState, ReportRow, ReportTable,
 };
 use od_db::{Backend, DemoStore, MySqlStore, Store};
 use od_domain::definitions::{
@@ -670,6 +670,13 @@ struct LedgerRow {
     note: String,
 }
 
+/// The period-close action being confirmed in the audited dialog.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeriodAction {
+    Close,
+    Reopen,
+}
+
 /// The patient-account record being posted into the double-entry journal.
 /// Adjustments and payments share one window, one balance guard and one audit
 /// path; only the source-specific builders and reference tokens differ.
@@ -691,6 +698,13 @@ impl JournalPostSource {
         match self {
             Self::Adjustment(adj) => adj.pat_num,
             Self::Payment(pay) => pay.pat_num,
+        }
+    }
+
+    fn date(&self) -> chrono::NaiveDate {
+        match self {
+            Self::Adjustment(adj) => adj.adj_date,
+            Self::Payment(pay) => pay.pay_date,
         }
     }
 
@@ -1599,6 +1613,12 @@ struct OdApp {
     /// balanced pair in one DB transaction.
     post_all_open: bool,
     post_all_defaults: PostingAccountDefaults,
+    /// Signed-off accounting months, persisted in the OD preference table and
+    /// enforced by every journal posting window until explicitly reopened.
+    closed_periods: ClosedPeriods,
+    period_action_open: bool,
+    period_action: Option<(PeriodAction, chrono::NaiveDate)>,
+    period_action_reason: String,
     payment_edit: Option<Payment>,
     payment_edit_open: bool,
     payment_date_text: String,
@@ -1812,6 +1832,7 @@ impl OdApp {
         let group_attaches = store.list_user_group_attaches().unwrap_or_default();
         let security_log = store.list_security_log(50).unwrap_or_default();
         let report_prefs = ReportPreferences::load();
+        let closed_periods = ClosedPeriods::from_prefs(&store.list_prefs().unwrap_or_default());
         let mut app = Self {
             store,
             db_label,
@@ -1884,6 +1905,10 @@ impl OdApp {
                 positive_adjustment: (0, 0),
                 negative_adjustment: (0, 0),
             },
+            closed_periods,
+            period_action_open: false,
+            period_action: None,
+            period_action_reason: String::new(),
             payment_edit: None,
             payment_edit_open: false,
             payment_date_text: String::new(),
@@ -2031,6 +2056,7 @@ impl OdApp {
     }
 
     fn refresh(&mut self) {
+        self.closed_periods = ClosedPeriods::from_prefs(&self.store.list_prefs().unwrap_or_default());
         match self.store.list_patients() {
             Ok(rows) => self.patients = rows,
             Err(e) => self.error = Some(e),
@@ -2432,6 +2458,7 @@ impl OdApp {
         self.adjustment_window(&ctx);
         self.journal_post_window(&ctx);
         self.post_all_window(&ctx);
+        self.period_action_window(&ctx);
         self.payment_window(&ctx);
         self.plan_window(&ctx);
         self.plan_charge_window(&ctx);
@@ -5779,6 +5806,24 @@ impl OdApp {
                     ui.weak("Journal posting is off in Settings, or the Adjustment Create permission is missing.");
                 }
             });
+            let locked = self.closed_periods.in_range(self.report_from, self.report_to);
+            if !locked.is_empty() {
+                let labels = locked
+                    .iter()
+                    .map(|p| p.label())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        Color32::from_rgb(200, 130, 30),
+                        format!("Closed period(s) in range: {labels} — posting to them is locked."),
+                    )
+                    .on_hover_text("Reopen the period in the Ledger tie-out report to post a late correction, then close it again with a new reason.");
+                });
+            }
+        }
+        if current == ReportKind::LedgerTieOut {
+            self.period_close_controls(ui);
         }
         // The upstream reports expose the same option checkboxes/radios as the
         // original FormRp* dialogs. Changes are saved with the other report
@@ -9207,6 +9252,13 @@ impl OdApp {
                 source.source_num()
             ));
         }
+        let lock_error = self.closed_periods.reject_posting(
+            source.date(),
+            &format!("{} #{}", source.label(), source.source_num()),
+        );
+        if preview_error.is_none() {
+            preview_error = lock_error.err();
+        }
         match source.build(
             self.journal_debit_account,
             self.journal_credit_account,
@@ -9346,6 +9398,14 @@ impl OdApp {
             ));
             return;
         }
+        let lock_error = self.closed_periods.reject_posting(
+            source.date(),
+            &format!("{} #{}", source.label(), source.source_num()),
+        );
+        if let Err(err) = lock_error {
+            self.error = Some(err);
+            return;
+        }
         let mut entries = match source.build(
             self.journal_debit_account,
             self.journal_credit_account,
@@ -9407,15 +9467,25 @@ impl OdApp {
             payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
         }
         let adjustments = gather_adjustments(&*self.store, &self.patients);
-        let plan = build_posting_batch_plan(
+        let plan = build_posting_batch_plan_with_closed(
             &procedures,
             &payments,
             &adjustments,
             &self.store.list_journal_entries().unwrap_or_default(),
             &self.post_all_defaults,
+            &self.closed_periods,
             range_from,
             range_to,
         );
+        let is_locked = |date: chrono::NaiveDate| {
+            date >= range_from && date <= range_to && self.closed_periods.is_closed(date)
+        };
+        let blocked = procedures
+            .iter()
+            .filter(|p| p.proc_status.is_completed() && is_locked(p.proc_date))
+            .count()
+            + payments.iter().filter(|p| is_locked(p.pay_date)).count()
+            + adjustments.iter().filter(|a| is_locked(a.adj_date)).count();
         let count = |kind: PostingSourceKind| {
             plan.iter()
                 .filter(|item| item.source.kind() == kind)
@@ -9436,10 +9506,16 @@ impl OdApp {
                     count(PostingSourceKind::Payment),
                     count(PostingSourceKind::Adjustment),
                 ));
+                if blocked > 0 {
+                    ui.colored_label(
+                        Color32::from_rgb(200, 130, 30),
+                        format!("{blocked} source(s) in this range are in closed periods and were excluded — reopen the period to post them."),
+                    );
+                }
                 if plan.is_empty() {
                     ui.colored_label(
                         Color32::GRAY,
-                        "Nothing to post — every source in this range is already in the ledger (or has no amount).",
+                        "Nothing to post — every source in this range is already in the ledger, locked by a closed period, or has no amount.",
                     );
                 }
                 ui.separator();
@@ -9545,17 +9621,18 @@ impl OdApp {
             payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
         }
         let adjustments = gather_adjustments(&*self.store, &self.patients);
-        let plan = build_posting_batch_plan(
+        let plan = build_posting_batch_plan_with_closed(
             &procedures,
             &payments,
             &adjustments,
             &self.store.list_journal_entries().unwrap_or_default(),
             &self.post_all_defaults,
+            &self.closed_periods,
             range_from,
             range_to,
         );
         if plan.is_empty() {
-            self.notice = Some("No unposted sources remain; nothing was written.".into());
+            self.notice = Some("No unposted sources remain (closed periods stay locked); nothing was written.".into());
             self.post_all_open = false;
             return;
         }
@@ -9612,6 +9689,210 @@ impl OdApp {
                 self.post_all_open = false;
             }
             Err(err) => self.error = Some(format!("Could not post sources to ledger: {err}")),
+        }
+    }
+
+    /// Rebuild the tie-out for one month and report any check that is not OK.
+    /// Closing is only offered when this passes, so a signed-off month cannot
+    /// conceal an unposted source or a chart-setup gap.
+    fn tie_out_gate_for(&self, date: chrono::NaiveDate) -> Result<(), String> {
+        let (from, to) = month_bounds(date);
+        let accounts = self.store.list_accounts().unwrap_or_default();
+        let journal = self.store.list_journal_entries().unwrap_or_default();
+        let procedures = gather_procedures(&*self.store, &self.patients);
+        let adjustments = gather_adjustments(&*self.store, &self.patients);
+        let splits = gather_splits(&*self.store, &self.patients);
+        let mut payments = Vec::new();
+        for patient in &self.patients {
+            payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+        }
+        tie_out_ready(&ledger_tie_out_report(
+            &procedures,
+            &payments,
+            &adjustments,
+            &splits,
+            &journal,
+            &accounts,
+            from,
+            to,
+        ))
+    }
+
+    /// Period-close controls shown with the Ledger tie-out report: close the
+    /// month being reviewed, and reopen any earlier month that needs a late
+    /// correction (both actions require Adjustment Create).
+    fn period_close_controls(&mut self, ui: &mut Ui) {
+        let target = self.report_to;
+        let (first, last) = month_bounds(target);
+        let allowed = self.features.enabled(FeatureKey::LedgerJournalPosting)
+            && self.can(Permission::ADJUSTMENT_CREATE);
+        let gate = if allowed {
+            self.tie_out_gate_for(target)
+        } else {
+            Err("Journal posting is off in Settings, or the Adjustment Create permission is missing.".into())
+        };
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(format!("Period close · {first} – {last}"));
+            let button = ui.add_enabled(
+                gate.is_ok() && !self.period_action_open,
+                egui::Button::new("Close period"),
+            );
+            if button.clicked() {
+                self.period_action = Some((PeriodAction::Close, first));
+                self.period_action_reason.clear();
+                self.period_action_open = true;
+                self.error = None;
+            }
+            button.on_hover_text(match &gate {
+                Ok(()) => "Close this month once its tie-out reconciles. Requires a reason and the Adjustment Create permission.",
+                Err(err) => err,
+            });
+        });
+        if let Err(err) = &gate {
+            ui.weak(format!("Cannot close yet: {err}"));
+        }
+        if !self.closed_periods.is_empty() {
+            ui.weak("Closed periods — posting is locked until reopened:");
+            let mut reopen: Option<chrono::NaiveDate> = None;
+            for period in self.closed_periods.all() {
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} · {} · {}",
+                        period.label(),
+                        period.closed_at,
+                        period.reason
+                    ));
+                    if ui
+                        .add_enabled(
+                            allowed && !self.period_action_open,
+                            egui::Button::new("Reopen"),
+                        )
+                        .clicked()
+                    {
+                        reopen = Some(
+                            chrono::NaiveDate::from_ymd_opt(period.year, period.month, 1)
+                                .unwrap_or(target),
+                        );
+                    }
+                });
+            }
+            if let Some(date) = reopen {
+                self.period_action = Some((PeriodAction::Reopen, date));
+                self.period_action_reason.clear();
+                self.period_action_open = true;
+                self.error = None;
+            }
+        }
+    }
+
+    /// Reasoned, audited close/reopen dialog. Preference write and in-memory
+    /// state move together, so a failed save cannot unlock a period in the UI.
+    fn period_action_window(&mut self, ctx: &egui::Context) {
+        let Some((action, date)) = self.period_action else {
+            return;
+        };
+        let (first, last) = month_bounds(date);
+        let allowed = self.features.enabled(FeatureKey::LedgerJournalPosting)
+            && self.can(Permission::ADJUSTMENT_CREATE);
+        let gate = if action == PeriodAction::Close && allowed {
+            self.tie_out_gate_for(date)
+        } else {
+            Ok(())
+        };
+        let reason_ready = !self.period_action_reason.trim().is_empty();
+        let mut save = false;
+        let mut cancel = false;
+        let title = match action {
+            PeriodAction::Close => "Close accounting period",
+            PeriodAction::Reopen => "Reopen accounting period",
+        };
+        egui::Window::new(title)
+            .open(&mut self.period_action_open)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(format!("Period {first} – {last}"));
+                match action {
+                    PeriodAction::Close => {
+                        ui.label("Closing locks every journal posting dated in this month until it is reopened.");
+                        if let Err(err) = &gate {
+                            ui.colored_label(Color32::RED, err);
+                        }
+                    }
+                    PeriodAction::Reopen => {
+                        ui.label("Reopening allows new postings in this month. The reason is written to the security log.");
+                    }
+                }
+                ui.label("Reason (written to the security log)");
+                ui.text_edit_multiline(&mut self.period_action_reason);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let label = match action {
+                        PeriodAction::Close => "Close period",
+                        PeriodAction::Reopen => "Reopen period",
+                    };
+                    save = ui
+                        .add_enabled(
+                            allowed && gate.is_ok() && reason_ready,
+                            egui::Button::new(label),
+                        )
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel {
+            self.period_action_open = false;
+            self.period_action = None;
+            return;
+        }
+        if !self.period_action_open || !save {
+            return;
+        }
+        if !allowed {
+            self.error = Some("Journal posting is off, or the Adjustment Create permission is missing.".into());
+            return;
+        }
+        let reason = self.period_action_reason.trim().to_string();
+        let mut updated = self.closed_periods.clone();
+        let outcome = match action {
+            PeriodAction::Close => match gate {
+                Ok(()) => match updated.close(date, &reason, Local::now().naive_local().to_string())
+                {
+                    Ok(period) => Ok(format!(
+                        "Closed accounting period {}: {reason}",
+                        period.key()
+                    )),
+                    Err(err) => Err(err),
+                },
+                Err(err) => Err(err),
+            },
+            PeriodAction::Reopen => match updated.reopen(date) {
+                Ok(period) => Ok(format!(
+                    "Reopened accounting period {} (was closed for: {}) — reason: {reason}",
+                    period.key(),
+                    period.reason
+                )),
+                Err(err) => Err(err),
+            },
+        };
+        match outcome {
+            Ok(log) => {
+                if let Err(err) = self.store.upsert_pref(CLOSED_PERIODS_PREF, &updated.to_json()) {
+                    self.error = Some(format!("Could not save the period close: {err}"));
+                    return;
+                }
+                self.closed_periods = updated;
+                // A gate change is always audited, independent of the optional
+                // billing-change audit toggle.
+                self.audit(Permission::ADJUSTMENT_CREATE, 0, log.clone());
+                self.notice = Some(log);
+                self.error = None;
+                self.period_action_open = false;
+                self.period_action = None;
+            }
+            Err(err) => self.error = Some(err),
         }
     }
 
@@ -11396,7 +11677,9 @@ fn treat_plan_status_label(plan: &TreatPlan) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use od_core::{build_charge_posting_plan, suggest_charge_ledger_accounts};
+    use od_core::{
+        build_charge_posting_plan, build_posting_batch_plan, suggest_charge_ledger_accounts,
+    };
 
     #[test]
     fn security_log_search_finds_stale_resolution_reason() {
@@ -12074,6 +12357,152 @@ mod tests {
         )
         .is_empty());
         assert_eq!(app.store.list_journal_entries().unwrap().len(), all.len());
+    }
+
+    /// A reconciled month can be closed once, persists in the preference table,
+    /// is audited, and locks later sources until it is reopened (also audited).
+    #[test]
+    fn gui_period_close_persists_audits_and_locks_posting() {
+        use od_domain::{Adjustment, Payment, Procedure, ProcedureStatus};
+
+        let mut app = OdApp::new();
+        let accounts = app.store.list_accounts().unwrap();
+        let defaults = PostingAccountDefaults::from_chart(&accounts);
+        let pat = app.patients[0].pat_num;
+        let date = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let procedure = Procedure {
+            proc_num: 700,
+            pat_num: pat,
+            proc_date: date,
+            proc_status: ProcedureStatus::Complete,
+            fee: 60.0,
+            code_num: 3,
+            ..Default::default()
+        };
+        let payment = Payment {
+            pay_num: 71,
+            pat_num: pat,
+            pay_date: date,
+            pay_amount: 40.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let adjustment = Adjustment {
+            adj_num: 81,
+            adj_date: date,
+            adj_amount: -5.0,
+            pat_num: pat,
+            ..Default::default()
+        };
+        let tie_out = |journal: &[JournalEntry]| {
+            let mut payments = Vec::new();
+            payments.push(payment.clone());
+            ledger_tie_out_report(
+                &[procedure.clone()],
+                &payments,
+                &[adjustment.clone()],
+                &[],
+                journal,
+                &accounts,
+                from,
+                to,
+            )
+        };
+        assert!(tie_out_ready(&tie_out(&app.store.list_journal_entries().unwrap())).is_err());
+
+        let before = app.store.list_journal_entries().unwrap();
+        let plan = build_posting_batch_plan(
+            &[procedure.clone()],
+            &[payment.clone()],
+            &[adjustment.clone()],
+            &before,
+            &defaults,
+            from,
+            to,
+        );
+        let batches = build_journal_batches(&plan).unwrap();
+        app.store.post_journal_batch(&batches).unwrap();
+        let after = app.store.list_journal_entries().unwrap();
+        assert!(tie_out_ready(&tie_out(&after)).is_ok());
+
+        let mut closed = app.closed_periods.clone();
+        closed.close(date, "Signed off after tie-out", "now".into()).unwrap();
+        app.store
+            .upsert_pref(CLOSED_PERIODS_PREF, &closed.to_json())
+            .unwrap();
+        app.closed_periods = closed;
+        app.audit(
+            Permission::ADJUSTMENT_CREATE,
+            0,
+            "Closed accounting period 2026-11: Signed off after tie-out".into(),
+        );
+        assert_eq!(
+            ClosedPeriods::from_prefs(&app.store.list_prefs().unwrap()),
+            app.closed_periods
+        );
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Closed accounting period 2026-11")));
+
+        let late = Procedure {
+            proc_num: 701,
+            fee: 30.0,
+            ..procedure.clone()
+        };
+        assert!(app.closed_periods.is_closed(late.proc_date));
+        assert!(app
+            .closed_periods
+            .reject_posting(date, "Charge #701")
+            .unwrap_err()
+            .contains("2026-11"));
+        assert_eq!(
+            build_posting_batch_plan(
+                &[late.clone()],
+                &[],
+                &[],
+                &after,
+                &defaults,
+                from,
+                to,
+            )
+            .len(),
+            1
+        );
+        assert!(build_posting_batch_plan_with_closed(
+            &[late],
+            &[],
+            &[],
+            &after,
+            &defaults,
+            &app.closed_periods,
+            from,
+            to,
+        )
+        .is_empty());
+
+        let mut reopened = app.closed_periods.clone();
+        reopened.reopen(date).unwrap();
+        app.store
+            .upsert_pref(CLOSED_PERIODS_PREF, &reopened.to_json())
+            .unwrap();
+        app.closed_periods = reopened;
+        app.audit(
+            Permission::ADJUSTMENT_CREATE,
+            0,
+            "Reopened accounting period 2026-11 for a late correction".into(),
+        );
+        assert!(!app.closed_periods.is_closed(date));
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Reopened accounting period 2026-11")));
     }
 
     /// A batch containing a malformed transaction group is refused up front,

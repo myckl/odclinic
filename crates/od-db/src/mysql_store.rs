@@ -3688,6 +3688,31 @@ impl Store for MySqlStore {
             .collect())
     }
 
+    fn upsert_pref(&self, name: &str, value: &str) -> Result<(), String> {
+        let mut conn = self.conn()?;
+        // Check existence explicitly: MySQL counts *changed* rows in
+        // affected_rows(), so an UPDATE that writes the same value would report
+        // zero and look like a missing row.
+        let count: u64 = conn
+            .exec_first("SELECT COUNT(*) FROM preference WHERE PrefName=?", (name.to_string(),))
+            .map_err(|e| e.to_string())?
+            .unwrap_or(0);
+        if count == 0 {
+            conn.exec_drop(
+                "INSERT INTO preference (PrefName,ValueString) VALUES (?,?)",
+                (name.to_string(), value.to_string()),
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            conn.exec_drop(
+                "UPDATE preference SET ValueString=? WHERE PrefName=?",
+                (value.to_string(), name.to_string()),
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     fn list_group_permissions(&self) -> Result<Vec<GroupPermission>, String> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn

@@ -13,7 +13,8 @@ use mysql::prelude::Queryable;
 use od_core::{
     account_summary_without_insurance, active_patient_report, adj_sheet_report, aging_report,
     appointments_report, asap_report, balance_sheet_report, birthday_report,
-    broken_appointments_report, build_statement_document, confirmation_report, custom_aging_report,
+    broken_appointments_report, build_statement_document, ClosedPeriods, confirmation_report,
+    custom_aging_report,
     dental_sealant_measure_report, discount_amount, discount_plan_report, dpp_overcharged_report,
     annual_bucket, charge_generation_block, generate_plan_charges, DiscountInput, FrequencyCodeSets,
     finance_charge_report, general_ledger_report, hidden_pay_splits_report, laser_labels_report,
@@ -51,8 +52,9 @@ use od_domain::reports::{
 use od_domain::{
     Account, Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
     DiscountPlan, DiscountPlanSub, Gender, JournalEntry, Patient, PatientCorrection, PayPlan,
-    PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Procedure,
-    ProcedureStatus, Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine, TreatPlanStatus,
+    PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Pref,
+    Procedure, ProcedureStatus, Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine,
+    TreatPlanStatus,
 };
 
 #[test]
@@ -4727,6 +4729,71 @@ fn mysql_live_post_all_batch_round_trip() {
         .iter()
         .all(|item| !cleaned.iter().any(|e| e.transaction_num == item.transaction_num)));
     println!("live post-all batch: transactions {txns:?} round-tripped and cleaned up");
+}
+
+/// Writes the closed-period preference into the live OD `preference` table,
+/// verifies a second write updates rather than duplicates the row, then removes
+/// the temporary preference so the demo database is unchanged.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes one temporary preference row"]
+fn mysql_live_period_close_pref_round_trip() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let name = "ODCLINIC_LIVE_TEST_CLOSED_PERIODS";
+    let mut periods = ClosedPeriods::default();
+    periods
+        .close(
+            NaiveDate::from_ymd_opt(2099, 5, 1).unwrap(),
+            "live close",
+            "now".into(),
+        )
+        .unwrap();
+    store.upsert_pref(name, &periods.to_json()).unwrap();
+    let rows: Vec<Pref> = store
+        .list_prefs()
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.pref_name == name)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(ClosedPeriods::from_json(&rows[0].pref_value), periods);
+
+    let mut updated = periods.clone();
+    updated
+        .close(
+            NaiveDate::from_ymd_opt(2099, 6, 1).unwrap(),
+            "second live close",
+            "now".into(),
+        )
+        .unwrap();
+    store.upsert_pref(name, &updated.to_json()).unwrap();
+    let rows: Vec<Pref> = store
+        .list_prefs()
+        .unwrap()
+        .into_iter()
+        .filter(|p| p.pref_name == name)
+        .collect();
+    assert_eq!(rows.len(), 1, "upsert must update, not duplicate the preference");
+    assert_eq!(ClosedPeriods::from_json(&rows[0].pref_value), updated);
+    assert!(updated.is_closed(NaiveDate::from_ymd_opt(2099, 5, 24).unwrap()));
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    conn.exec_drop("DELETE FROM preference WHERE PrefName=?", (name,))
+        .expect("preference cleanup failed");
+    assert!(store
+        .list_prefs()
+        .unwrap()
+        .iter()
+        .all(|p| p.pref_name != name));
+    println!("live period-close preference: round-tripped, updated and cleaned up");
 }
 
 /// Builds the posting audit from live OD sources. Read-only: it verifies every

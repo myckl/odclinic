@@ -680,11 +680,37 @@ pub fn build_posting_batch_plan(
     from: chrono::NaiveDate,
     to: chrono::NaiveDate,
 ) -> Vec<PostingBatchItem> {
+    build_posting_batch_plan_with_closed(
+        procedures,
+        payments,
+        adjustments,
+        journal,
+        defaults,
+        &crate::period_close::ClosedPeriods::default(),
+        from,
+        to,
+    )
+}
+
+/// Same planner with the period-close gate applied: a source dated inside a
+/// closed month is never offered for posting, so a signed-off period cannot be
+/// changed by a later batch run.
+pub fn build_posting_batch_plan_with_closed(
+    procedures: &[Procedure],
+    payments: &[Payment],
+    adjustments: &[Adjustment],
+    journal: &[JournalEntry],
+    defaults: &PostingAccountDefaults,
+    closed: &crate::period_close::ClosedPeriods,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> Vec<PostingBatchItem> {
     let mut next = next_journal_transaction_num(journal);
     let mut items = Vec::new();
     let in_range = |date: chrono::NaiveDate| date >= from && date <= to;
     let mut add = |source: PostingSource| {
         if !in_range(source.date())
+            || closed.is_closed(source.date())
             || source.is_posted(journal)
             || !source.amount().is_finite()
             || source.amount().abs() <= 0.005
@@ -1816,5 +1842,79 @@ mod tests {
         assert!(build_journal_batches(&plan)
             .unwrap_err()
             .contains("used more than once"));
+    }
+
+    #[test]
+    fn closed_periods_are_excluded_from_the_batch_plan() {
+        use crate::period_close::ClosedPeriods;
+
+        let defaults = PostingAccountDefaults::from_chart(&accounts());
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        let charge = procedure(40.0);
+        let later = Procedure {
+            proc_num: 49,
+            proc_date: NaiveDate::from_ymd_opt(2026, 12, 2).unwrap(),
+            ..charge.clone()
+        };
+        let pay = Payment {
+            pay_num: 33,
+            pat_num: charge.pat_num,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 20.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let mut closed = ClosedPeriods::default();
+        closed
+            .close(
+                NaiveDate::from_ymd_opt(2026, 11, 15).unwrap(),
+                "Tie-out signed off",
+                "now".into(),
+            )
+            .unwrap();
+
+        let open = build_posting_batch_plan(
+            &[charge.clone(), later.clone()],
+            &[pay.clone()],
+            &[],
+            &[],
+            &defaults,
+            from,
+            to,
+        );
+        assert_eq!(open.len(), 3);
+        let locked = build_posting_batch_plan_with_closed(
+            &[charge, later.clone()],
+            &[pay],
+            &[],
+            &[],
+            &defaults,
+            &closed,
+            from,
+            to,
+        );
+        assert_eq!(locked.len(), 1, "only December survives the November close");
+        assert_eq!(locked[0].source.date(), later.proc_date);
+        assert!(build_journal_batches(&locked).is_ok());
+    }
+
+    #[test]
+    fn tie_out_ready_requires_every_hard_check_to_be_ok() {
+        let mut table = crate::ReportTable::new(&[
+            "Check",
+            "Clinical source",
+            "Journal",
+            "Variance",
+            "Status",
+            "Detail",
+        ]);
+        table.push(&["Charges", "10.00", "10.00", "0.00", "OK", "detail"]);
+        table.push(&["A/R balance", "", "5.00", "", "INFO", "detail"]);
+        assert!(crate::tie_out_ready(&table).is_ok());
+        table.push(&["Unposted sources", "1", "", "", "CHECK", "detail"]);
+        assert!(crate::tie_out_ready(&table)
+            .unwrap_err()
+            .contains("Unposted sources (CHECK)"));
     }
 }

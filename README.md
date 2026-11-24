@@ -836,6 +836,19 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       and an unposted-source count. Together these turn period close into one
       reviewed run: **Post all unposted sources**, then re-run the tie-out until
       every check reads `OK`. On by default with the same feature toggle.
+      Closing is now an enforced gate, not just a report: once the tie-out
+      reconciles, **Close period** signs off the month shown in the range. It
+      requires a reason and the OD *Adjustment Create* permission, persists the
+      lock in the `preference` table (`AccountingClosedPeriods`) so it survives
+      a restart, and writes a `Close`/`Reopen accounting period` entry to the
+      security log (always audited, independent of the audit-log toggle). While
+      a month is closed, every posting window refuses sources dated in that
+      month and the batch window excludes them with a visible count — a
+      backdated charge, payment or adjustment cannot silently undo the
+      signed-off period. **Reopen** (same permission, with its own reason, also
+      audited) unlocks the month for a late correction; close it again with a
+      new reason when finished. Closed months in the current report range are
+      flagged above the report.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be

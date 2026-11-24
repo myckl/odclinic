@@ -7,6 +7,7 @@ pub mod discount;
 pub mod dynamic_payment_plan;
 pub mod journal;
 pub mod payment_plan;
+pub mod period_close;
 pub mod pdf;
 pub mod recall;
 pub mod registry;
@@ -46,7 +47,8 @@ pub use journal::{
     adjustment_journal_memo, adjustment_journal_memo_with_note, adjustment_journal_reference,
     build_adjustment_journal, build_charge_journal, build_charge_posting_plan,
     build_journal_batches, build_payment_journal, build_posting_batch_plan,
-    is_adjustment_posted, is_payment_posted, is_procedure_posted,
+    build_posting_batch_plan_with_closed, is_adjustment_posted, is_payment_posted,
+    is_procedure_posted,
     journal_transaction_for_adjustment, journal_transaction_for_payment,
     journal_transaction_for_procedure, journal_posting_audit_report, ledger_tie_out_report,
     next_journal_transaction_num, payment_journal_memo,
@@ -54,6 +56,9 @@ pub use journal::{
     procedure_journal_memo_with_note, procedure_journal_reference, suggest_charge_ledger_accounts,
     suggest_ledger_accounts, suggest_payment_ledger_accounts, validate_balanced_journal,
     ChargePostingPlan, PostingAccountDefaults, PostingBatchItem, PostingSource, PostingSourceKind,
+};
+pub use period_close::{
+    CLOSED_PERIODS_PREF, ClosedPeriod, ClosedPeriods, month_bounds, tie_out_ready,
 };
 pub use pdf::{render_invoice_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};

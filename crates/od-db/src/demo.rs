@@ -2229,6 +2229,20 @@ impl Store for DemoStore {
     fn list_prefs(&self) -> Result<Vec<Pref>, String> {
         Ok(self.data.lock().unwrap().prefs.clone())
     }
+    fn upsert_pref(&self, name: &str, value: &str) -> Result<(), String> {
+        let mut data = self.data.lock().unwrap();
+        if let Some(pref) = data.prefs.iter_mut().find(|p| p.pref_name == name) {
+            pref.pref_value = value.to_string();
+        } else {
+            let pref_num = data.prefs.iter().map(|p| p.pref_num).max().unwrap_or(0) + 1;
+            data.prefs.push(Pref {
+                pref_num,
+                pref_name: name.to_string(),
+                pref_value: value.to_string(),
+            });
+        }
+        Ok(())
+    }
     fn list_group_permissions(&self) -> Result<Vec<GroupPermission>, String> {
         Ok(self.data.lock().unwrap().group_permissions.clone())
     }

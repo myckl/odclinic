@@ -244,6 +244,9 @@ pub trait Store: Send + Sync {
 
     fn list_users(&self) -> Result<Vec<Userod>, String>;
     fn list_prefs(&self) -> Result<Vec<Pref>, String>;
+    /// Insert or update one OD `preference` row by name, used for persisted
+    /// practice state such as closed accounting periods.
+    fn upsert_pref(&self, name: &str, value: &str) -> Result<(), String>;
 
     fn list_group_permissions(&self) -> Result<Vec<GroupPermission>, String>;
     fn list_user_group_attaches(&self) -> Result<Vec<UserGroupAttach>, String>;
@@ -821,6 +824,12 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.list_prefs(),
             Backend::MySql(s) => s.list_prefs(),
+        }
+    }
+    fn upsert_pref(&self, name: &str, value: &str) -> Result<(), String> {
+        match self {
+            Backend::Demo(s) => s.upsert_pref(name, value),
+            Backend::MySql(s) => s.upsert_pref(name, value),
         }
     }
     fn list_group_permissions(&self) -> Result<Vec<GroupPermission>, String> {
