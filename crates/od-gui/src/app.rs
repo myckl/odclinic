@@ -1721,6 +1721,10 @@ struct OdApp {
     report: ReportKind,
     report_from: NaiveDate,
     report_to: NaiveDate,
+    /// Editable ISO copies of the reporting window. Invalid text is kept on
+    /// screen until corrected, while the parsed dates drive the reports.
+    report_from_text: String,
+    report_to_text: String,
     report_export_path: String,
     report_export_kind: Option<ReportKind>,
     /// Dedicated path for the payment-plan stale-resolved audit export, kept
@@ -1995,6 +1999,8 @@ impl OdApp {
             report: ReportKind::Production,
             report_from: today - Duration::days(30),
             report_to: today,
+            report_from_text: (today - Duration::days(30)).format("%Y-%m-%d").to_string(),
+            report_to_text: today.format("%Y-%m-%d").to_string(),
             report_export_path: String::new(),
             report_export_kind: None,
             pay_plan_audit_export_path: persisted_export_path(
@@ -2215,10 +2221,54 @@ impl OdApp {
                 NaiveDate::parse_from_str(&range.from, "%Y-%m-%d"),
                 NaiveDate::parse_from_str(&range.to, "%Y-%m-%d"),
             ) {
-                self.report_from = from;
-                self.report_to = to;
+                self.show_report_dates(from, to);
             }
         }
+    }
+
+    /// Replace both the live dates and their editable text. Loading a saved
+    /// range uses this without writing, so an invalid saved value is not copied
+    /// back into `reports.txt`.
+    fn show_report_dates(&mut self, from: NaiveDate, to: NaiveDate) {
+        self.report_from = from;
+        self.report_to = to;
+        self.report_from_text = from.format("%Y-%m-%d").to_string();
+        self.report_to_text = to.format("%Y-%m-%d").to_string();
+    }
+
+    /// Apply a user-chosen range and save it for the signed-in user.
+    fn apply_report_dates(&mut self, from: NaiveDate, to: NaiveDate) {
+        if from > to {
+            return;
+        }
+        self.show_report_dates(from, to);
+        self.persist_report_date_range();
+    }
+
+    /// Parse the visible date fields without writing anything. Range reports use
+    /// both fields; "as of" reports only show the end date, so an earlier end
+    /// clamps the hidden start to keep the saved window ordered.
+    fn parsed_report_dates(&self, uses_date_range: bool) -> Option<(NaiveDate, NaiveDate)> {
+        let to = NaiveDate::parse_from_str(self.report_to_text.trim(), "%Y-%m-%d").ok()?;
+        let from = if uses_date_range {
+            NaiveDate::parse_from_str(self.report_from_text.trim(), "%Y-%m-%d").ok()?
+        } else {
+            self.report_from.min(to)
+        };
+        (from <= to).then_some((from, to))
+    }
+
+    /// Turn the editable text fields into the live dates when the visible fields
+    /// are valid. Partial or reversed input stays on screen with a hint until
+    /// corrected.
+    fn commit_report_date_texts(&mut self, uses_date_range: bool) {
+        if let Some((from, to)) = self.parsed_report_dates(uses_date_range) {
+            self.apply_report_dates(from, to);
+        }
+    }
+
+    fn report_date_text_valid(&self, uses_date_range: bool) -> bool {
+        self.parsed_report_dates(uses_date_range).is_some()
     }
 
     /// Persist the currently visible reporting window for this user. Missing or
@@ -5864,13 +5914,27 @@ impl OdApp {
                     }
                 });
             ui.separator();
+            let mut date_text_changed = false;
             if current.uses_date_range() {
-                ui.label(format!("{} to {}", self.report_from, self.report_to));
+                ui.label("From");
+                date_text_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.report_from_text)
+                            .desired_width(100.0)
+                            .hint_text("YYYY-MM-DD"),
+                    )
+                    .changed();
+                ui.label("to");
+                date_text_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.report_to_text)
+                            .desired_width(100.0)
+                            .hint_text("YYYY-MM-DD"),
+                    )
+                    .changed();
                 if ui.button("Last 30 days").clicked() {
                     let today = chrono::Local::now().date_naive();
-                    self.report_to = today;
-                    self.report_from = today - Duration::days(30);
-                    self.persist_report_date_range();
+                    self.apply_report_dates(today - Duration::days(30), today);
                 }
                 if current == ReportKind::Birthday && ui.button("Next Month").clicked() {
                     let today = chrono::Local::now().date_naive();
@@ -5881,16 +5945,35 @@ impl OdApp {
                     let after_next = (next_first + Duration::days(32))
                         .with_day(1)
                         .unwrap_or(next_first);
-                    self.report_from = next_first;
-                    self.report_to = after_next - Duration::days(1);
-                    self.persist_report_date_range();
+                    self.apply_report_dates(next_first, after_next - Duration::days(1));
                 }
             } else if current == ReportKind::PeriodCloseHistory {
                 ui.label("Full audit history (all dates)");
             } else {
-                ui.label(format!("As of {}", self.report_to));
+                ui.label("As of");
+                date_text_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.report_to_text)
+                            .desired_width(100.0)
+                            .hint_text("YYYY-MM-DD"),
+                    )
+                    .changed();
+            }
+            if date_text_changed {
+                self.commit_report_date_texts(current.uses_date_range());
             }
         });
+        if current != ReportKind::PeriodCloseHistory
+            && !self.report_date_text_valid(current.uses_date_range())
+        {
+            let error_color = ui.visuals().error_fg_color;
+            let hint = if current.uses_date_range() {
+                "Dates must be YYYY-MM-DD, with the start on or before the end."
+            } else {
+                "End date must be YYYY-MM-DD."
+            };
+            ui.colored_label(error_color, hint);
+        }
         if current != self.report {
             self.report = current;
             self.report_export_path = self
@@ -12114,6 +12197,37 @@ mod tests {
             patient_export_key(EXPORT_KEY_SECURITY_LOG, 12)
         );
         assert_eq!(security_log_export_key(None), EXPORT_KEY_SECURITY_LOG);
+    }
+
+    /// Editable report dates mirror the live range and reject partial or
+    /// reversed input without changing the dates that drive the reports.
+    #[test]
+    fn report_date_text_fields_validate_and_mirror_dates() {
+        let mut app = OdApp::new();
+        let from = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 2, 20).unwrap();
+        app.show_report_dates(from, to);
+        assert_eq!(app.report_from_text, "2026-01-15");
+        assert_eq!(app.report_to_text, "2026-02-20");
+        assert!(app.report_date_text_valid(true));
+
+        app.report_from_text = "2026-03-01".into();
+        assert!(!app.report_date_text_valid(true), "reversed range is rejected");
+        app.report_to_text = "not-a-date".into();
+        assert!(!app.report_date_text_valid(true), "partial text is rejected");
+        assert_eq!(app.report_from, from);
+        assert_eq!(app.report_to, to);
+
+        // "As of" reports hide the start field; a valid end still applies and
+        // clamps the hidden start so the persisted window stays ordered.
+        app.report_from_text = "not-a-date".into();
+        app.report_to_text = "2026-01-10".into();
+        assert!(app.report_date_text_valid(false));
+        let (from, to) = app.parsed_report_dates(false).unwrap();
+        assert_eq!(from, NaiveDate::from_ymd_opt(2026, 1, 10).unwrap());
+        assert_eq!(to, NaiveDate::from_ymd_opt(2026, 1, 10).unwrap());
+        app.show_report_dates(from, to);
+        assert_eq!(app.report_from_text, "2026-01-10");
     }
 
     /// The account ledger keeps the source adjustment number so its

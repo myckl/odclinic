@@ -556,8 +556,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   same way as `report_range.user-<UserNum>.from`/`.to` (or
   `report_range.local.*` without a login), so each user's default dates also
   survive a restart or login switch. A user with no saved window starts with
-  the usual last-30-days-to-today range; clicking **Last 30 days** or
-  **Next Month** updates their saved range.
+  the usual last-30-days-to-today range. The Reports toolbar now has editable
+  `YYYY-MM-DD` start/end fields (an end-only field on "as of" reports), so any
+  window can be chosen; the **Last 30 days** and **Next Month** shortcuts also
+  update the saved range.
   These reports use a variable-column `ReportTable` model; the local three-column
   reports are wrapped into it, so the CSV header stays
   `Practice,Report,Item,Value,Detail` for them while upstream exports keep OD's
