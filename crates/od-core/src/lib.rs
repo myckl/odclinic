@@ -44,8 +44,11 @@ pub use payment_plan::{
 };
 pub use journal::{
     adjustment_journal_memo, adjustment_journal_memo_with_note, adjustment_journal_reference,
-    build_adjustment_journal, is_adjustment_posted, journal_transaction_for_adjustment,
-    next_journal_transaction_num, suggest_ledger_accounts, validate_balanced_journal,
+    build_adjustment_journal, build_payment_journal, is_adjustment_posted, is_payment_posted,
+    journal_transaction_for_adjustment, journal_transaction_for_payment,
+    next_journal_transaction_num, payment_journal_memo, payment_journal_memo_with_note,
+    payment_journal_reference, suggest_ledger_accounts, suggest_payment_ledger_accounts,
+    validate_balanced_journal,
 };
 pub use pdf::{render_invoice_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};

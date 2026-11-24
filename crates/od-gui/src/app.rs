@@ -18,15 +18,15 @@ use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
     adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
-    build_adjustment_journal, build_invoice_document,
+    build_adjustment_journal, build_invoice_document, build_payment_journal,
     build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    is_adjustment_posted, is_waitlist, journal_transaction_for_adjustment, laser_labels_report,
-    new_patient_report, next_definition_order, next_journal_transaction_num,
-    patient_label_addresses,
+    is_adjustment_posted, is_payment_posted, is_waitlist, journal_transaction_for_adjustment,
+    journal_transaction_for_payment, laser_labels_report, new_patient_report,
+    next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
     parse_appointment_datetime, parse_appointment_length, pattern_for_length, payment_plan_report,
@@ -40,7 +40,8 @@ use od_core::{
     render_report_csv, render_report_html, render_statement_html, render_statement_pdf,
     restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
     interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
-    suggest_ledger_accounts, validate_balanced_journal,
+    payment_journal_memo_with_note, suggest_ledger_accounts,
+    suggest_payment_ledger_accounts, validate_balanced_journal,
     sorted_definitions, statement_report, treatment_plan_report,
     treat_plan_presentation_statistics_report, unearned_income_report,
     validate_clinic_card_issue, validate_definition, validate_display_fields,
@@ -619,6 +620,111 @@ struct LedgerRow {
     /// Set on adjustment rows so the ledger can offer "Post to ledger".
     adj_num: Id,
     note: String,
+}
+
+/// The patient-account record being posted into the double-entry journal.
+/// Adjustments and payments share one window, one balance guard and one audit
+/// path; only the source-specific builders and reference tokens differ.
+#[derive(Clone)]
+enum JournalPostSource {
+    Adjustment(Adjustment),
+    Payment(Payment),
+}
+
+impl JournalPostSource {
+    fn source_num(&self) -> Id {
+        match self {
+            Self::Adjustment(adj) => adj.adj_num,
+            Self::Payment(pay) => pay.pay_num,
+        }
+    }
+
+    fn pat_num(&self) -> Id {
+        match self {
+            Self::Adjustment(adj) => adj.pat_num,
+            Self::Payment(pay) => pay.pat_num,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Adjustment(_) => "Adjustment",
+            Self::Payment(_) => "Payment",
+        }
+    }
+
+    fn note(&self) -> &str {
+        match self {
+            Self::Adjustment(adj) => &adj.note,
+            Self::Payment(pay) => &pay.note,
+        }
+    }
+
+    fn amount(&self) -> f64 {
+        match self {
+            Self::Adjustment(adj) => adj.adj_amount.abs(),
+            Self::Payment(pay) => pay.pay_amount.abs(),
+        }
+    }
+
+    fn heading(&self) -> String {
+        match self {
+            Self::Adjustment(adj) => format!(
+                "Adjustment #{} · patient #{} · {} · {:.2}",
+                adj.adj_num, adj.pat_num, adj.adj_date, adj.adj_amount
+            ),
+            Self::Payment(pay) => format!(
+                "Payment #{} · patient #{} · {} · {:.2}{}",
+                pay.pay_num,
+                pay.pat_num,
+                pay.pay_date,
+                pay.pay_amount,
+                if pay.check_num.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" · cheque {}", pay.check_num)
+                }
+            ),
+        }
+    }
+
+    fn is_posted(&self, journal: &[JournalEntry]) -> bool {
+        match self {
+            Self::Adjustment(adj) => is_adjustment_posted(journal, adj.adj_num, adj.pat_num),
+            Self::Payment(pay) => is_payment_posted(journal, pay.pay_num, pay.pat_num),
+        }
+    }
+
+    fn memo(&self, note: &str) -> String {
+        match self {
+            Self::Adjustment(adj) => adjustment_journal_memo_with_note(adj, note),
+            Self::Payment(pay) => payment_journal_memo_with_note(pay, note),
+        }
+    }
+
+    fn default_accounts(&self, accounts: &[Account]) -> (Id, Id) {
+        match self {
+            Self::Adjustment(adj) => suggest_ledger_accounts(accounts, adj.adj_amount),
+            Self::Payment(pay) => suggest_payment_ledger_accounts(accounts, pay.pay_amount),
+        }
+        .unwrap_or((0, 0))
+    }
+
+    fn build(
+        &self,
+        debit_account: Id,
+        credit_account: Id,
+        transaction_num: Id,
+    ) -> Result<[JournalEntry; 2], String> {
+        match self {
+            Self::Adjustment(adj) => {
+                build_adjustment_journal(adj, debit_account, credit_account, transaction_num)
+            }
+            Self::Payment(pay) => {
+                build_payment_journal(pay, debit_account, credit_account, transaction_num)
+            }
+        }
+    }
 }
 
 fn build_account_ledger_rows(
@@ -1420,8 +1526,9 @@ struct OdApp {
     adj_date_text: String,
     adj_amount_text: String,
     adj_note_text: String,
-    /// Explicit "post adjustment to ledger" path into the double-entry journal.
-    journal_post_edit: Option<Adjustment>,
+    /// Explicit "post to ledger" path into the double-entry journal, for both
+    /// adjustments and patient payments.
+    journal_post_edit: Option<JournalPostSource>,
     journal_post_open: bool,
     journal_debit_account: Id,
     journal_credit_account: Id,
@@ -3629,13 +3736,45 @@ impl OdApp {
         }
 
         let mut quick_refund_plan: Option<(Id, f64)> = None;
-        let mut ledger_post: Option<Adjustment> = None;
+        let mut ledger_post: Option<JournalPostSource> = None;
         let posting_enabled = self.features.enabled(FeatureKey::LedgerJournalPosting)
             && self.can(Permission::ADJUSTMENT_CREATE);
         let ledger_journal: Vec<JournalEntry> = if posting_enabled {
             self.store.list_journal_entries().unwrap_or_default()
         } else {
             Vec::new()
+        };
+        // Shared control for the payment-backed rows (ordinary payments and
+        // refunds). A payment with several splits may appear more than once;
+        // once posted every row shows the same transaction instead of a button.
+        let payment_post_control = |ui: &mut egui::Ui, pay_num: Id| -> Option<JournalPostSource> {
+            if !posting_enabled {
+                ui.weak("—").on_hover_text(
+                    "Posting to the ledger is off in Settings, or the Adjustment Create permission is missing.",
+                );
+                return None;
+            }
+            let Some(payment) = payments.iter().find(|p| p.pay_num == pay_num) else {
+                ui.weak("—");
+                return None;
+            };
+            if is_payment_posted(&ledger_journal, payment.pay_num, payment.pat_num) {
+                let txn = journal_transaction_for_payment(
+                    &ledger_journal,
+                    payment.pay_num,
+                    payment.pat_num,
+                )
+                .unwrap_or(0);
+                ui.weak(format!("Posted #{txn}")).on_hover_text(format!(
+                    "Payment #{} is already in journal transaction #{}. Posting again would duplicate it.",
+                    payment.pay_num, txn
+                ));
+                None
+            } else if ui.small_button("Post to ledger").clicked() {
+                Some(JournalPostSource::Payment(payment.clone()))
+            } else {
+                None
+            }
         };
         egui::Grid::new("account_ledger")
             .num_columns(6)
@@ -3675,15 +3814,19 @@ impl OdApp {
                                         adj.adj_num, txn
                                     ));
                                 } else if ui.small_button("Post to ledger").clicked() {
-                                    ledger_post = Some(adj.clone());
+                                    ledger_post = Some(JournalPostSource::Adjustment(adj.clone()));
                                 }
                             } else {
                                 ui.weak("—");
                             }
                         } else {
                             ui.weak("—").on_hover_text(
-                                "Post adjustments to the ledger is off in Settings, or the Adjustment Create permission is missing.",
+                                "Posting to the ledger is off in Settings, or the Adjustment Create permission is missing.",
                             );
+                        }
+                    } else if row.kind == "Payment" {
+                        if let Some(source) = payment_post_control(ui, row.pay_num) {
+                            ledger_post = Some(source);
                         }
                     } else if row.kind == "Refund/Transfer" {
                         let target = match row.transfer_target.unwrap_or(PaymentTarget::Unallocated) {
@@ -3729,6 +3872,9 @@ impl OdApp {
                                         }
                                     }
                                 }
+                                if let Some(source) = payment_post_control(ui, row.pay_num) {
+                                    ledger_post = Some(source);
+                                }
                             }
                         });
                     } else if row.plan_num != 0 && row.credit > 0.005 {
@@ -3742,17 +3888,16 @@ impl OdApp {
                 }
             });
 
-        if let Some(adj) = ledger_post {
+        if let Some(source) = ledger_post {
             let accounts = self.store.list_accounts().unwrap_or_default();
-            let (debit, credit) =
-                suggest_ledger_accounts(&accounts, adj.adj_amount).unwrap_or((0, 0));
-            self.journal_post_edit = Some(adj.clone());
+            let (debit, credit) = source.default_accounts(&accounts);
+            self.journal_post_edit = Some(source.clone());
             self.journal_debit_account = debit;
             self.journal_credit_account = credit;
             self.journal_transaction_num = next_journal_transaction_num(&ledger_journal);
             // Only the readable note is edited; the window re-attaches the
-            // stable adjustment reference before writing.
-            self.journal_memo_text = adj.note.clone();
+            // stable source reference before writing.
+            self.journal_memo_text = source.note().to_string();
             self.journal_post_open = true;
             self.error = None;
         }
@@ -8885,8 +9030,11 @@ impl OdApp {
     /// Explicit, audited path from a recorded account adjustment into OD's
     /// double-entry journal. The two lines are previewed before anything is
     /// written, and the accounts default from the chart by the adjustment's sign.
+    /// Explicit, audited path from an account adjustment or patient payment
+    /// into OD's double-entry journal. The two lines are previewed before
+    /// anything is written, and accounts default from the chart by direction.
     fn journal_post_window(&mut self, ctx: &egui::Context) {
-        let Some(adj) = self.journal_post_edit.clone() else {
+        let Some(source) = self.journal_post_edit.clone() else {
             return;
         };
         let accounts = self.store.list_accounts().unwrap_or_default();
@@ -8904,25 +9052,22 @@ impl OdApp {
         };
 
         // The reference token is rebuilt on every write, so editing the note
-        // can never strip the link back to the source adjustment.
-        let memo = adjustment_journal_memo_with_note(&adj, &self.journal_memo_text);
+        // can never strip the link back to the source record.
+        let memo = source.memo(&self.journal_memo_text);
 
         // Build the preview from the current selections so staff see exactly
         // which accounts, amounts and memo will be written before confirming.
         let mut preview_rows: Vec<[String; 5]> = Vec::new();
         let mut preview_error: Option<String> = None;
-        if is_adjustment_posted(
-            &self.store.list_journal_entries().unwrap_or_default(),
-            adj.adj_num,
-            adj.pat_num,
-        ) {
+        let current_journal = self.store.list_journal_entries().unwrap_or_default();
+        if source.is_posted(&current_journal) {
             preview_error = Some(format!(
-                "Adjustment #{} is already posted to the ledger. Posting again would duplicate it.",
-                adj.adj_num
+                "{} #{} is already posted to the ledger. Posting again would duplicate it.",
+                source.label(),
+                source.source_num()
             ));
         }
-        match build_adjustment_journal(
-            &adj,
+        match source.build(
             self.journal_debit_account,
             self.journal_credit_account,
             self.journal_transaction_num,
@@ -8950,24 +9095,22 @@ impl OdApp {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Post adjustment to ledger")
+        egui::Window::new(format!("Post {} to ledger", source.label()))
             .open(&mut self.journal_post_open)
             .resizable(true)
             .default_width(560.0)
             .show(ctx, |ui| {
-                ui.label(format!(
-                    "Adjustment #{} · patient #{} · {} · {:.2}",
-                    adj.adj_num, adj.pat_num, adj.adj_date, adj.adj_amount
-                ));
-                if !adj.note.trim().is_empty() {
-                    ui.label(format!("Note: {}", adj.note));
+                ui.label(source.heading());
+                if !source.note().trim().is_empty() {
+                    ui.label(format!("Note: {}", source.note()));
                 }
                 ui.separator();
-                ui.label(
+                ui.label(format!(
                     "Writes one balanced debit/credit pair with a shared transaction number. \
-                     The patient balance is unchanged; the posting makes this adjustment visible \
+                     The patient balance is unchanged; the posting makes this {} visible \
                      to the Balance Sheet, General Ledger and Profit & Loss reports.",
-                );
+                    source.label().to_lowercase()
+                ));
                 egui::Grid::new("journal_post_accounts")
                     .num_columns(2)
                     .show(ui, |ui| {
@@ -9000,8 +9143,10 @@ impl OdApp {
                         ui.label("Transaction #");
                         ui.label(self.journal_transaction_num.to_string());
                         ui.end_row();
-                        ui.label("Memo note")
-                            .on_hover_text("The adjustment reference is added automatically and cannot be removed.");
+                        ui.label("Memo note").on_hover_text(format!(
+                            "The {} reference is added automatically and cannot be removed.",
+                            source.label()
+                        ));
                         ui.text_edit_singleline(&mut self.journal_memo_text);
                         ui.end_row();
                     });
@@ -9053,19 +9198,15 @@ impl OdApp {
         // Re-check with the freshest values (a selection change, a click or a
         // posting from another window can land on the same frame) before any
         // write. This is the last line of defence against a duplicate pair.
-        if is_adjustment_posted(
-            &self.store.list_journal_entries().unwrap_or_default(),
-            adj.adj_num,
-            adj.pat_num,
-        ) {
+        if source.is_posted(&self.store.list_journal_entries().unwrap_or_default()) {
             self.error = Some(format!(
-                "Adjustment #{} is already posted to the ledger; nothing was written.",
-                adj.adj_num
+                "{} #{} is already posted to the ledger; nothing was written.",
+                source.label(),
+                source.source_num()
             ));
             return;
         }
-        let mut entries = match build_adjustment_journal(
-            &adj,
+        let mut entries = match source.build(
             self.journal_debit_account,
             self.journal_credit_account,
             self.journal_transaction_num,
@@ -9083,9 +9224,10 @@ impl OdApp {
             self.error = Some(err);
             return;
         }
-        let pat_num = adj.pat_num;
-        let adj_num = adj.adj_num;
-        let amount = adj.adj_amount.abs();
+        let pat_num = source.pat_num();
+        let source_num = source.source_num();
+        let label = source.label();
+        let amount = source.amount();
         let debit = self.journal_debit_account;
         let credit = self.journal_credit_account;
         match self.store.post_journal_transaction(&entries) {
@@ -9095,17 +9237,17 @@ impl OdApp {
                     Permission::ADJUSTMENT_CREATE,
                     pat_num,
                     format!(
-                        "Adjustment #{adj_num} posted to journal transaction #{transaction_num}: debit account #{debit}, credit account #{credit}, amount {amount:.2}"
+                        "{label} #{source_num} posted to journal transaction #{transaction_num}: debit account #{debit}, credit account #{credit}, amount {amount:.2}"
                     ),
                 );
                 self.notice = Some(format!(
-                    "Adjustment posted to ledger as journal transaction #{transaction_num} — now visible in the accounting reports"
+                    "{label} posted to ledger as journal transaction #{transaction_num} — now visible in the accounting reports"
                 ));
                 self.error = None;
                 self.journal_post_edit = None;
                 self.journal_post_open = false;
             }
-            Err(err) => self.error = Some(format!("Could not post adjustment to ledger: {err}")),
+            Err(err) => self.error = Some(format!("Could not post {label} to ledger: {err}")),
         }
     }
 
@@ -11265,6 +11407,145 @@ mod tests {
         assert!(app.error.is_some_and(|e| e.contains("already posted")));
         let after_second = app.store.list_journal_entries().unwrap();
         assert_eq!(after_second.len(), after.len(), "no duplicate lines written");
+    }
+
+    /// Payment-backed ledger rows carry the payment number so the Action
+    /// column can offer one posting per payment, even with several splits.
+    #[test]
+    fn account_ledger_rows_expose_the_payment_number() {
+        use od_domain::{PaySplit, Payment};
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let payment = Payment {
+            pay_num: 71,
+            pat_num: 1,
+            pay_date: date,
+            pay_amount: 40.0,
+            pay_type: 0,
+            check_num: "CHQ-71".into(),
+            note: "Desk cash".into(),
+        };
+        let split = PaySplit {
+            pay_num: 71,
+            pat_num: 1,
+            split_amount: 40.0,
+            date_pay: date,
+            ..Default::default()
+        };
+        let rows = build_account_ledger_rows(&[], &[], &[split], &[payment], true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "Payment");
+        assert_eq!(rows[0].pay_num, 71);
+        assert_eq!(rows[0].credit, 40.0);
+    }
+
+    /// The shared source handles both record types: sign-based defaults,
+    /// balanced pairs and a stable reference that survives note edits.
+    #[test]
+    fn journal_post_source_handles_adjustments_and_payments() {
+        use od_core::payment_journal_reference;
+        let app = OdApp::new();
+        let accounts = app.store.list_accounts().unwrap();
+        let pat_num = app.patients[0].pat_num;
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let adj_source = JournalPostSource::Adjustment(Adjustment {
+            adj_num: 91,
+            adj_date: date,
+            adj_amount: 12.0,
+            pat_num,
+            note: "Charge".into(),
+            ..Default::default()
+        });
+        let pay_source = JournalPostSource::Payment(Payment {
+            pay_num: 92,
+            pat_num,
+            pay_date: date,
+            pay_amount: -20.0,
+            pay_type: 0,
+            check_num: "CHQ-92".into(),
+            note: "Refund".into(),
+        });
+        assert_eq!(adj_source.label(), "Adjustment");
+        assert_eq!(pay_source.label(), "Payment");
+        assert_eq!((adj_source.source_num(), pay_source.source_num()), (91, 92));
+        assert_eq!((adj_source.pat_num(), pay_source.pat_num()), (pat_num, pat_num));
+        let (adj_debit, adj_credit) = adj_source.default_accounts(&accounts);
+        let (pay_debit, pay_credit) = pay_source.default_accounts(&accounts);
+        assert_ne!(adj_debit, adj_credit);
+        assert_ne!(pay_debit, pay_credit);
+        let adj_entries = adj_source.build(adj_debit, adj_credit, 1).unwrap();
+        let pay_entries = pay_source.build(pay_debit, pay_credit, 2).unwrap();
+        validate_balanced_journal(&adj_entries).unwrap();
+        validate_balanced_journal(&pay_entries).unwrap();
+        assert!(adj_entries[0].memo.contains("[Adj #91"));
+        assert!(pay_entries[0].memo.contains("[Pay #92"));
+        assert_eq!(pay_entries[0].check_number, "CHQ-92");
+        assert!(pay_source
+            .memo("edited")
+            .contains(&payment_journal_reference(92, pat_num)));
+        assert!(pay_source.heading().contains("cheque CHQ-92"));
+        assert!(!adj_source.is_posted(&pay_entries));
+        assert!(!pay_source.is_posted(&adj_entries));
+    }
+
+    /// Posting a patient payment writes a balanced pair through the real app
+    /// state, audits it, and refuses a second posting for the same payment.
+    #[test]
+    fn gui_payment_journal_posting_writes_pair_audit_and_guard() {
+        let mut app = OdApp::new();
+        let accounts = app.store.list_accounts().unwrap();
+        let pat_num = app.patients[0].pat_num;
+        let source = JournalPostSource::Payment(Payment {
+            pay_num: 93,
+            pat_num,
+            pay_date: chrono::NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 55.0,
+            pay_type: 0,
+            check_num: "CHQ-55".into(),
+            note: "Desk cash".into(),
+        });
+        let (debit, credit) = source.default_accounts(&accounts);
+        let journal_before = app.store.list_journal_entries().unwrap();
+        let transaction_num = next_journal_transaction_num(&journal_before);
+        let mut entries = source.build(debit, credit, transaction_num).unwrap();
+        let memo = source.memo("till 2");
+        for entry in &mut entries {
+            entry.memo = memo.clone();
+        }
+        assert_eq!(
+            app.store.post_journal_transaction(&entries).unwrap(),
+            transaction_num
+        );
+        app.audit_if(
+            FeatureKey::AuditBillingChanges,
+            Permission::ADJUSTMENT_CREATE,
+            pat_num,
+            format!("Payment #93 posted to journal transaction #{transaction_num}"),
+        );
+
+        let all = app.store.list_journal_entries().unwrap();
+        let posted: Vec<&JournalEntry> = all
+            .iter()
+            .filter(|e| e.transaction_num == transaction_num)
+            .collect();
+        assert_eq!(posted.len(), 2);
+        assert!(posted
+            .iter()
+            .all(|e| e.check_number == "CHQ-55" && e.memo.contains("[Pay #93")));
+        assert!(is_payment_posted(&all, 93, pat_num));
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Payment #93 posted to journal")));
+
+        // Once posted, the window's guard rejects a duplicate before any write.
+        assert!(source.is_posted(&app.store.list_journal_entries().unwrap_or_default()));
+        assert_eq!(
+            app.store.list_journal_entries().unwrap().len(),
+            all.len(),
+            "no duplicate payment lines written"
+        );
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the

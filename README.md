@@ -792,21 +792,24 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       into retained earnings and derive current-year net income — never stored.
       The Balance Sheet uses the range's end date; the Ledger shows opening and
       closing balances per account. Those reports are no longer read-only: the
-      Account ledger's adjustment rows have a **Post to ledger** action (toggle
-      `ledger_journal_posting`, on by default, plus the OD *Adjustment Create*
-      permission). It writes one balanced `journalentry` transaction — a debit
-      and a credit of the adjustment's absolute value sharing a `TransactionNum`
-      and date — through `Store::post_journal_transaction`, which inserts both
-      lines atomically in MySQL. Debit/credit accounts default from the chart by
-      sign (a charge debits A/R and credits income; a write-off debits expense
-      and credits A/R) and can be overridden. The two lines are previewed before
-      confirmation, the patient balance is unchanged, and each posting writes an
-      `Adjustment Create` security-log entry so the source adjustment stays
-      traceable from the ledger to the accounting reports. Each memo carries a
-      stable `[Adj #… pat #…]` reference that is re-attached even when staff edit
-      the note, so an already-posted adjustment shows **Posted #⟨transaction⟩**
-      instead of the button and a second posting is refused at confirmation —
-      no duplicate journal pair can be booked (pre-reference memos are still
+      Account ledger's adjustment **and payment** rows have a **Post to ledger**
+      action (toggle `ledger_journal_posting`, on by default, plus the OD
+      *Adjustment Create* permission). It writes one balanced `journalentry`
+      transaction — a debit and a credit of the source amount's absolute value
+      sharing a `TransactionNum` and date — through
+      `Store::post_journal_transaction`, which inserts both lines atomically in
+      MySQL. Debit/credit accounts default from the chart by direction (a charge
+      debits A/R and credits income; a write-off debits expense and credits A/R;
+      a collection debits cash and credits A/R; a refund reverses that) and can
+      be overridden. A payment's cheque number is carried onto both lines. The
+      two lines are previewed before confirmation, the patient balance is
+      unchanged, and each posting writes an `Adjustment Create` security-log
+      entry so the source record stays traceable from the ledger to the
+      accounting reports. Each memo carries a stable `[Adj #… pat #…]` or
+      `[Pay #… pat #…]` reference that is re-attached even when staff edit the
+      note, so an already-posted record shows **Posted #⟨transaction⟩** instead
+      of the button and a second posting is refused at confirmation — no
+      duplicate journal pair can be booked (pre-reference memos are still
       recognised).
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a

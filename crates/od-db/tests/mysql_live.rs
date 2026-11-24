@@ -4435,3 +4435,91 @@ fn mysql_live_journal_posting_round_trip() {
         .all(|e| e.transaction_num != transaction_num));
     println!("live journal posting: transaction {transaction_num} round-tripped and cleaned up");
 }
+
+/// Posts a balanced patient-payment pair into the live OD `journalentry`
+/// table, verifies the cheque number and memo survive the round trip, then
+/// removes the temporary transaction so the demo database is left unchanged.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes a temporary journal transaction"]
+fn mysql_live_payment_journal_posting_round_trip() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let accounts: Vec<Account> = store.list_accounts().expect("list_accounts failed");
+    assert!(accounts.len() >= 2, "need two accounts for a balanced pair");
+    let journal_before = store.list_journal_entries().unwrap();
+    let transaction_num = od_core::next_journal_transaction_num(&journal_before) + 51_000;
+    let pat_num = store.list_patients().unwrap()[0].pat_num;
+    let pay_num = 2_100_000_099;
+    let payment = Payment {
+        pay_num,
+        pat_num,
+        pay_date: NaiveDate::from_ymd_opt(2099, 4, 1).unwrap(),
+        pay_amount: 48.25,
+        pay_type: 0,
+        check_num: "ODCLINIC_LIVE_TEST_CHQ".into(),
+        note: "ODCLINIC_LIVE_TEST_PAY_JOURNAL".into(),
+    };
+    assert!(!od_core::is_payment_posted(&journal_before, pay_num, pat_num));
+    let (debit, credit) =
+        od_core::suggest_payment_ledger_accounts(&accounts, payment.pay_amount)
+            .expect("two distinct accounts");
+    let entries =
+        od_core::build_payment_journal(&payment, debit, credit, transaction_num).unwrap();
+    od_core::validate_balanced_journal(&entries).unwrap();
+
+    store
+        .post_journal_transaction(&entries)
+        .expect("post_journal_transaction failed");
+    let after = store.list_journal_entries().unwrap();
+    let posted: Vec<JournalEntry> = after
+        .iter()
+        .filter(|e| e.transaction_num == transaction_num)
+        .cloned()
+        .collect();
+    assert_eq!(posted.len(), 2, "both journal lines must be written atomically");
+    assert!(posted.iter().any(|e| e.debit_amt == 48.25 && e.account_num == debit));
+    assert!(posted.iter().any(|e| e.credit_amt == 48.25 && e.account_num == credit));
+    assert!(posted
+        .iter()
+        .all(|e| e.check_number == "ODCLINIC_LIVE_TEST_CHQ"
+            && e.memo.contains("ODCLINIC_LIVE_TEST_PAY_JOURNAL")));
+    od_core::validate_balanced_journal(&posted).unwrap();
+    assert!(od_core::is_payment_posted(&after, pay_num, pat_num));
+    assert_eq!(
+        od_core::journal_transaction_for_payment(&after, pay_num, pat_num),
+        Some(transaction_num)
+    );
+
+    let report = general_ledger_report(
+        &accounts,
+        &after,
+        NaiveDate::from_ymd_opt(2099, 1, 1).unwrap(),
+        NaiveDate::from_ymd_opt(2099, 12, 31).unwrap(),
+        false,
+    );
+    assert!(
+        report
+            .rows
+            .concat()
+            .join("|")
+            .contains("ODCLINIC_LIVE_TEST_PAY_JOURNAL"),
+        "the payment posting must reach the General Ledger"
+    );
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    conn.query_drop(format!(
+        "DELETE FROM journalentry WHERE TransactionNum = {transaction_num}"
+    ))
+    .expect("journal cleanup failed");
+    let cleaned = store.list_journal_entries().unwrap();
+    assert!(!od_core::is_payment_posted(&cleaned, pay_num, pat_num));
+    println!("live payment journal posting: transaction {transaction_num} round-tripped and cleaned up");
+}
