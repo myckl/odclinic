@@ -25,9 +25,10 @@ use od_core::{
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    is_adjustment_posted, is_payment_posted, is_waitlist, journal_posting_audit_report,
-    journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
-    ledger_tie_out_report, month_bounds, new_patient_report, tie_out_ready,
+    close_audit_text, is_adjustment_posted, is_payment_posted, is_waitlist,
+    journal_posting_audit_report, journal_transaction_for_adjustment,
+    journal_transaction_for_payment, laser_labels_report, ledger_tie_out_report, month_bounds,
+    new_patient_report, period_close_history_report, reopen_audit_text, tie_out_ready,
     next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
@@ -1190,6 +1191,7 @@ enum ReportKind {
     ProfitLoss,
     JournalPostingAudit,
     LedgerTieOut,
+    PeriodCloseHistory,
     HiddenPaySplits,
     UnearnedIncome,
     ProcOverpaid,
@@ -1214,7 +1216,7 @@ enum ReportKind {
 }
 
 impl ReportKind {
-    const ALL: [ReportKind; 54] = [
+    const ALL: [ReportKind; 55] = [
         ReportKind::PatientList,
         ReportKind::Production,
         ReportKind::Collections,
@@ -1248,6 +1250,7 @@ impl ReportKind {
         ReportKind::ProfitLoss,
         ReportKind::JournalPostingAudit,
         ReportKind::LedgerTieOut,
+        ReportKind::PeriodCloseHistory,
         ReportKind::HiddenPaySplits,
         ReportKind::UnearnedIncome,
         ReportKind::ProcOverpaid,
@@ -1305,6 +1308,7 @@ impl ReportKind {
             ReportKind::ProfitLoss => "Profit & loss (FormRpAccountingProfitLoss)",
             ReportKind::JournalPostingAudit => "Journal posting audit",
             ReportKind::LedgerTieOut => "Ledger tie-out",
+            ReportKind::PeriodCloseHistory => "Period close history",
             ReportKind::HiddenPaySplits => "Hidden pay splits (FormRpHiddenPaySplits)",
             ReportKind::UnearnedIncome => "Unearned income (FormRpUnearnedIncome)",
             ReportKind::ProcOverpaid => "Overpaid procedures (FormRpProcOverpaid)",
@@ -1366,6 +1370,7 @@ impl ReportKind {
             ReportKind::ProfitLoss => FeatureKey::ReportProfitLoss,
             ReportKind::JournalPostingAudit => FeatureKey::LedgerJournalPosting,
             ReportKind::LedgerTieOut => FeatureKey::LedgerJournalPosting,
+            ReportKind::PeriodCloseHistory => FeatureKey::LedgerJournalPosting,
             ReportKind::HiddenPaySplits => FeatureKey::ReportHiddenPaySplits,
             ReportKind::UnearnedIncome => FeatureKey::ReportUnearnedIncome,
             ReportKind::ProcOverpaid => FeatureKey::ReportProcOverpaid,
@@ -1471,6 +1476,7 @@ impl ReportKind {
             ReportKind::ProfitLoss => "profit-loss",
             ReportKind::JournalPostingAudit => "journal-posting-audit",
             ReportKind::LedgerTieOut => "ledger-tie-out",
+            ReportKind::PeriodCloseHistory => "period-close-history",
             ReportKind::HiddenPaySplits => "hidden-pay-splits",
             ReportKind::UnearnedIncome => "unearned-income",
             ReportKind::ProcOverpaid => "overpaid-procedures",
@@ -5764,6 +5770,8 @@ impl OdApp {
                     self.report_from = next_first;
                     self.report_to = after_next - Duration::days(1);
                 }
+            } else if current == ReportKind::PeriodCloseHistory {
+                ui.label("Full audit history (all dates)");
             } else {
                 ui.label(format!("As of {}", self.report_to));
             }
@@ -5778,7 +5786,11 @@ impl OdApp {
             self.report_export_kind = Some(current);
         }
         if !current.uses_date_range() {
-            ui.label("Balance and summary reports use the range end date as 'as of'; the start date is ignored.");
+            if current == ReportKind::PeriodCloseHistory {
+                ui.label("Every audited close and reopen is listed, regardless of the date range above.");
+            } else {
+                ui.label("Balance and summary reports use the range end date as 'as of'; the start date is ignored.");
+            }
         }
         // Accounting reports read only `journalentry`, so charges, payments and
         // adjustments must be posted before the Balance Sheet and P&L are complete.
@@ -8100,6 +8112,15 @@ impl OdApp {
                     self.report_to,
                 ));
             }
+            ReportKind::PeriodCloseHistory => {
+                // Sign-offs span months, so read the full log rather than the
+                // short Setup view. This report never writes to the store.
+                let log = match self.store.list_security_log(1000) {
+                    Ok(rows) => rows,
+                    Err(_) => self.security_log.clone(),
+                };
+                upstream_table = Some(period_close_history_report(&log, &self.closed_periods));
+            }
             ReportKind::HiddenPaySplits => {
                 let definitions = self.store.list_definitions().unwrap_or_default();
                 let splits = gather_splits(&*self.store, &patients);
@@ -9860,20 +9881,13 @@ impl OdApp {
             PeriodAction::Close => match gate {
                 Ok(()) => match updated.close(date, &reason, Local::now().naive_local().to_string())
                 {
-                    Ok(period) => Ok(format!(
-                        "Closed accounting period {}: {reason}",
-                        period.key()
-                    )),
+                    Ok(period) => Ok(close_audit_text(&period.key(), &reason)),
                     Err(err) => Err(err),
                 },
                 Err(err) => Err(err),
             },
             PeriodAction::Reopen => match updated.reopen(date) {
-                Ok(period) => Ok(format!(
-                    "Reopened accounting period {} (was closed for: {}) — reason: {reason}",
-                    period.key(),
-                    period.reason
-                )),
+                Ok(period) => Ok(reopen_audit_text(&period.key(), &period.reason, &reason)),
                 Err(err) => Err(err),
             },
         };
@@ -12582,7 +12596,7 @@ mod tests {
         assert!(app.features.enabled(FeatureKey::ReportUnearnedIncome));
         assert!(app.features.enabled(FeatureKey::ReportProcNote));
         assert!(app.features.enabled(FeatureKey::ReportTpPresentationStats));
-        assert_eq!(ReportKind::ALL.len(), 54, "local + upstream reports wired");
+        assert_eq!(ReportKind::ALL.len(), 55, "local + upstream reports wired");
         assert_eq!(
             ReportKind::JournalPostingAudit.feature_key(),
             FeatureKey::LedgerJournalPosting
@@ -12598,6 +12612,16 @@ mod tests {
         );
         assert_eq!(ReportKind::LedgerTieOut.file_stem(), "ledger-tie-out");
         assert!(ReportKind::LedgerTieOut.uses_date_range());
+        assert_eq!(ReportKind::PeriodCloseHistory.label(), "Period close history");
+        assert_eq!(
+            ReportKind::PeriodCloseHistory.feature_key(),
+            FeatureKey::LedgerJournalPosting
+        );
+        assert_eq!(
+            ReportKind::PeriodCloseHistory.file_stem(),
+            "period-close-history"
+        );
+        assert!(!ReportKind::PeriodCloseHistory.uses_date_range());
         assert_eq!(ReportKind::CustomAging.file_stem(), "custom-aging");
         assert_eq!(ReportKind::Patients.file_stem(), "patients");
         assert_eq!(ReportKind::BalanceSheet.file_stem(), "balance-sheet");

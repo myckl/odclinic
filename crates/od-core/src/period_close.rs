@@ -6,8 +6,10 @@
 //! closed month is never written, and every close/reopen is written to the OD
 //! security log by the caller.
 
-use chrono::{Datelike, NaiveDate};
-use od_domain::Pref;
+use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use od_domain::{Id, Pref, SecurityEvent};
+
+use crate::ReportTable;
 use serde_json::{Value, json};
 
 /// Preference row holding the JSON array of closed periods.
@@ -63,6 +65,20 @@ impl ClosedPeriod {
             None
         }
     }
+}
+
+/// Canonical audit wording for a close. The GUI writes this exact text and the
+/// history report reads it back, so the two cannot drift apart.
+pub fn close_audit_text(key: &str, reason: &str) -> String {
+    format!("Closed accounting period {key}: {}", reason.trim())
+}
+
+/// Canonical audit wording for a reopen, retaining the reason being undone.
+pub fn reopen_audit_text(key: &str, previous_reason: &str, reason: &str) -> String {
+    format!(
+        "Reopened accounting period {key} (was closed for: {previous_reason}) — reason: {}",
+        reason.trim()
+    )
 }
 
 /// First and last day of the month containing `date`. Closing operates on
@@ -198,6 +214,118 @@ impl ClosedPeriods {
     }
 }
 
+/// What an audited period action did to the posting gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PeriodCloseAction {
+    Closed,
+    Reopened,
+}
+
+impl PeriodCloseAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "Closed",
+            Self::Reopened => "Reopened",
+        }
+    }
+}
+
+/// One close or reopen reconstructed from the OD security log.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PeriodCloseEvent {
+    pub security_log_num: Id,
+    pub timestamp: NaiveDateTime,
+    pub month: String,
+    pub action: PeriodCloseAction,
+    pub reason: String,
+    /// The reason of the close that a reopen undid, when applicable.
+    pub previous_reason: Option<String>,
+}
+
+fn valid_month_key(key: &str) -> bool {
+    let Some((year, month)) = key.split_once('-') else {
+        return false;
+    };
+    match (year.parse::<i32>(), month.parse::<u32>()) {
+        (Ok(year), Ok(month)) => NaiveDate::from_ymd_opt(year, month, 1).is_some(),
+        _ => false,
+    }
+}
+
+impl PeriodCloseEvent {
+    /// Read one canonical period-close audit row. Unrelated log rows are
+    /// ignored so the report stays useful on a busy security log.
+    pub fn from_security_event(event: &SecurityEvent) -> Option<Self> {
+        let text = event.log_text.as_str();
+        let (month, action, reason, previous_reason) =
+            if let Some(rest) = text.strip_prefix("Closed accounting period ") {
+                let (key, reason) = rest.split_once(": ")?;
+                (key, PeriodCloseAction::Closed, reason, None)
+            } else if let Some(rest) = text.strip_prefix("Reopened accounting period ") {
+                let (key, tail) = rest.split_once(" (was closed for: ")?;
+                let (previous, reason) = tail.rsplit_once(") — reason: ")?;
+                (key, PeriodCloseAction::Reopened, reason, Some(previous))
+            } else {
+                return None;
+            };
+        if !valid_month_key(month) {
+            return None;
+        }
+        Some(Self {
+            security_log_num: event.security_log_num,
+            timestamp: event.log_datetime,
+            month: month.to_string(),
+            action,
+            reason: reason.to_string(),
+            previous_reason: previous_reason.map(str::to_string),
+        })
+    }
+}
+
+/// Every logged sign-off and reopen, newest first. Ties keep log-number order
+/// so two actions in the same second still read in the order they were written.
+pub fn period_close_events(log: &[SecurityEvent]) -> Vec<PeriodCloseEvent> {
+    let mut events: Vec<_> = log
+        .iter()
+        .filter_map(PeriodCloseEvent::from_security_event)
+        .collect();
+    events.sort_by(|a, b| {
+        (b.timestamp, b.security_log_num).cmp(&(a.timestamp, a.security_log_num))
+    });
+    events
+}
+
+/// Read-only sign-off history for staff. Each row is one audited close or
+/// reopen; the final column shows whether that month is still locked by the
+/// persisted preference, so a reopen that was later re-signed reads as locked.
+pub fn period_close_history_report(log: &[SecurityEvent], closed: &ClosedPeriods) -> ReportTable {
+    let mut table = ReportTable::new(&[
+        "Time",
+        "Month",
+        "Action",
+        "Reason",
+        "Previous close reason",
+        "Current posting lock",
+    ]);
+    for event in period_close_events(log) {
+        let time = event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+        let lock = if closed.all().iter().any(|p| p.key() == event.month) {
+            "Locked"
+        } else {
+            "Unlocked"
+        };
+        table.push(&[
+            &time,
+            &event.month,
+            event.action.label(),
+            &event.reason,
+            event.previous_reason.as_deref().unwrap_or(""),
+            lock,
+        ]);
+    }
+    table
+}
+
 /// A tie-out is ready to sign off only when every non-informational check is
 /// `OK`; that includes the unposted-source and account-setup `CHECK` rows.
 pub fn tie_out_ready(table: &crate::ReportTable) -> Result<(), String> {
@@ -318,5 +446,113 @@ mod tests {
     fn malformed_preference_is_an_empty_gate() {
         assert!(ClosedPeriods::from_prefs(&pref("{not json")).is_empty());
         assert!(ClosedPeriods::from_prefs(&[]).is_empty());
+    }
+
+    fn audit(num: Id, text: &str, when: &str) -> SecurityEvent {
+        SecurityEvent {
+            security_log_num: num,
+            perm_type: od_domain::Permission::ADJUSTMENT_CREATE,
+            user_num: 7,
+            log_datetime: NaiveDateTime::parse_from_str(when, "%Y-%m-%d %H:%M:%S").unwrap(),
+            log_text: text.to_string(),
+            pat_num: 0,
+        }
+    }
+
+    #[test]
+    fn period_close_audit_texts_parse_back_into_events() {
+        let events = period_close_events(&[
+            audit(
+                1,
+                &close_audit_text("2026-11", "Month-end signed off"),
+                "2026-11-30 18:00:00",
+            ),
+            audit(
+                2,
+                &reopen_audit_text("2026-11", "Month-end signed off", "Late correction #209"),
+                "2026-12-01 09:00:00",
+            ),
+            audit(3, "User: Admin has logged off.", "2026-12-01 09:01:00"),
+        ]);
+        assert_eq!(events.len(), 2);
+        // Newest first: the reopen precedes the close it undid.
+        assert_eq!(events[0].action, PeriodCloseAction::Reopened);
+        assert_eq!(events[0].month, "2026-11");
+        assert_eq!(events[0].reason, "Late correction #209");
+        assert_eq!(
+            events[0].previous_reason.as_deref(),
+            Some("Month-end signed off")
+        );
+        assert_eq!(events[1].action, PeriodCloseAction::Closed);
+        assert_eq!(events[1].reason, "Month-end signed off");
+        assert_eq!(events[1].previous_reason, None);
+    }
+
+    #[test]
+    fn history_report_shows_reason_timestamp_and_current_lock() {
+        let date = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        let mut periods = ClosedPeriods::default();
+        periods
+            .close(date, "Late correction posted", "2026-12-01 10:00:00".into())
+            .unwrap();
+        let log = vec![
+            audit(
+                1,
+                &close_audit_text("2026-11", "Final sign-off"),
+                "2026-11-30 18:00:00",
+            ),
+            audit(
+                2,
+                &reopen_audit_text("2026-11", "Final sign-off", "Late correction"),
+                "2026-12-01 09:00:00",
+            ),
+            audit(
+                3,
+                &close_audit_text("2026-11", "Late correction posted"),
+                "2026-12-01 10:00:00",
+            ),
+        ];
+        let table = period_close_history_report(&log, &periods);
+        assert_eq!(
+            table.headers,
+            [
+                "Time",
+                "Month",
+                "Action",
+                "Reason",
+                "Previous close reason",
+                "Current posting lock",
+            ]
+        );
+        assert_eq!(table.rows.len(), 3);
+        assert_eq!(table.rows[0][0], "2026-12-01 10:00:00");
+        assert_eq!(table.rows[0][2], "Closed");
+        assert_eq!(table.rows[0][3], "Late correction posted");
+        assert_eq!(table.rows[0][5], "Locked");
+        assert_eq!(table.rows[1][2], "Reopened");
+        assert_eq!(table.rows[1][4], "Final sign-off");
+        // The month was re-signed after that reopen, so it is locked again now.
+        assert_eq!(table.rows[1][5], "Locked");
+
+        let open = period_close_history_report(&log, &ClosedPeriods::default());
+        assert!(open.rows.iter().all(|row| row[5] == "Unlocked"));
+    }
+
+    #[test]
+    fn malformed_or_unrelated_log_rows_are_ignored() {
+        let log = vec![
+            audit(
+                1,
+                "Closed accounting period 2026-13: bad month",
+                "2026-11-30 18:00:00",
+            ),
+            audit(2, "Closed accounting period nonsense", "2026-11-30 18:00:00"),
+            audit(
+                3,
+                "Reopened accounting period 2026-11 (bad separator",
+                "2026-11-30 18:00:00",
+            ),
+        ];
+        assert!(period_close_events(&log).is_empty());
     }
 }

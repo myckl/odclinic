@@ -58,7 +58,9 @@ pub use journal::{
     ChargePostingPlan, PostingAccountDefaults, PostingBatchItem, PostingSource, PostingSourceKind,
 };
 pub use period_close::{
-    CLOSED_PERIODS_PREF, ClosedPeriod, ClosedPeriods, month_bounds, tie_out_ready,
+    CLOSED_PERIODS_PREF, ClosedPeriod, ClosedPeriods, PeriodCloseAction, PeriodCloseEvent,
+    close_audit_text, month_bounds, period_close_events, period_close_history_report,
+    reopen_audit_text, tie_out_ready,
 };
 pub use pdf::{render_invoice_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};

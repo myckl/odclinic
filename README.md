@@ -848,7 +848,14 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       signed-off period. **Reopen** (same permission, with its own reason, also
       audited) unlocks the month for a late correction; close it again with a
       new reason when finished. Closed months in the current report range are
-      flagged above the report.
+      flagged above the report. The **Period close history** report is the
+      read-only sign-off register: every audited close and reopen is listed
+      with its timestamp, month, action, reason, the reason a reopen superseded,
+      and that month's *current* posting lock. It reads only the security log
+      and the persisted preference — there is nothing to edit — and ignores
+      the report date range so no sign-off can be missed. It uses the
+      `period-close-history` export stem and shares the `ledger_journal_posting`
+      toggle.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be
