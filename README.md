@@ -546,8 +546,13 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
     information" and "Exclude patients with no production" mirror the original;
     since this port does not store referrals or preferred names, those columns
     are blank.
-  Every option above lives in the "Report options (as in Open Dental)" panel and
-  is persisted in `reports.txt` alongside the practice name and export paths.
+  Every option above lives in the "Report options (as in Open Dental)" panel.
+  The practice name and export paths stay practice-wide, while each option set
+  is saved per signed-in user in `reports.txt` (as `user_options.user-<UserNum>`
+  or `user_options.local`) and restored on restart or login/logout, so two staff
+  members can keep different report defaults without overwriting each other.
+  Options from an older shared installation become the first user's starting
+  set rather than being discarded.
   These reports use a variable-column `ReportTable` model; the local three-column
   reports are wrapped into it, so the CSV header stays
   `Practice,Report,Item,Value,Detail` for them while upstream exports keep OD's

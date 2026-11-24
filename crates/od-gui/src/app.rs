@@ -2067,6 +2067,7 @@ impl OdApp {
             display_field_width_text: "80".into(),
         };
         app.load_period_close_history_filters();
+        app.load_report_options_for_user();
         app.refresh();
         app
     }
@@ -2148,7 +2149,7 @@ impl OdApp {
             return;
         }
         self.report_prefs.set_export_path(key, path);
-        if let Err(err) = self.report_prefs.save() {
+        if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save export path preference: {err}"));
         }
     }
@@ -2190,8 +2191,34 @@ impl OdApp {
             return;
         }
         self.report_prefs.set_period_close_history_view(key, view);
-        if let Err(err) = self.report_prefs.save() {
+        if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save history filters: {err}"));
+        }
+    }
+
+    /// Snapshot the active user's report options, then write `reports.txt`.
+    /// Every option edit and preference write goes through here, so one user's
+    /// choices cannot overwrite another user's saved set.
+    fn save_report_prefs(&mut self) -> Result<(), String> {
+        let key = self.period_close_history_user_key();
+        self.report_prefs.snapshot_user_options(&key);
+        self.report_prefs.save()
+    }
+
+    /// Make the signed-in user's saved report options the live ones. Called on
+    /// startup and after each login/logout switch.
+    fn load_report_options_for_user(&mut self) {
+        let key = self.period_close_history_user_key();
+        self.report_prefs.restore_user_options(&key);
+    }
+
+    /// The session has already changed: persist the outgoing user before
+    /// loading the incoming user's options, then write both snapshots.
+    fn switch_report_options_user(&mut self, previous_user_key: &str) {
+        self.report_prefs.snapshot_user_options(previous_user_key);
+        self.load_report_options_for_user();
+        if let Err(err) = self.save_report_prefs() {
+            self.error = Some(format!("Could not save report preferences: {err}"));
         }
     }
 
@@ -2380,12 +2407,14 @@ impl OdApp {
             od_core::auth::resolve_permissions(&user, &self.group_attaches, &self.group_permissions);
         let user_name = user.user_name.clone();
         let user_num = user.user_num;
+        let previous_user_key = self.period_close_history_user_key();
         self.session = Some(Session {
             user_num,
             user_name: user_name.clone(),
             permissions,
         });
         self.load_period_close_history_filters();
+        self.switch_report_options_user(&previous_user_key);
         self.login_error = None;
         self.login_pass.clear();
         self.show_settings = false;
@@ -2402,8 +2431,10 @@ impl OdApp {
             let text = format!("User: {} has logged off.", session.user_name);
             self.audit_if(FeatureKey::AuditLogins, Permission::USER_LOG_ON_OFF, 0, text);
         }
+        let previous_user_key = self.period_close_history_user_key();
         self.session = None;
         self.load_period_close_history_filters();
+        self.switch_report_options_user(&previous_user_key);
     }
 
     fn login_ui(&mut self, ui: &mut Ui) {
@@ -7387,7 +7418,7 @@ impl OdApp {
                 }
             });
             if options_changed {
-                if let Err(err) = self.report_prefs.save() {
+                if let Err(err) = self.save_report_prefs() {
                     self.error = Some(format!("Could not save report options: {err}"));
                 }
             }
@@ -7398,7 +7429,7 @@ impl OdApp {
                 egui::TextEdit::singleline(&mut self.report_prefs.practice_name).desired_width(260.0),
             );
             if response.changed() {
-                if let Err(err) = self.report_prefs.save() {
+                if let Err(err) = self.save_report_prefs() {
                     self.error = Some(format!("Could not save report preferences: {err}"));
                 }
             }
@@ -8570,7 +8601,7 @@ impl OdApp {
             if response.changed() {
                 self.report_prefs
                     .set_export_path(current.file_stem(), self.report_export_path.clone());
-                if let Err(err) = self.report_prefs.save() {
+                if let Err(err) = self.save_report_prefs() {
                     self.error = Some(format!("Could not save report preferences: {err}"));
                 }
             }
@@ -8590,7 +8621,7 @@ impl OdApp {
             self.report_export_path = path_text.clone();
             self.report_prefs
                 .set_export_path(current.file_stem(), path_text);
-            if let Err(err) = self.report_prefs.save() {
+            if let Err(err) = self.save_report_prefs() {
                 self.error = Some(format!("Could not save report preferences: {err}"));
             }
         }

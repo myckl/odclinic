@@ -1196,6 +1196,10 @@ pub struct ReportPreferences {
     /// Period close history narrowing, keyed by signed-in user number (`local`
     /// for the implicit login-free session). Each user keeps their own view.
     pub period_close_history: HashMap<String, PeriodCloseHistoryView>,
+    /// Serialized `option.*` lines for each signed-in user. The live option
+    /// fields above mirror the active user; these snapshots give another user
+    /// their own choices back after a login switch or an application restart.
+    user_options: HashMap<String, String>,
 }
 
 impl Default for ReportPreferences {
@@ -1231,6 +1235,7 @@ impl Default for ReportPreferences {
             laser_labels: LaserLabelOptions::default(),
             treatment_finder: TreatmentFinderReportOptions::default(),
             period_close_history: HashMap::new(),
+            user_options: HashMap::new(),
         }
     }
 }
@@ -1295,6 +1300,9 @@ impl ReportPreferences {
     /// Per-user Period close history views, e.g.
     /// `period_close_history.user-7.user=Ada`.
     const PERIOD_CLOSE_HISTORY_PREFIX: &'static str = "period_close_history.";
+    /// Per-user report option snapshots, e.g.
+    /// `user_options.user-7=option.aging.age%3Dany%0A...`.
+    const USER_OPTIONS_PREFIX: &'static str = "user_options.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1314,6 +1322,36 @@ impl ReportPreferences {
         view: PeriodCloseHistoryView,
     ) {
         self.period_close_history.insert(user_key.into(), view);
+    }
+
+    /// Store the live report options as one escaped block for `user_key`. The
+    /// canonical `option.*` serializer is reused, so every option field present
+    /// in `to_text` is captured without a second list to keep in sync.
+    pub fn snapshot_user_options(&mut self, user_key: &str) {
+        let options = self
+            .to_text()
+            .lines()
+            .filter(|line| line.starts_with(Self::OPTION_PREFIX))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.user_options
+            .insert(user_key.to_string(), encode_pref_value(&options));
+    }
+
+    /// Make `user_key`'s saved options the live ones. A user with no snapshot
+    /// inherits the options currently on screen (the legacy global set), so an
+    /// existing installation keeps its choices on the first per-user run.
+    pub fn restore_user_options(&mut self, user_key: &str) {
+        let Some(encoded) = self.user_options.get(user_key).cloned() else {
+            self.snapshot_user_options(user_key);
+            return;
+        };
+        let mut restored = Self::from_text(&decode_pref_value(&encoded));
+        restored.practice_name = std::mem::take(&mut self.practice_name);
+        restored.export_paths = std::mem::take(&mut self.export_paths);
+        restored.period_close_history = std::mem::take(&mut self.period_close_history);
+        restored.user_options = std::mem::take(&mut self.user_options);
+        *self = restored;
     }
 
     fn bool_text(value: bool) -> &'static str {
@@ -1786,6 +1824,16 @@ impl ReportPreferences {
                 ));
             }
         }
+        let mut option_users: Vec<_> = self.user_options.iter().collect();
+        option_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, encoded) in option_users {
+            lines.push(format!(
+                "{}{}={}",
+                Self::USER_OPTIONS_PREFIX,
+                user_key,
+                encoded
+            ));
+        }
         let mut paths: Vec<_> = self.export_paths.iter().collect();
         paths.sort_by(|a, b| a.0.cmp(b.0));
         for (key, path) in paths {
@@ -1829,6 +1877,12 @@ impl ReportPreferences {
                     "month" => view.month = decoded,
                     "action" => view.action = decoded.trim().to_ascii_lowercase(),
                     _ => {}
+                }
+            } else if let Some(user_key) = key.strip_prefix(Self::USER_OPTIONS_PREFIX) {
+                if !user_key.is_empty() {
+                    prefs
+                        .user_options
+                        .insert(user_key.to_string(), value.to_string());
                 }
             } else if let Some(option) = key.strip_prefix(Self::OPTION_PREFIX) {
                 let flag = Self::parse_bool(value);
@@ -2252,6 +2306,71 @@ mod tests {
 
         let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
         assert_eq!(old.period_close_history_view("local"), None);
+    }
+
+    #[test]
+    fn report_options_round_trip_per_user() {
+        let mut prefs = ReportPreferences::default();
+        prefs.practice_name = "Shared Clinic".into();
+        prefs.set_export_path("recall-asap", "C:\\Reports\\recall.csv");
+
+        prefs.aging.age = AgingAgeFilter::Over60;
+        prefs.laser_labels.start_name = "Dr Ada = Smith".into();
+        prefs.snapshot_user_options("local");
+
+        prefs.aging.age = AgingAgeFilter::Over30;
+        prefs.laser_labels.start_name = "Dr Ben".into();
+        prefs.snapshot_user_options("user-1");
+
+        let text = prefs.to_text();
+        assert!(text.contains("user_options.local="));
+        assert!(text.contains("user_options.user-1="));
+        assert!(text.contains("option.laser.start_name=Dr Ben"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(loaded.practice_name, "Shared Clinic");
+        assert_eq!(
+            loaded.export_path("recall-asap"),
+            Some("C:\\Reports\\recall.csv")
+        );
+
+        loaded.restore_user_options("local");
+        assert_eq!(loaded.aging.age, AgingAgeFilter::Over60);
+        assert_eq!(loaded.laser_labels.start_name, "Dr Ada = Smith");
+
+        loaded.restore_user_options("user-1");
+        assert_eq!(loaded.aging.age, AgingAgeFilter::Over30);
+        assert_eq!(loaded.laser_labels.start_name, "Dr Ben");
+
+        loaded.restore_user_options("local");
+        assert_eq!(loaded.aging.age, AgingAgeFilter::Over60);
+        assert_eq!(loaded.practice_name, "Shared Clinic");
+        assert_eq!(
+            loaded.export_path("recall-asap"),
+            Some("C:\\Reports\\recall.csv")
+        );
+    }
+
+    #[test]
+    fn legacy_global_options_become_each_users_initial_snapshot() {
+        let mut prefs = ReportPreferences::from_text(
+            "practice_name=Clinic\noption.aging.age=over60\noption.aging.only_negative=true\n",
+        );
+        prefs.restore_user_options("user-2");
+        assert_eq!(prefs.aging.age, AgingAgeFilter::Over60);
+        assert!(prefs.aging.only_negative);
+
+        prefs.aging.age = AgingAgeFilter::Over30;
+        prefs.restore_user_options("local");
+        assert_eq!(prefs.aging.age, AgingAgeFilter::Over30);
+
+        let mut loaded = ReportPreferences::from_text(&prefs.to_text());
+        assert_eq!(loaded.practice_name, "Clinic");
+        loaded.aging.age = AgingAgeFilter::Any;
+        loaded.restore_user_options("user-2");
+        assert_eq!(loaded.aging.age, AgingAgeFilter::Over60);
+        loaded.restore_user_options("local");
+        assert_eq!(loaded.aging.age, AgingAgeFilter::Over30);
     }
 
     #[test]
