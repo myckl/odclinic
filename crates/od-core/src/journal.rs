@@ -10,6 +10,8 @@
 
 use od_domain::{Account, AccountType, Adjustment, Id, JournalEntry, Payment, Procedure};
 
+use crate::ReportTable;
+
 /// Stable token included in every posted journal memo. It lets the account
 /// ledger detect an already-posted adjustment and refuse a duplicate posting,
 /// even when staff customise the human-readable part of the memo.
@@ -475,6 +477,146 @@ pub fn build_charge_posting_plan(
     plan
 }
 
+/// Read-only audit of every posting source in a date range. Each charge,
+/// payment and adjustment shows whether it reached `journalentry`, the journal
+/// transaction that carries it, and a running posted/unposted total per source.
+/// This makes the manual posting workflow verifiable before month-end: nothing
+/// can be silently left out of the accounting reports.
+pub fn journal_posting_audit_report(
+    procedures: &[Procedure],
+    payments: &[Payment],
+    adjustments: &[Adjustment],
+    journal: &[JournalEntry],
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> ReportTable {
+    let mut table = ReportTable::new(&[
+        "Type",
+        "Number",
+        "Patient",
+        "Date",
+        "Description",
+        "Amount",
+        "Status",
+        "Transaction",
+    ]);
+    // (amount, posted count, unposted count) for charges, payments, adjustments.
+    let mut totals: [(f64, usize, usize); 3] = [(0.0, 0, 0); 3];
+
+    let mut charges: Vec<&Procedure> = procedures
+        .iter()
+        .filter(|p| p.proc_status.is_completed() && p.proc_date >= from && p.proc_date <= to)
+        .collect();
+    charges.sort_by_key(|p| (p.proc_date, p.proc_num));
+    for proc in charges {
+        let posted = is_procedure_posted(journal, proc.proc_num, proc.pat_num);
+        let amount = proc.fee.abs();
+        table.push(&[
+            "Charge",
+            &proc.proc_num.to_string(),
+            &proc.pat_num.to_string(),
+            &proc.proc_date.to_string(),
+            &procedure_description(proc),
+            &format!("{amount:.2}"),
+            if posted { "Posted" } else { "UNPOSTED" },
+            &journal_transaction_for_procedure(journal, proc.proc_num, proc.pat_num)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        ]);
+        totals[0].0 += amount;
+        if posted {
+            totals[0].1 += 1;
+        } else {
+            totals[0].2 += 1;
+        }
+    }
+
+    let mut collected: Vec<&Payment> = payments
+        .iter()
+        .filter(|p| p.pay_date >= from && p.pay_date <= to)
+        .collect();
+    collected.sort_by_key(|p| (p.pay_date, p.pay_num));
+    for payment in collected {
+        let posted = is_payment_posted(journal, payment.pay_num, payment.pat_num);
+        let mut description = if payment.note.trim().is_empty() {
+            format!("Payment type {}", payment.pay_type)
+        } else {
+            payment.note.trim().to_string()
+        };
+        if !payment.check_num.trim().is_empty() {
+            description.push_str(&format!(" · cheque {}", payment.check_num.trim()));
+        }
+        table.push(&[
+            "Payment",
+            &payment.pay_num.to_string(),
+            &payment.pat_num.to_string(),
+            &payment.pay_date.to_string(),
+            &description,
+            &format!("{:.2}", payment.pay_amount),
+            if posted { "Posted" } else { "UNPOSTED" },
+            &journal_transaction_for_payment(journal, payment.pay_num, payment.pat_num)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        ]);
+        totals[1].0 += payment.pay_amount;
+        if posted {
+            totals[1].1 += 1;
+        } else {
+            totals[1].2 += 1;
+        }
+    }
+
+    let mut collected: Vec<&Adjustment> = adjustments
+        .iter()
+        .filter(|a| a.adj_date >= from && a.adj_date <= to)
+        .collect();
+    collected.sort_by_key(|a| (a.adj_date, a.adj_num));
+    for adj in collected {
+        let posted = is_adjustment_posted(journal, adj.adj_num, adj.pat_num);
+        let description = if adj.note.trim().is_empty() {
+            format!("Adjustment #{}", adj.adj_num)
+        } else {
+            adj.note.trim().to_string()
+        };
+        table.push(&[
+            "Adjustment",
+            &adj.adj_num.to_string(),
+            &adj.pat_num.to_string(),
+            &adj.adj_date.to_string(),
+            &description,
+            &format!("{:.2}", adj.adj_amount),
+            if posted { "Posted" } else { "UNPOSTED" },
+            &journal_transaction_for_adjustment(journal, adj.adj_num, adj.pat_num)
+                .map(|n| n.to_string())
+                .unwrap_or_default(),
+        ]);
+        totals[2].0 += adj.adj_amount;
+        if posted {
+            totals[2].1 += 1;
+        } else {
+            totals[2].2 += 1;
+        }
+    }
+
+    for (label, (amount, posted, unposted)) in [
+        ("Charges", totals[0]),
+        ("Payments", totals[1]),
+        ("Adjustments", totals[2]),
+    ] {
+        table.push(&[
+            "Total",
+            label,
+            "",
+            "",
+            &format!("{posted} posted / {unposted} unposted"),
+            &format!("{amount:.2}"),
+            "",
+            "",
+        ]);
+    }
+    table
+}
+
 /// One more than the largest `TransactionNum` already stored, so a new posting
 /// never reuses an existing transaction group.
 pub fn next_journal_transaction_num(journal: &[JournalEntry]) -> Id {
@@ -914,5 +1056,59 @@ mod tests {
         assert!(flat.contains("Accounts Receivable"));
         assert!(flat.contains("Patient Income"));
         assert!(flat.contains("Composite filling"), "the charge description reaches the memo");
+    }
+
+    #[test]
+    fn posting_audit_lists_every_source_with_its_status_and_totals() {
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let posted_charge = procedure(40.0);
+        let unposted = Procedure {
+            proc_num: 45,
+            fee: 15.0,
+            ..posted_charge.clone()
+        };
+        let out_of_range = Procedure {
+            proc_num: 46,
+            proc_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            ..posted_charge.clone()
+        };
+        let mut journal = build_charge_journal(&posted_charge, 2, 5, 23).unwrap().to_vec();
+        let pay = Payment {
+            pay_num: 31,
+            pat_num: 7,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 20.0,
+            pay_type: 0,
+            check_num: "CHQ-1".into(),
+            note: "Desk cash".into(),
+        };
+        let mut pay_journal = build_payment_journal(&pay, 1, 2, 24).unwrap().to_vec();
+        journal.extend(pay_journal.drain(..));
+        let unposted_adj = adjustment(-5.0);
+
+        let table = journal_posting_audit_report(
+            &[posted_charge.clone(), unposted, out_of_range],
+            &[pay],
+            &[unposted_adj],
+            &journal,
+            from,
+            to,
+        );
+        assert_eq!(table.headers.len(), 8);
+        assert_eq!(table.headers[0], "Type");
+        assert_eq!(table.headers[6], "Status");
+        // Two in-range charges + one payment + one adjustment + three totals.
+        assert_eq!(table.rows.len(), 7);
+        assert_eq!(table.rows[0][6], "Posted");
+        assert_eq!(table.rows[0][7], "23");
+        assert_eq!(table.rows[1][6], "UNPOSTED");
+        assert_eq!(table.rows[1][7], "");
+        assert_eq!(table.rows[2][6], "Posted");
+        assert!(table.rows[2][4].contains("CHQ-1"));
+        assert_eq!(table.rows[3][6], "UNPOSTED");
+        assert_eq!(table.rows[4], vec!["Total", "Charges", "", "", "1 posted / 1 unposted", "55.00", "", ""]);
+        assert_eq!(table.rows[5], vec!["Total", "Payments", "", "", "1 posted / 0 unposted", "20.00", "", ""]);
+        assert_eq!(table.rows[6], vec!["Total", "Adjustments", "", "", "0 posted / 1 unposted", "-5.00", "", ""]);
     }
 }

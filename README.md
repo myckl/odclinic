@@ -815,7 +815,11 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       `[Proc #… pat #…]` reference that is re-attached even when staff edit the
       note, so an already-posted record shows **Posted #⟨transaction⟩** instead
       of the button (and is skipped by the batch) — no duplicate journal pair can
-      be booked (pre-reference memos are still recognised).
+      be booked (pre-reference memos are still recognised). The **Journal posting
+      audit** report lists every charge, payment and adjustment in a date range
+      with its posting status and transaction number, plus posted/unposted totals
+      per source, so an unposted record cannot be silently left out of the
+      accounting reports. It shares the `ledger_journal_posting` toggle.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be

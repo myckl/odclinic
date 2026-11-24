@@ -24,8 +24,9 @@ use od_core::{
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
     discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    is_adjustment_posted, is_payment_posted, is_waitlist, journal_transaction_for_adjustment,
-    journal_transaction_for_payment, laser_labels_report, new_patient_report,
+    is_adjustment_posted, is_payment_posted, is_waitlist, journal_posting_audit_report,
+    journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
+    new_patient_report,
     next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
@@ -1126,6 +1127,7 @@ enum ReportKind {
     BalanceSheet,
     GeneralLedger,
     ProfitLoss,
+    JournalPostingAudit,
     HiddenPaySplits,
     UnearnedIncome,
     ProcOverpaid,
@@ -1150,7 +1152,7 @@ enum ReportKind {
 }
 
 impl ReportKind {
-    const ALL: [ReportKind; 52] = [
+    const ALL: [ReportKind; 53] = [
         ReportKind::PatientList,
         ReportKind::Production,
         ReportKind::Collections,
@@ -1182,6 +1184,7 @@ impl ReportKind {
         ReportKind::BalanceSheet,
         ReportKind::GeneralLedger,
         ReportKind::ProfitLoss,
+        ReportKind::JournalPostingAudit,
         ReportKind::HiddenPaySplits,
         ReportKind::UnearnedIncome,
         ReportKind::ProcOverpaid,
@@ -1237,6 +1240,7 @@ impl ReportKind {
             ReportKind::BalanceSheet => "Balance sheet (FormRpAccountingBalanceSheet)",
             ReportKind::GeneralLedger => "General ledger (FormRpAccountingGenLedg)",
             ReportKind::ProfitLoss => "Profit & loss (FormRpAccountingProfitLoss)",
+            ReportKind::JournalPostingAudit => "Journal posting audit",
             ReportKind::HiddenPaySplits => "Hidden pay splits (FormRpHiddenPaySplits)",
             ReportKind::UnearnedIncome => "Unearned income (FormRpUnearnedIncome)",
             ReportKind::ProcOverpaid => "Overpaid procedures (FormRpProcOverpaid)",
@@ -1296,6 +1300,7 @@ impl ReportKind {
             ReportKind::BalanceSheet => FeatureKey::ReportBalanceSheet,
             ReportKind::GeneralLedger => FeatureKey::ReportGeneralLedger,
             ReportKind::ProfitLoss => FeatureKey::ReportProfitLoss,
+            ReportKind::JournalPostingAudit => FeatureKey::LedgerJournalPosting,
             ReportKind::HiddenPaySplits => FeatureKey::ReportHiddenPaySplits,
             ReportKind::UnearnedIncome => FeatureKey::ReportUnearnedIncome,
             ReportKind::ProcOverpaid => FeatureKey::ReportProcOverpaid,
@@ -1344,6 +1349,7 @@ impl ReportKind {
                 | ReportKind::BalanceSheet
                 | ReportKind::GeneralLedger
                 | ReportKind::ProfitLoss
+                | ReportKind::JournalPostingAudit
                 | ReportKind::HiddenPaySplits
                 | ReportKind::UnearnedIncome
                 | ReportKind::ProcOverpaid
@@ -1397,6 +1403,7 @@ impl ReportKind {
             ReportKind::BalanceSheet => "balance-sheet",
             ReportKind::GeneralLedger => "general-ledger",
             ReportKind::ProfitLoss => "profit-loss",
+            ReportKind::JournalPostingAudit => "journal-posting-audit",
             ReportKind::HiddenPaySplits => "hidden-pay-splits",
             ReportKind::UnearnedIncome => "unearned-income",
             ReportKind::ProcOverpaid => "overpaid-procedures",
@@ -5693,7 +5700,10 @@ impl OdApp {
         // charges must be posted before the Balance Sheet and P&L are complete.
         if matches!(
             current,
-            ReportKind::BalanceSheet | ReportKind::GeneralLedger | ReportKind::ProfitLoss
+            ReportKind::BalanceSheet
+                | ReportKind::GeneralLedger
+                | ReportKind::ProfitLoss
+                | ReportKind::JournalPostingAudit
         ) {
             ui.horizontal(|ui| {
                 if self.features.enabled(FeatureKey::LedgerJournalPosting)
@@ -7945,6 +7955,25 @@ impl OdApp {
                 let journal = self.store.list_journal_entries().unwrap_or_default();
                 upstream_table = Some(profit_loss_report(
                     &accounts,
+                    &journal,
+                    self.report_from,
+                    self.report_to,
+                ));
+            }
+            ReportKind::JournalPostingAudit => {
+                let mut all_procs = Vec::new();
+                let mut all_payments = Vec::new();
+                let mut all_adjustments = Vec::new();
+                for patient in &patients {
+                    all_procs.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+                    all_payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+                    all_adjustments.extend(self.store.list_adjustments(patient.pat_num).unwrap_or_default());
+                }
+                let journal = self.store.list_journal_entries().unwrap_or_default();
+                upstream_table = Some(journal_posting_audit_report(
+                    &all_procs,
+                    &all_payments,
+                    &all_adjustments,
                     &journal,
                     self.report_from,
                     self.report_to,
@@ -11914,7 +11943,16 @@ mod tests {
         assert!(app.features.enabled(FeatureKey::ReportUnearnedIncome));
         assert!(app.features.enabled(FeatureKey::ReportProcNote));
         assert!(app.features.enabled(FeatureKey::ReportTpPresentationStats));
-        assert_eq!(ReportKind::ALL.len(), 52, "local + upstream reports wired");
+        assert_eq!(ReportKind::ALL.len(), 53, "local + upstream reports wired");
+        assert_eq!(
+            ReportKind::JournalPostingAudit.feature_key(),
+            FeatureKey::LedgerJournalPosting
+        );
+        assert_eq!(
+            ReportKind::JournalPostingAudit.file_stem(),
+            "journal-posting-audit"
+        );
+        assert!(ReportKind::JournalPostingAudit.uses_date_range());
         assert_eq!(ReportKind::CustomAging.file_stem(), "custom-aging");
         assert_eq!(ReportKind::Patients.file_stem(), "patients");
         assert_eq!(ReportKind::BalanceSheet.file_stem(), "balance-sheet");

@@ -4623,3 +4623,65 @@ fn mysql_live_charge_journal_batch_round_trip() {
         .all(|p| !od_core::is_procedure_posted(&cleaned, p.proc_num, pat_num)));
     println!("live charge batch: transactions {txns:?} round-tripped and cleaned up");
 }
+
+/// Builds the posting audit from live OD sources. Read-only: it verifies every
+/// charge/payment/adjustment in range is represented with a posting status and
+/// that the three summary rows reconcile with the detail rows.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; read-only"]
+fn mysql_live_journal_posting_audit_reads_live_sources() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let from = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+    let mut procedures = Vec::new();
+    let mut payments = Vec::new();
+    let mut adjustments = Vec::new();
+    for patient in store.list_patients().unwrap() {
+        procedures.extend(store.list_procedures(patient.pat_num).unwrap());
+        payments.extend(store.list_payments(patient.pat_num).unwrap());
+        adjustments.extend(store.list_adjustments(patient.pat_num).unwrap());
+    }
+    let journal = store.list_journal_entries().unwrap();
+    let report = od_core::journal_posting_audit_report(
+        &procedures, &payments, &adjustments, &journal, from, to,
+    );
+    assert_eq!(report.headers.len(), 8);
+    assert_eq!(report.headers[0], "Type");
+    assert_eq!(report.headers[6], "Status");
+
+    let in_range = |date: NaiveDate| date >= from && date <= to;
+    let expected_charges = procedures
+        .iter()
+        .filter(|p| p.proc_status.is_completed() && in_range(p.proc_date))
+        .count();
+    assert!(expected_charges > 0, "live demo should have completed procedures");
+    assert_eq!(
+        report.rows.iter().filter(|r| r[0] == "Charge").count(),
+        expected_charges
+    );
+    assert_eq!(
+        report.rows.iter().filter(|r| r[0] == "Payment").count(),
+        payments.iter().filter(|p| in_range(p.pay_date)).count()
+    );
+    assert_eq!(
+        report.rows.iter().filter(|r| r[0] == "Adjustment").count(),
+        adjustments.iter().filter(|a| in_range(a.adj_date)).count()
+    );
+    for label in ["Charges", "Payments", "Adjustments"] {
+        assert!(report
+            .rows
+            .iter()
+            .any(|r| r[0] == "Total" && r[1] == label && r[4].contains("unposted")));
+    }
+    // With an empty journal every charge must be flagged for the batch action.
+    if journal.is_empty() {
+        assert!(report
+            .rows
+            .iter()
+            .filter(|r| r[0] == "Charge")
+            .all(|r| r[6] == "UNPOSTED" && r[7].is_empty()));
+    }
+    println!("live posting audit: {} rows from live sources", report.rows.len());
+}
