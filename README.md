@@ -819,7 +819,17 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       audit** report lists every charge, payment and adjustment in a date range
       with its posting status and transaction number, plus posted/unposted totals
       per source, so an unposted record cannot be silently left out of the
-      accounting reports. It shares the `ledger_journal_posting` toggle.
+      accounting reports. It shares the `ledger_journal_posting` toggle. The
+      **Ledger tie-out** report is the period-close check: it compares completed
+      procedure fees with the A/R charge debits, payments with cash debits, and
+      signed adjustments with their A/R movement, then reconciles the expected
+      A/R movement (charges + adjustments − collections) with every A/R journal
+      line in the range. Each check shows the clinical figure, the journal
+      figure, the variance and an explicit `OK` or `OUT OF BALANCE` status, so a
+      missing posting, a duplicate or an unsourced manual journal entry cannot
+      hide behind a report that merely looks complete. It also shows the A/R
+      closing balance, the paysplit collections used by the Collections report,
+      and an unposted-source count. On by default with the same feature toggle.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be

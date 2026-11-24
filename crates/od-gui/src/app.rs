@@ -26,7 +26,7 @@ use od_core::{
     dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
     is_adjustment_posted, is_payment_posted, is_waitlist, journal_posting_audit_report,
     journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
-    new_patient_report,
+    ledger_tie_out_report, new_patient_report,
     next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
@@ -1128,6 +1128,7 @@ enum ReportKind {
     GeneralLedger,
     ProfitLoss,
     JournalPostingAudit,
+    LedgerTieOut,
     HiddenPaySplits,
     UnearnedIncome,
     ProcOverpaid,
@@ -1152,7 +1153,7 @@ enum ReportKind {
 }
 
 impl ReportKind {
-    const ALL: [ReportKind; 53] = [
+    const ALL: [ReportKind; 54] = [
         ReportKind::PatientList,
         ReportKind::Production,
         ReportKind::Collections,
@@ -1185,6 +1186,7 @@ impl ReportKind {
         ReportKind::GeneralLedger,
         ReportKind::ProfitLoss,
         ReportKind::JournalPostingAudit,
+        ReportKind::LedgerTieOut,
         ReportKind::HiddenPaySplits,
         ReportKind::UnearnedIncome,
         ReportKind::ProcOverpaid,
@@ -1241,6 +1243,7 @@ impl ReportKind {
             ReportKind::GeneralLedger => "General ledger (FormRpAccountingGenLedg)",
             ReportKind::ProfitLoss => "Profit & loss (FormRpAccountingProfitLoss)",
             ReportKind::JournalPostingAudit => "Journal posting audit",
+            ReportKind::LedgerTieOut => "Ledger tie-out",
             ReportKind::HiddenPaySplits => "Hidden pay splits (FormRpHiddenPaySplits)",
             ReportKind::UnearnedIncome => "Unearned income (FormRpUnearnedIncome)",
             ReportKind::ProcOverpaid => "Overpaid procedures (FormRpProcOverpaid)",
@@ -1301,6 +1304,7 @@ impl ReportKind {
             ReportKind::GeneralLedger => FeatureKey::ReportGeneralLedger,
             ReportKind::ProfitLoss => FeatureKey::ReportProfitLoss,
             ReportKind::JournalPostingAudit => FeatureKey::LedgerJournalPosting,
+            ReportKind::LedgerTieOut => FeatureKey::LedgerJournalPosting,
             ReportKind::HiddenPaySplits => FeatureKey::ReportHiddenPaySplits,
             ReportKind::UnearnedIncome => FeatureKey::ReportUnearnedIncome,
             ReportKind::ProcOverpaid => FeatureKey::ReportProcOverpaid,
@@ -1350,6 +1354,7 @@ impl ReportKind {
                 | ReportKind::GeneralLedger
                 | ReportKind::ProfitLoss
                 | ReportKind::JournalPostingAudit
+                | ReportKind::LedgerTieOut
                 | ReportKind::HiddenPaySplits
                 | ReportKind::UnearnedIncome
                 | ReportKind::ProcOverpaid
@@ -1404,6 +1409,7 @@ impl ReportKind {
             ReportKind::GeneralLedger => "general-ledger",
             ReportKind::ProfitLoss => "profit-loss",
             ReportKind::JournalPostingAudit => "journal-posting-audit",
+            ReportKind::LedgerTieOut => "ledger-tie-out",
             ReportKind::HiddenPaySplits => "hidden-pay-splits",
             ReportKind::UnearnedIncome => "unearned-income",
             ReportKind::ProcOverpaid => "overpaid-procedures",
@@ -5704,6 +5710,7 @@ impl OdApp {
                 | ReportKind::GeneralLedger
                 | ReportKind::ProfitLoss
                 | ReportKind::JournalPostingAudit
+                | ReportKind::LedgerTieOut
         ) {
             ui.horizontal(|ui| {
                 if self.features.enabled(FeatureKey::LedgerJournalPosting)
@@ -7975,6 +7982,27 @@ impl OdApp {
                     &all_payments,
                     &all_adjustments,
                     &journal,
+                    self.report_from,
+                    self.report_to,
+                ));
+            }
+            ReportKind::LedgerTieOut => {
+                let accounts = self.store.list_accounts().unwrap_or_default();
+                let journal = self.store.list_journal_entries().unwrap_or_default();
+                let procedures = gather_procedures(&*self.store, &patients);
+                let adjustments = gather_adjustments(&*self.store, &patients);
+                let splits = gather_splits(&*self.store, &patients);
+                let mut payments = Vec::new();
+                for patient in &patients {
+                    payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+                }
+                upstream_table = Some(ledger_tie_out_report(
+                    &procedures,
+                    &payments,
+                    &adjustments,
+                    &splits,
+                    &journal,
+                    &accounts,
                     self.report_from,
                     self.report_to,
                 ));
@@ -11943,7 +11971,7 @@ mod tests {
         assert!(app.features.enabled(FeatureKey::ReportUnearnedIncome));
         assert!(app.features.enabled(FeatureKey::ReportProcNote));
         assert!(app.features.enabled(FeatureKey::ReportTpPresentationStats));
-        assert_eq!(ReportKind::ALL.len(), 53, "local + upstream reports wired");
+        assert_eq!(ReportKind::ALL.len(), 54, "local + upstream reports wired");
         assert_eq!(
             ReportKind::JournalPostingAudit.feature_key(),
             FeatureKey::LedgerJournalPosting
@@ -11953,6 +11981,12 @@ mod tests {
             "journal-posting-audit"
         );
         assert!(ReportKind::JournalPostingAudit.uses_date_range());
+        assert_eq!(
+            ReportKind::LedgerTieOut.feature_key(),
+            FeatureKey::LedgerJournalPosting
+        );
+        assert_eq!(ReportKind::LedgerTieOut.file_stem(), "ledger-tie-out");
+        assert!(ReportKind::LedgerTieOut.uses_date_range());
         assert_eq!(ReportKind::CustomAging.file_stem(), "custom-aging");
         assert_eq!(ReportKind::Patients.file_stem(), "patients");
         assert_eq!(ReportKind::BalanceSheet.file_stem(), "balance-sheet");

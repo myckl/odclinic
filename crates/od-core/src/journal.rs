@@ -8,7 +8,9 @@
 //! event; `Store::post_journal_transaction` and `Store::post_journal_batch`
 //! write them atomically.
 
-use od_domain::{Account, AccountType, Adjustment, Id, JournalEntry, Payment, Procedure};
+use od_domain::{
+    Account, AccountType, Adjustment, Id, JournalEntry, PaySplit, Payment, Procedure,
+};
 
 use crate::ReportTable;
 
@@ -617,6 +619,217 @@ pub fn journal_posting_audit_report(
     table
 }
 
+fn has_charge_reference(entry: &JournalEntry) -> bool {
+    entry.memo.contains("[Proc #") || entry.memo.contains("Procedure #")
+}
+
+fn has_payment_reference(entry: &JournalEntry) -> bool {
+    entry.memo.contains("[Pay #") || entry.memo.contains("Payment #")
+}
+
+fn has_adjustment_reference(entry: &JournalEntry) -> bool {
+    entry.memo.contains("[Adj #") || entry.memo.contains("Adjustment #")
+}
+
+/// Period-end reconciliation between the clinical reports and the accounting
+/// reports. The first column is the figure the clinical side reports (completed
+/// procedure fees, payments, signed adjustments), the second is the figure the
+/// General Ledger actually books, and the third is the difference. A zero
+/// variance on every source means the posting workflow can be trusted for a
+/// period close: the accounting reports are not missing a charge or carrying a
+/// duplicate. The final rows reconcile the A/R movement and its closing balance.
+pub fn ledger_tie_out_report(
+    procedures: &[Procedure],
+    payments: &[Payment],
+    adjustments: &[Adjustment],
+    splits: &[PaySplit],
+    journal: &[JournalEntry],
+    accounts: &[Account],
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> ReportTable {
+    let mut table = ReportTable::new(&[
+        "Check",
+        "Clinical source",
+        "Journal",
+        "Variance",
+        "Status",
+        "Detail",
+    ]);
+    let tolerance = 0.005;
+    let in_range = |date: chrono::NaiveDate| date >= from && date <= to;
+    let money = |value: f64| format!("{:.2}", if value == 0.0 { 0.0 } else { value });
+    let status = |variance: f64| {
+        if variance.abs() <= tolerance {
+            "OK"
+        } else {
+            "OUT OF BALANCE"
+        }
+    };
+
+    // Use the same chart defaults the posting UI offers, so the tie-out reads
+    // the accounts the journal would have been written to. Both helpers fall
+    // back to the first active accounts on a minimal chart of accounts.
+    let receivable = suggest_charge_ledger_accounts(accounts).map(|(debit, _)| debit);
+    let cash = suggest_payment_ledger_accounts(accounts, 1.0).map(|(debit, _)| debit);
+    let ar_lines: Vec<&JournalEntry> = match receivable {
+        Some(account) => journal
+            .iter()
+            .filter(|e| e.account_num == account && in_range(e.date_displayed))
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let production: f64 = procedures
+        .iter()
+        .filter(|p| p.proc_status.is_completed() && in_range(p.proc_date))
+        .map(|p| p.fee.abs())
+        .sum();
+    let posted_charges: f64 = ar_lines
+        .iter()
+        .filter(|e| has_charge_reference(e))
+        .map(|e| e.debit_amt)
+        .sum();
+
+    let collected: f64 = payments
+        .iter()
+        .filter(|p| in_range(p.pay_date))
+        .map(|p| p.pay_amount)
+        .sum();
+    let posted_collections: f64 = match cash {
+        Some(account) => journal
+            .iter()
+            .filter(|e| e.account_num == account && in_range(e.date_displayed))
+            .filter(|e| has_payment_reference(e))
+            .map(|e| e.debit_amt)
+            .sum(),
+        None => 0.0,
+    };
+    let split_collections: f64 = splits
+        .iter()
+        .filter(|s| in_range(s.date_pay))
+        .map(|s| s.split_amount)
+        .sum();
+
+    let adjustments_total: f64 = adjustments
+        .iter()
+        .filter(|a| in_range(a.adj_date))
+        .map(|a| a.adj_amount)
+        .sum();
+    let posted_adjustments: f64 = ar_lines
+        .iter()
+        .filter(|e| has_adjustment_reference(e))
+        .map(|e| e.debit_amt - e.credit_amt)
+        .sum();
+
+    // Charges and positive adjustments debit A/R; collections and write-offs
+    // credit it. The expected movement uses the clinical figures, the actual
+    // one uses every A/R journal line in the range, including manual entries.
+    let expected_ar = production + adjustments_total - collected;
+    let actual_ar: f64 = ar_lines.iter().map(|e| e.debit_amt - e.credit_amt).sum();
+    let closing_ar: f64 = match receivable {
+        Some(account) => journal
+            .iter()
+            .filter(|e| e.account_num == account && e.date_displayed <= to)
+            .map(|e| e.debit_amt - e.credit_amt)
+            .sum(),
+        None => 0.0,
+    };
+
+    for (label, source, posted, detail) in [
+        (
+            "Charges",
+            production,
+            posted_charges,
+            "Completed procedure fees vs posted A/R charge debits",
+        ),
+        (
+            "Collections",
+            collected,
+            posted_collections,
+            "Payment amounts vs posted cash debits",
+        ),
+        (
+            "Adjustments",
+            adjustments_total,
+            posted_adjustments,
+            "Signed adjustments vs posted A/R movement",
+        ),
+        (
+            "A/R movement",
+            expected_ar,
+            actual_ar,
+            "Charges + adjustments - collections vs all A/R journal activity",
+        ),
+    ] {
+        let variance = posted - source;
+        table.push(&[
+            label,
+            &money(source),
+            &money(posted),
+            &money(variance),
+            status(variance),
+            detail,
+        ]);
+    }
+
+    // A payment can be split across procedures, so the split total is shown
+    // for comparison with the Collections report but is not a hard gate: the
+    // journal books one cash debit per payment.
+    let split_variance = posted_collections - split_collections;
+    table.push(&[
+        "Paysplit collections",
+        &money(split_collections),
+        &money(posted_collections),
+        &money(split_variance),
+        "INFO",
+        "Collections report basis vs cash booked per payment",
+    ]);
+    table.push(&[
+        "A/R balance",
+        "",
+        &money(closing_ar),
+        "",
+        "INFO",
+        &format!("Accounts receivable at {to}"),
+    ]);
+
+    let unposted = procedures
+        .iter()
+        .filter(|p| p.proc_status.is_completed() && in_range(p.proc_date))
+        .filter(|p| !is_procedure_posted(journal, p.proc_num, p.pat_num))
+        .count()
+        + payments
+            .iter()
+            .filter(|p| in_range(p.pay_date))
+            .filter(|p| !is_payment_posted(journal, p.pay_num, p.pat_num))
+            .count()
+        + adjustments
+            .iter()
+            .filter(|a| in_range(a.adj_date))
+            .filter(|a| !is_adjustment_posted(journal, a.adj_num, a.pat_num))
+            .count();
+    table.push(&[
+        "Unposted sources",
+        &unposted.to_string(),
+        "",
+        "",
+        if unposted == 0 { "OK" } else { "CHECK" },
+        "See Journal posting audit for the individual records",
+    ]);
+    if receivable.is_none() || cash.is_none() {
+        table.push(&[
+            "Account setup",
+            "",
+            "",
+            "",
+            "CHECK",
+            "Chart of accounts has no receivable or cash account to tie against",
+        ]);
+    }
+    table
+}
+
 /// One more than the largest `TransactionNum` already stored, so a new posting
 /// never reuses an existing transaction group.
 pub fn next_journal_transaction_num(journal: &[JournalEntry]) -> Id {
@@ -1110,5 +1323,112 @@ mod tests {
         assert_eq!(table.rows[4], vec!["Total", "Charges", "", "", "1 posted / 1 unposted", "55.00", "", ""]);
         assert_eq!(table.rows[5], vec!["Total", "Payments", "", "", "1 posted / 0 unposted", "20.00", "", ""]);
         assert_eq!(table.rows[6], vec!["Total", "Adjustments", "", "", "0 posted / 1 unposted", "-5.00", "", ""]);
+    }
+
+    #[test]
+    fn tie_out_reconciles_when_every_source_is_posted() {
+        let accounts = accounts();
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let proc = procedure(40.0);
+        let pay = Payment {
+            pay_num: 31,
+            pat_num: proc.pat_num,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 20.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let adj = adjustment(-5.0);
+        let splits = [PaySplit {
+            split_num: 1,
+            pay_num: pay.pay_num,
+            pat_num: pay.pat_num,
+            split_amount: 20.0,
+            date_pay: pay.pay_date,
+            ..Default::default()
+        }];
+        let mut journal = Vec::new();
+        journal.extend(build_charge_journal(&proc, 2, 5, 1).unwrap());
+        journal.extend(build_payment_journal(&pay, 1, 2, 2).unwrap());
+        journal.extend(build_adjustment_journal(&adj, 6, 2, 3).unwrap());
+
+        let table = ledger_tie_out_report(
+            &[proc], &[pay], &[adj], &splits, &journal, &accounts, from, to,
+        );
+        assert_eq!(
+            table.headers,
+            vec!["Check", "Clinical source", "Journal", "Variance", "Status", "Detail"]
+        );
+        let row = |label: &str| table.rows.iter().find(|r| r[0] == label).unwrap();
+        let charges = row("Charges");
+        assert_eq!(charges[1], "40.00");
+        assert_eq!(charges[2], "40.00");
+        assert_eq!(charges[3], "0.00");
+        assert_eq!(charges[4], "OK");
+        let collections = row("Collections");
+        assert_eq!(collections[1], "20.00");
+        assert_eq!(collections[2], "20.00");
+        assert_eq!(collections[4], "OK");
+        let adjustments = row("Adjustments");
+        assert_eq!(adjustments[1], "-5.00");
+        assert_eq!(adjustments[2], "-5.00");
+        assert_eq!(adjustments[4], "OK");
+        let movement = row("A/R movement");
+        assert_eq!(movement[1], "15.00");
+        assert_eq!(movement[2], "15.00");
+        assert_eq!(movement[3], "0.00");
+        assert_eq!(movement[4], "OK");
+        assert_eq!(row("A/R balance")[2], "15.00");
+        assert_eq!(row("Paysplit collections")[4], "INFO");
+        assert_eq!(row("Unposted sources")[1], "0");
+        assert_eq!(row("Unposted sources")[4], "OK");
+        assert!(table.rows.iter().all(|r| r[4] != "OUT OF BALANCE"));
+    }
+
+    #[test]
+    fn tie_out_flags_unposted_charges_and_journal_only_drift() {
+        let accounts = accounts();
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let proc = procedure(40.0);
+        let pay = Payment {
+            pay_num: 31,
+            pat_num: proc.pat_num,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 20.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let adj = adjustment(-5.0);
+        // The charge was never posted; a stray manual A/R debit was.
+        let mut journal = build_payment_journal(&pay, 1, 2, 2).unwrap().to_vec();
+        journal.extend(build_adjustment_journal(&adj, 6, 2, 3).unwrap());
+        journal.push(JournalEntry {
+            account_num: 2,
+            date_displayed: NaiveDate::from_ymd_opt(2026, 11, 28).unwrap(),
+            debit_amt: 7.0,
+            memo: "Manual entry with no source record".into(),
+            transaction_num: 4,
+            ..Default::default()
+        });
+
+        let table = ledger_tie_out_report(
+            &[proc], &[pay], &[adj], &[], &journal, &accounts, from, to,
+        );
+        let row = |label: &str| table.rows.iter().find(|r| r[0] == label).unwrap();
+        let charges = row("Charges");
+        assert_eq!(charges[2], "0.00");
+        assert_eq!(charges[3], "-40.00");
+        assert_eq!(charges[4], "OUT OF BALANCE");
+        assert_eq!(row("Collections")[4], "OK");
+        assert_eq!(row("Adjustments")[4], "OK");
+        let movement = row("A/R movement");
+        assert_eq!(movement[1], "15.00");
+        assert_eq!(movement[2], "-18.00");
+        assert_eq!(movement[3], "-33.00");
+        assert_eq!(movement[4], "OUT OF BALANCE");
+        assert_eq!(row("Unposted sources")[1], "1");
+        assert_eq!(row("Unposted sources")[4], "CHECK");
     }
 }

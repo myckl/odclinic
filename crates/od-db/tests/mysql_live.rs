@@ -4685,3 +4685,74 @@ fn mysql_live_journal_posting_audit_reads_live_sources() {
     }
     println!("live posting audit: {} rows from live sources", report.rows.len());
 }
+
+/// Builds the period-end tie-out from live OD tables. Read-only: it verifies the
+/// clinical figures are carried into the report and that every check reports a
+/// status. On the clean demo database the journal starts empty, so all in-range
+/// charges must be flagged as unposted and out of balance.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; read-only"]
+fn mysql_live_ledger_tie_out_reads_live_sources() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let accounts = store.list_accounts().unwrap();
+    let from = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+    let mut procedures = Vec::new();
+    let mut payments = Vec::new();
+    let mut adjustments = Vec::new();
+    let mut splits = Vec::new();
+    let mut seen_splits = std::collections::HashSet::new();
+    for patient in store.list_patients().unwrap() {
+        procedures.extend(store.list_procedures(patient.pat_num).unwrap());
+        payments.extend(store.list_payments(patient.pat_num).unwrap());
+        adjustments.extend(store.list_adjustments(patient.pat_num).unwrap());
+        for split in store.list_pay_splits(patient.pat_num).unwrap() {
+            if seen_splits.insert(split.split_num) {
+                splits.push(split);
+            }
+        }
+    }
+    let journal = store.list_journal_entries().unwrap();
+    let report = od_core::ledger_tie_out_report(
+        &procedures,
+        &payments,
+        &adjustments,
+        &splits,
+        &journal,
+        &accounts,
+        from,
+        to,
+    );
+    assert_eq!(
+        report.headers,
+        vec!["Check", "Clinical source", "Journal", "Variance", "Status", "Detail"]
+    );
+    for label in [
+        "Charges",
+        "Collections",
+        "Adjustments",
+        "A/R movement",
+        "Paysplit collections",
+        "A/R balance",
+        "Unposted sources",
+    ] {
+        assert!(report.rows.iter().any(|r| r[0] == label), "missing check {label}");
+    }
+    let row = |label: &str| report.rows.iter().find(|r| r[0] == label).unwrap();
+    let production: f64 = procedures
+        .iter()
+        .filter(|p| p.proc_status.is_completed() && p.proc_date >= from && p.proc_date <= to)
+        .map(|p| p.fee.abs())
+        .sum();
+    assert_eq!(row("Charges")[1], format!("{production:.2}"));
+    assert_eq!(row("Paysplit collections")[4], "INFO");
+    assert!(["OK", "OUT OF BALANCE", "INFO", "CHECK"].contains(&row("Charges")[4].as_str()));
+    if journal.is_empty() {
+        assert_eq!(row("Charges")[2], "0.00");
+        assert_eq!(row("Charges")[4], "OUT OF BALANCE");
+        assert!(row("Unposted sources")[1].parse::<usize>().unwrap() > 0);
+    }
+    println!("live ledger tie-out: {} checks from live sources", report.rows.len());
+}
