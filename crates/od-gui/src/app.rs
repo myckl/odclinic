@@ -8119,7 +8119,11 @@ impl OdApp {
                     Ok(rows) => rows,
                     Err(_) => self.security_log.clone(),
                 };
-                upstream_table = Some(period_close_history_report(&log, &self.closed_periods));
+                upstream_table = Some(period_close_history_report(
+                    &log,
+                    &self.users,
+                    &self.closed_periods,
+                ));
             }
             ReportKind::HiddenPaySplits => {
                 let definitions = self.store.list_definitions().unwrap_or_default();

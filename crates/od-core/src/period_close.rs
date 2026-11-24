@@ -7,7 +7,7 @@
 //! security log by the caller.
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
-use od_domain::{Id, Pref, SecurityEvent};
+use od_domain::{Id, Pref, SecurityEvent, Userod};
 
 use crate::ReportTable;
 use serde_json::{Value, json};
@@ -234,6 +234,7 @@ impl PeriodCloseAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeriodCloseEvent {
     pub security_log_num: Id,
+    pub user_num: Id,
     pub timestamp: NaiveDateTime,
     pub month: String,
     pub action: PeriodCloseAction,
@@ -273,6 +274,7 @@ impl PeriodCloseEvent {
         }
         Some(Self {
             security_log_num: event.security_log_num,
+            user_num: event.user_num,
             timestamp: event.log_datetime,
             month: month.to_string(),
             action,
@@ -295,20 +297,48 @@ pub fn period_close_events(log: &[SecurityEvent]) -> Vec<PeriodCloseEvent> {
     events
 }
 
+/// Resolve the audit row's `UserNum` against `userod`. User 0 is the implicit
+/// session used when login is turned off; an unrecognised number is still
+/// shown so a stale user record cannot hide who signed the period off.
+fn user_label(users: &[Userod], user_num: Id) -> String {
+    if user_num == 0 {
+        return "Local user".to_string();
+    }
+    users
+        .iter()
+        .find(|user| user.user_num == user_num)
+        .map(|user| {
+            let name = user.user_name.trim();
+            if name.is_empty() {
+                format!("User #{user_num}")
+            } else {
+                name.to_string()
+            }
+        })
+        .unwrap_or_else(|| format!("User #{user_num}"))
+}
+
 /// Read-only sign-off history for staff. Each row is one audited close or
 /// reopen; the final column shows whether that month is still locked by the
 /// persisted preference, so a reopen that was later re-signed reads as locked.
-pub fn period_close_history_report(log: &[SecurityEvent], closed: &ClosedPeriods) -> ReportTable {
+/// The acting user is resolved from `userod` so staff need not decode log numbers.
+pub fn period_close_history_report(
+    log: &[SecurityEvent],
+    users: &[Userod],
+    closed: &ClosedPeriods,
+) -> ReportTable {
     let mut table = ReportTable::new(&[
         "Time",
         "Month",
         "Action",
+        "User",
         "Reason",
         "Previous close reason",
         "Current posting lock",
     ]);
     for event in period_close_events(log) {
         let time = event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
+        let user = user_label(users, event.user_num);
         let lock = if closed.all().iter().any(|p| p.key() == event.month) {
             "Locked"
         } else {
@@ -318,6 +348,7 @@ pub fn period_close_history_report(log: &[SecurityEvent], closed: &ClosedPeriods
             &time,
             &event.month,
             event.action.label(),
+            &user,
             &event.reason,
             event.previous_reason.as_deref().unwrap_or(""),
             lock,
@@ -449,13 +480,25 @@ mod tests {
     }
 
     fn audit(num: Id, text: &str, when: &str) -> SecurityEvent {
+        audit_for(7, num, text, when)
+    }
+
+    fn audit_for(user: Id, num: Id, text: &str, when: &str) -> SecurityEvent {
         SecurityEvent {
             security_log_num: num,
             perm_type: od_domain::Permission::ADJUSTMENT_CREATE,
-            user_num: 7,
+            user_num: user,
             log_datetime: NaiveDateTime::parse_from_str(when, "%Y-%m-%d %H:%M:%S").unwrap(),
             log_text: text.to_string(),
             pat_num: 0,
+        }
+    }
+
+    fn user(num: Id, name: &str) -> Userod {
+        Userod {
+            user_num: num,
+            user_name: name.to_string(),
+            ..Default::default()
         }
     }
 
@@ -477,6 +520,7 @@ mod tests {
         assert_eq!(events.len(), 2);
         // Newest first: the reopen precedes the close it undid.
         assert_eq!(events[0].action, PeriodCloseAction::Reopened);
+        assert_eq!(events[0].user_num, 7);
         assert_eq!(events[0].month, "2026-11");
         assert_eq!(events[0].reason, "Late correction #209");
         assert_eq!(
@@ -512,13 +556,15 @@ mod tests {
                 "2026-12-01 10:00:00",
             ),
         ];
-        let table = period_close_history_report(&log, &periods);
+        let users = [user(7, "Ada")];
+        let table = period_close_history_report(&log, &users, &periods);
         assert_eq!(
             table.headers,
             [
                 "Time",
                 "Month",
                 "Action",
+                "User",
                 "Reason",
                 "Previous close reason",
                 "Current posting lock",
@@ -527,15 +573,54 @@ mod tests {
         assert_eq!(table.rows.len(), 3);
         assert_eq!(table.rows[0][0], "2026-12-01 10:00:00");
         assert_eq!(table.rows[0][2], "Closed");
-        assert_eq!(table.rows[0][3], "Late correction posted");
-        assert_eq!(table.rows[0][5], "Locked");
+        assert_eq!(table.rows[0][3], "Ada");
+        assert_eq!(table.rows[0][4], "Late correction posted");
+        assert_eq!(table.rows[0][6], "Locked");
         assert_eq!(table.rows[1][2], "Reopened");
-        assert_eq!(table.rows[1][4], "Final sign-off");
+        assert_eq!(table.rows[1][5], "Final sign-off");
         // The month was re-signed after that reopen, so it is locked again now.
-        assert_eq!(table.rows[1][5], "Locked");
+        assert_eq!(table.rows[1][6], "Locked");
 
-        let open = period_close_history_report(&log, &ClosedPeriods::default());
-        assert!(open.rows.iter().all(|row| row[5] == "Unlocked"));
+        let open = period_close_history_report(&log, &users, &ClosedPeriods::default());
+        assert!(open.rows.iter().all(|row| row[6] == "Unlocked"));
+    }
+
+    #[test]
+    fn history_report_resolves_user_names_with_stale_and_local_fallbacks() {
+        let log = vec![
+            audit_for(
+                7,
+                1,
+                &close_audit_text("2026-11", "By Ada"),
+                "2026-11-30 18:00:00",
+            ),
+            audit_for(
+                99,
+                2,
+                &reopen_audit_text("2026-11", "By Ada", "By deleted user"),
+                "2026-12-01 09:00:00",
+            ),
+            audit_for(
+                0,
+                3,
+                &close_audit_text("2026-11", "By local session"),
+                "2026-12-01 10:00:00",
+            ),
+            audit_for(
+                8,
+                4,
+                &close_audit_text("2026-11", "By blank name"),
+                "2026-12-01 11:00:00",
+            ),
+        ];
+        // Newest first: blank name, local, stale user number, resolved name.
+        let table = period_close_history_report(
+            &log,
+            &[user(7, "Ada"), user(8, "  ")],
+            &ClosedPeriods::default(),
+        );
+        let names: Vec<&str> = table.rows.iter().map(|row| row[3].as_str()).collect();
+        assert_eq!(names, ["User #8", "Local user", "User #99", "Ada"]);
     }
 
     #[test]

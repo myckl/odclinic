@@ -850,8 +850,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       new reason when finished. Closed months in the current report range are
       flagged above the report. The **Period close history** report is the
       read-only sign-off register: every audited close and reopen is listed
-      with its timestamp, month, action, reason, the reason a reopen superseded,
-      and that month's *current* posting lock. It reads only the security log
+      with its timestamp, month, action, the acting user resolved from `userod`
+      (`Local user` for the implicit login-free session, `User #…` when the
+      record is missing), reason, the reason a reopen superseded, and that
+      month's *current* posting lock. It reads only the security log
       and the persisted preference — there is nothing to edit — and ignores
       the report date range so no sign-off can be missed. It uses the
       `period-close-history` export stem and shares the `ledger_journal_posting`
