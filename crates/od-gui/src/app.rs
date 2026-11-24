@@ -28,7 +28,8 @@ use od_core::{
     close_audit_text, is_adjustment_posted, is_payment_posted, is_waitlist,
     journal_posting_audit_report, journal_transaction_for_adjustment,
     journal_transaction_for_payment, laser_labels_report, ledger_tie_out_report, month_bounds,
-    new_patient_report, period_close_history_report, reopen_audit_text, tie_out_ready,
+    new_patient_report, period_close_history_report_filtered, PeriodCloseActionFilter,
+    PeriodCloseHistoryFilter, reopen_audit_text, tie_out_ready,
     next_definition_order, next_journal_transaction_num, patient_label_addresses,
     patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
     patient_change_note, treatment_finder_report,
@@ -1731,6 +1732,11 @@ struct OdApp {
     /// against the current table's headers before use.
     report_sort_column: usize,
     report_sort_desc: bool,
+    /// Filters for the read-only Period close history report. Blank fields and
+    /// `All` show the full register; exports always follow the visible rows.
+    period_close_history_user_filter: String,
+    period_close_history_month_filter: String,
+    period_close_history_action_filter: PeriodCloseActionFilter,
     /// Draft WHERE prerequisite editor for the FormRpReferrals options panel.
     referrals_filter_field: String,
     referrals_filter_condition: ReportFilterCondition,
@@ -1998,6 +2004,9 @@ impl OdApp {
             report_prefs,
             report_sort_column: 0,
             report_sort_desc: false,
+            period_close_history_user_filter: String::new(),
+            period_close_history_month_filter: String::new(),
+            period_close_history_action_filter: PeriodCloseActionFilter::All,
             referrals_filter_field: "LName".into(),
             referrals_filter_condition: ReportFilterCondition::Like,
             referrals_filter_value: String::new(),
@@ -5788,6 +5797,7 @@ impl OdApp {
         if !current.uses_date_range() {
             if current == ReportKind::PeriodCloseHistory {
                 ui.label("Every audited close and reopen is listed, regardless of the date range above.");
+                self.period_close_history_filters(ui);
             } else {
                 ui.label("Balance and summary reports use the range end date as 'as of'; the start date is ignored.");
             }
@@ -8119,10 +8129,16 @@ impl OdApp {
                     Ok(rows) => rows,
                     Err(_) => self.security_log.clone(),
                 };
-                upstream_table = Some(period_close_history_report(
+                let filter = PeriodCloseHistoryFilter {
+                    user: self.period_close_history_user_filter.clone(),
+                    month: self.period_close_history_month_filter.clone(),
+                    action: self.period_close_history_action_filter,
+                };
+                upstream_table = Some(period_close_history_report_filtered(
                     &log,
                     &self.users,
                     &self.closed_periods,
+                    &filter,
                 ));
             }
             ReportKind::HiddenPaySplits => {
@@ -9741,6 +9757,41 @@ impl OdApp {
             from,
             to,
         ))
+    }
+
+    /// Read-only narrowing for the Period close history report. The filtered
+    /// table is the one rendered and exported, so the file matches the screen.
+    fn period_close_history_filters(&mut self, ui: &mut Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Filter sign-offs:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.period_close_history_user_filter)
+                    .desired_width(130.0)
+                    .hint_text("user"),
+            );
+            ui.add(
+                egui::TextEdit::singleline(&mut self.period_close_history_month_filter)
+                    .desired_width(100.0)
+                    .hint_text("YYYY-MM"),
+            );
+            egui::ComboBox::from_label("Action")
+                .selected_text(self.period_close_history_action_filter.label())
+                .show_ui(ui, |ui| {
+                    for option in PeriodCloseActionFilter::ALL {
+                        ui.selectable_value(
+                            &mut self.period_close_history_action_filter,
+                            option,
+                            option.label(),
+                        );
+                    }
+                });
+            if ui.button("Clear filters").clicked() {
+                self.period_close_history_user_filter.clear();
+                self.period_close_history_month_filter.clear();
+                self.period_close_history_action_filter = PeriodCloseActionFilter::All;
+            }
+            ui.weak("User and month match anywhere; exports use the rows shown.");
+        });
     }
 
     /// Period-close controls shown with the Ledger tie-out report: close the

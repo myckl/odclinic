@@ -230,6 +230,63 @@ impl PeriodCloseAction {
     }
 }
 
+/// Action selector for the read-only history report. `All` is the default so
+/// the unfiltered register still shows every sign-off.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PeriodCloseActionFilter {
+    #[default]
+    All,
+    Closed,
+    Reopened,
+}
+
+impl PeriodCloseActionFilter {
+    pub const ALL: [Self; 3] = [Self::All, Self::Closed, Self::Reopened];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All actions",
+            Self::Closed => "Closed only",
+            Self::Reopened => "Reopened only",
+        }
+    }
+
+    pub fn matches(self, action: PeriodCloseAction) -> bool {
+        match self {
+            Self::All => true,
+            Self::Closed => action == PeriodCloseAction::Closed,
+            Self::Reopened => action == PeriodCloseAction::Reopened,
+        }
+    }
+}
+
+/// Scoped view of the period close history. Blank fields match everything;
+/// user and month are case-insensitive substring matches so staff can search
+/// by login name, `User #…` fallback, year, or `YYYY-MM` without exact typing.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PeriodCloseHistoryFilter {
+    pub user: String,
+    pub month: String,
+    pub action: PeriodCloseActionFilter,
+}
+
+impl PeriodCloseHistoryFilter {
+    pub fn is_active(&self) -> bool {
+        !self.user.trim().is_empty()
+            || !self.month.trim().is_empty()
+            || self.action != PeriodCloseActionFilter::All
+    }
+
+    fn matches(&self, event: &PeriodCloseEvent, user: &str) -> bool {
+        let user_query = self.user.trim().to_ascii_lowercase();
+        let month_query = self.month.trim().to_ascii_lowercase();
+        (user_query.is_empty() || user.to_ascii_lowercase().contains(&user_query))
+            && (month_query.is_empty()
+                || event.month.to_ascii_lowercase().contains(&month_query))
+            && self.action.matches(event.action)
+    }
+}
+
 /// One close or reopen reconstructed from the OD security log.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PeriodCloseEvent {
@@ -327,6 +384,17 @@ pub fn period_close_history_report(
     users: &[Userod],
     closed: &ClosedPeriods,
 ) -> ReportTable {
+    period_close_history_report_filtered(log, users, closed, &PeriodCloseHistoryFilter::default())
+}
+
+/// The same register, narrowed by user, month and/or action. Filtering happens
+/// before the table is returned, so callers export exactly the rows they show.
+pub fn period_close_history_report_filtered(
+    log: &[SecurityEvent],
+    users: &[Userod],
+    closed: &ClosedPeriods,
+    filter: &PeriodCloseHistoryFilter,
+) -> ReportTable {
     let mut table = ReportTable::new(&[
         "Time",
         "Month",
@@ -337,8 +405,11 @@ pub fn period_close_history_report(
         "Current posting lock",
     ]);
     for event in period_close_events(log) {
-        let time = event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         let user = user_label(users, event.user_num);
+        if !filter.matches(&event, &user) {
+            continue;
+        }
+        let time = event.timestamp.format("%Y-%m-%d %H:%M:%S").to_string();
         let lock = if closed.all().iter().any(|p| p.key() == event.month) {
             "Locked"
         } else {
@@ -621,6 +692,75 @@ mod tests {
         );
         let names: Vec<&str> = table.rows.iter().map(|row| row[3].as_str()).collect();
         assert_eq!(names, ["User #8", "Local user", "User #99", "Ada"]);
+    }
+
+    #[test]
+    fn history_report_filters_by_user_month_and_action() {
+        let log = vec![
+            audit_for(
+                7,
+                1,
+                &close_audit_text("2026-11", "A close"),
+                "2026-11-30 18:00:00",
+            ),
+            audit_for(
+                8,
+                2,
+                &reopen_audit_text("2026-11", "A close", "B reopen"),
+                "2026-12-01 09:00:00",
+            ),
+            audit_for(
+                7,
+                3,
+                &close_audit_text("2026-10", "B close"),
+                "2026-10-31 18:00:00",
+            ),
+            audit_for(
+                0,
+                4,
+                &close_audit_text("2026-11", "Local close"),
+                "2026-12-02 18:00:00",
+            ),
+        ];
+        let users = [user(7, "Ada"), user(8, "Bob")];
+        let closed = ClosedPeriods::default();
+        let rows = |filter: PeriodCloseHistoryFilter| {
+            period_close_history_report_filtered(&log, &users, &closed, &filter).rows
+        };
+
+        assert!(!PeriodCloseHistoryFilter::default().is_active());
+        assert_eq!(rows(PeriodCloseHistoryFilter::default()).len(), 4);
+
+        let by_user = rows(PeriodCloseHistoryFilter {
+            user: "aD".into(),
+            ..Default::default()
+        });
+        assert_eq!(by_user.len(), 2);
+        assert!(by_user.iter().all(|row| row[3] == "Ada"));
+
+        let by_month = rows(PeriodCloseHistoryFilter {
+            month: "10".into(),
+            ..Default::default()
+        });
+        assert_eq!(by_month.len(), 1);
+        assert_eq!(by_month[0][1], "2026-10");
+
+        let by_action = rows(PeriodCloseHistoryFilter {
+            action: PeriodCloseActionFilter::Reopened,
+            ..Default::default()
+        });
+        assert_eq!(by_action.len(), 1);
+        assert_eq!(by_action[0][2], "Reopened");
+
+        let combined = PeriodCloseHistoryFilter {
+            user: "ada".into(),
+            month: "2026-11".into(),
+            action: PeriodCloseActionFilter::Closed,
+        };
+        assert!(combined.is_active());
+        let hits = rows(combined);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0][4], "A close");
     }
 
     #[test]
