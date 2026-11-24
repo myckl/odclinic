@@ -552,7 +552,12 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   or `user_options.local`) and restored on restart or login/logout, so two staff
   members can keep different report defaults without overwriting each other.
   Options from an older shared installation become the first user's starting
-  set rather than being discarded.
+  set rather than being discarded. The visible reporting window is stored the
+  same way as `report_range.user-<UserNum>.from`/`.to` (or
+  `report_range.local.*` without a login), so each user's default dates also
+  survive a restart or login switch. A user with no saved window starts with
+  the usual last-30-days-to-today range; clicking **Last 30 days** or
+  **Next Month** updates their saved range.
   These reports use a variable-column `ReportTable` model; the local three-column
   reports are wrapped into it, so the CSV header stays
   `Practice,Report,Item,Value,Detail` for them while upstream exports keep OD's

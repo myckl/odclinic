@@ -63,7 +63,7 @@ use od_domain::reports_ext::{LaserInsMode, LaserLabelTab, ProcNoteGroup, Unearne
 use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
     CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView, PlanTypeFilter,
-    ProcedureSheetMode, ReferralFilter, ReportFilter, ReportFilterCondition,
+    ProcedureSheetMode, ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition,
     ReportPreferences, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
     EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
     CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
@@ -2067,7 +2067,7 @@ impl OdApp {
             display_field_width_text: "80".into(),
         };
         app.load_period_close_history_filters();
-        app.load_report_options_for_user();
+        app.load_report_user_view();
         app.refresh();
         app
     }
@@ -2205,18 +2205,44 @@ impl OdApp {
         self.report_prefs.save()
     }
 
-    /// Make the signed-in user's saved report options the live ones. Called on
-    /// startup and after each login/logout switch.
-    fn load_report_options_for_user(&mut self) {
+    /// Restore the signed-in user's report options and reporting window. Called
+    /// on startup and after each login/logout switch.
+    fn load_report_user_view(&mut self) {
         let key = self.period_close_history_user_key();
         self.report_prefs.restore_user_options(&key);
+        if let Some(range) = self.report_prefs.report_date_range(&key) {
+            if let (Ok(from), Ok(to)) = (
+                NaiveDate::parse_from_str(&range.from, "%Y-%m-%d"),
+                NaiveDate::parse_from_str(&range.to, "%Y-%m-%d"),
+            ) {
+                self.report_from = from;
+                self.report_to = to;
+            }
+        }
     }
 
-    /// The session has already changed: persist the outgoing user before
-    /// loading the incoming user's options, then write both snapshots.
-    fn switch_report_options_user(&mut self, previous_user_key: &str) {
+    /// Persist the currently visible reporting window for this user. Missing or
+    /// unreadable saved dates leave the current view untouched.
+    fn persist_report_date_range(&mut self) {
+        let key = self.period_close_history_user_key();
+        let range = ReportDateRange {
+            from: self.report_from.format("%Y-%m-%d").to_string(),
+            to: self.report_to.format("%Y-%m-%d").to_string(),
+        };
+        if self.report_prefs.report_date_range(&key) == Some(&range) {
+            return;
+        }
+        self.report_prefs.set_report_date_range(key, range);
+        if let Err(err) = self.save_report_prefs() {
+            self.error = Some(format!("Could not save report date range: {err}"));
+        }
+    }
+
+    /// The session has already changed: persist the outgoing user's options
+    /// before loading the incoming user's view, then write both snapshots.
+    fn switch_report_user_view(&mut self, previous_user_key: &str) {
         self.report_prefs.snapshot_user_options(previous_user_key);
-        self.load_report_options_for_user();
+        self.load_report_user_view();
         if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save report preferences: {err}"));
         }
@@ -2408,13 +2434,14 @@ impl OdApp {
         let user_name = user.user_name.clone();
         let user_num = user.user_num;
         let previous_user_key = self.period_close_history_user_key();
+        self.persist_report_date_range();
         self.session = Some(Session {
             user_num,
             user_name: user_name.clone(),
             permissions,
         });
         self.load_period_close_history_filters();
-        self.switch_report_options_user(&previous_user_key);
+        self.switch_report_user_view(&previous_user_key);
         self.login_error = None;
         self.login_pass.clear();
         self.show_settings = false;
@@ -2432,9 +2459,10 @@ impl OdApp {
             self.audit_if(FeatureKey::AuditLogins, Permission::USER_LOG_ON_OFF, 0, text);
         }
         let previous_user_key = self.period_close_history_user_key();
+        self.persist_report_date_range();
         self.session = None;
         self.load_period_close_history_filters();
-        self.switch_report_options_user(&previous_user_key);
+        self.switch_report_user_view(&previous_user_key);
     }
 
     fn login_ui(&mut self, ui: &mut Ui) {
@@ -5842,6 +5870,7 @@ impl OdApp {
                     let today = chrono::Local::now().date_naive();
                     self.report_to = today;
                     self.report_from = today - Duration::days(30);
+                    self.persist_report_date_range();
                 }
                 if current == ReportKind::Birthday && ui.button("Next Month").clicked() {
                     let today = chrono::Local::now().date_naive();
@@ -5854,6 +5883,7 @@ impl OdApp {
                         .unwrap_or(next_first);
                     self.report_from = next_first;
                     self.report_to = after_next - Duration::days(1);
+                    self.persist_report_date_range();
                 }
             } else if current == ReportKind::PeriodCloseHistory {
                 ui.label("Full audit history (all dates)");

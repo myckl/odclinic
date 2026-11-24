@@ -1131,6 +1131,14 @@ pub struct PeriodCloseHistoryView {
     pub action: String,
 }
 
+/// A signed-in user's reporting window, kept as ISO `YYYY-MM-DD` text so the
+/// preferences file does not depend on the GUI's date library.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReportDateRange {
+    pub from: String,
+    pub to: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportPreferences {
     /// Printed on exported CSV/HTML so a practice can identify its reports.
@@ -1200,6 +1208,9 @@ pub struct ReportPreferences {
     /// fields above mirror the active user; these snapshots give another user
     /// their own choices back after a login switch or an application restart.
     user_options: HashMap<String, String>,
+    /// Reporting window per signed-in user. The GUI restores the active user's
+    /// dates on startup and login/logout instead of resetting to today.
+    pub report_ranges: HashMap<String, ReportDateRange>,
 }
 
 impl Default for ReportPreferences {
@@ -1236,6 +1247,7 @@ impl Default for ReportPreferences {
             treatment_finder: TreatmentFinderReportOptions::default(),
             period_close_history: HashMap::new(),
             user_options: HashMap::new(),
+            report_ranges: HashMap::new(),
         }
     }
 }
@@ -1303,6 +1315,9 @@ impl ReportPreferences {
     /// Per-user report option snapshots, e.g.
     /// `user_options.user-7=option.aging.age%3Dany%0A...`.
     const USER_OPTIONS_PREFIX: &'static str = "user_options.";
+    /// Per-user reporting windows, e.g.
+    /// `report_range.user-7.from=2026-10-25`.
+    const REPORT_RANGE_PREFIX: &'static str = "report_range.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1351,7 +1366,16 @@ impl ReportPreferences {
         restored.export_paths = std::mem::take(&mut self.export_paths);
         restored.period_close_history = std::mem::take(&mut self.period_close_history);
         restored.user_options = std::mem::take(&mut self.user_options);
+        restored.report_ranges = std::mem::take(&mut self.report_ranges);
         *self = restored;
+    }
+
+    pub fn report_date_range(&self, user_key: &str) -> Option<&ReportDateRange> {
+        self.report_ranges.get(user_key)
+    }
+
+    pub fn set_report_date_range(&mut self, user_key: impl Into<String>, range: ReportDateRange) {
+        self.report_ranges.insert(user_key.into(), range);
     }
 
     fn bool_text(value: bool) -> &'static str {
@@ -1824,6 +1848,22 @@ impl ReportPreferences {
                 ));
             }
         }
+        let mut range_users: Vec<_> = self.report_ranges.iter().collect();
+        range_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, range) in range_users {
+            lines.push(format!(
+                "{}{}.from={}",
+                Self::REPORT_RANGE_PREFIX,
+                user_key,
+                encode_pref_value(&range.from)
+            ));
+            lines.push(format!(
+                "{}{}.to={}",
+                Self::REPORT_RANGE_PREFIX,
+                user_key,
+                encode_pref_value(&range.to)
+            ));
+        }
         let mut option_users: Vec<_> = self.user_options.iter().collect();
         option_users.sort_by(|a, b| a.0.cmp(b.0));
         for (user_key, encoded) in option_users {
@@ -1876,6 +1916,23 @@ impl ReportPreferences {
                     "user" => view.user = decoded,
                     "month" => view.month = decoded,
                     "action" => view.action = decoded.trim().to_ascii_lowercase(),
+                    _ => {}
+                }
+            } else if let Some(range_key) = key.strip_prefix(Self::REPORT_RANGE_PREFIX) {
+                let Some((user_key, field)) = range_key.rsplit_once('.') else {
+                    continue;
+                };
+                if user_key.is_empty() {
+                    continue;
+                }
+                let decoded = decode_pref_value(value);
+                let range = prefs
+                    .report_ranges
+                    .entry(user_key.to_string())
+                    .or_default();
+                match field {
+                    "from" => range.from = decoded,
+                    "to" => range.to = decoded,
                     _ => {}
                 }
             } else if let Some(user_key) = key.strip_prefix(Self::USER_OPTIONS_PREFIX) {
@@ -2371,6 +2428,47 @@ mod tests {
         assert_eq!(loaded.aging.age, AgingAgeFilter::Over60);
         loaded.restore_user_options("local");
         assert_eq!(loaded.aging.age, AgingAgeFilter::Over30);
+    }
+
+    #[test]
+    fn report_date_ranges_round_trip_per_user() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_report_date_range(
+            "local",
+            ReportDateRange {
+                from: "2026-10-25".into(),
+                to: "2026-11-24".into(),
+            },
+        );
+        prefs.set_report_date_range(
+            "user-1",
+            ReportDateRange {
+                from: "2026-09-01".into(),
+                to: "2026-09-30".into(),
+            },
+        );
+
+        let text = prefs.to_text();
+        assert!(text.contains("report_range.local.from=2026-10-25"));
+        assert!(text.contains("report_range.user-1.to=2026-09-30"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(
+            loaded.report_date_range("local"),
+            Some(&ReportDateRange {
+                from: "2026-10-25".into(),
+                to: "2026-11-24".into(),
+            })
+        );
+        assert_eq!(loaded.report_date_range("user-2"), None);
+
+        // Switching option sets must not discard the users' saved windows.
+        loaded.restore_user_options("user-1");
+        assert_eq!(loaded.report_date_range("local").unwrap().from, "2026-10-25");
+        assert_eq!(loaded.report_date_range("user-1").unwrap().to, "2026-09-30");
+
+        let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
+        assert_eq!(old.report_date_range("local"), None);
     }
 
     #[test]
