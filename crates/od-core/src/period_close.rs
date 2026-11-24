@@ -251,6 +251,24 @@ impl PeriodCloseActionFilter {
         }
     }
 
+    /// Stable token written to `reports.txt`. Unknown values read back as `All`
+    /// so an older or hand-edited preference never hides sign-offs.
+    pub const fn storage_key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Closed => "closed",
+            Self::Reopened => "reopened",
+        }
+    }
+
+    pub fn from_storage(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "closed" | "closed only" => Self::Closed,
+            "reopened" | "reopened only" => Self::Reopened,
+            _ => Self::All,
+        }
+    }
+
     pub fn matches(self, action: PeriodCloseAction) -> bool {
         match self {
             Self::All => true,
@@ -761,6 +779,21 @@ mod tests {
         let hits = rows(combined);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0][4], "A close");
+    }
+
+    #[test]
+    fn action_filter_storage_tokens_round_trip() {
+        for value in PeriodCloseActionFilter::ALL {
+            assert_eq!(PeriodCloseActionFilter::from_storage(value.storage_key()), value);
+        }
+        assert_eq!(
+            PeriodCloseActionFilter::from_storage(" Reopened only "),
+            PeriodCloseActionFilter::Reopened
+        );
+        assert_eq!(
+            PeriodCloseActionFilter::from_storage("nonsense"),
+            PeriodCloseActionFilter::All
+        );
     }
 
     #[test]

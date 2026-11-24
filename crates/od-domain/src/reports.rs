@@ -1121,6 +1121,16 @@ pub const EXPORT_KEY_ACCOUNT_LEDGER: &str = "account-ledger";
 pub const EXPORT_KEY_PAY_PLAN_AUDIT: &str = "pay-plan-audit";
 pub const EXPORT_KEY_SECURITY_LOG: &str = "security-log";
 
+/// Saved Period close history filters for one signed-in user. The action is
+/// stored as the stable token from `PeriodCloseActionFilter::storage_key`;
+/// `reports.txt` stays independent of the report-building crate.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PeriodCloseHistoryView {
+    pub user: String,
+    pub month: String,
+    pub action: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportPreferences {
     /// Printed on exported CSV/HTML so a practice can identify its reports.
@@ -1183,6 +1193,9 @@ pub struct ReportPreferences {
     pub laser_labels: LaserLabelOptions,
     /// `FormRpTreatmentFinder` filters.
     pub treatment_finder: TreatmentFinderReportOptions,
+    /// Period close history narrowing, keyed by signed-in user number (`local`
+    /// for the implicit login-free session). Each user keeps their own view.
+    pub period_close_history: HashMap<String, PeriodCloseHistoryView>,
 }
 
 impl Default for ReportPreferences {
@@ -1217,6 +1230,7 @@ impl Default for ReportPreferences {
             proc_overpaid: ProcOverpaidReportOptions::default(),
             laser_labels: LaserLabelOptions::default(),
             treatment_finder: TreatmentFinderReportOptions::default(),
+            period_close_history: HashMap::new(),
         }
     }
 }
@@ -1249,11 +1263,38 @@ fn decode_report_filter(encoded: &str) -> Option<ReportFilter> {
     })
 }
 
+/// Percent-escape free-text preference values so `=`, newlines and leading or
+/// trailing spaces cannot break or be trimmed away by the line-based format.
+fn encode_pref_value(value: &str) -> String {
+    value
+        .replace('%', "%25")
+        .replace('=', "%3D")
+        .replace('|', "%7C")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace('\t', "%09")
+        .replace(' ', "%20")
+}
+
+fn decode_pref_value(value: &str) -> String {
+    value
+        .replace("%09", "\t")
+        .replace("%0A", "\n")
+        .replace("%0D", "\r")
+        .replace("%3D", "=")
+        .replace("%7C", "|")
+        .replace("%20", " ")
+        .replace("%25", "%")
+}
+
 impl ReportPreferences {
     /// The key prefix used for per-report export paths in the text file.
     const EXPORT_PREFIX: &'static str = "export.";
     /// The key prefix for the upstream report option checkboxes.
     const OPTION_PREFIX: &'static str = "option.";
+    /// Per-user Period close history views, e.g.
+    /// `period_close_history.user-7.user=Ada`.
+    const PERIOD_CLOSE_HISTORY_PREFIX: &'static str = "period_close_history.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1261,6 +1302,18 @@ impl ReportPreferences {
 
     pub fn set_export_path(&mut self, report_key: impl Into<String>, path: impl Into<String>) {
         self.export_paths.insert(report_key.into(), path.into());
+    }
+
+    pub fn period_close_history_view(&self, user_key: &str) -> Option<&PeriodCloseHistoryView> {
+        self.period_close_history.get(user_key)
+    }
+
+    pub fn set_period_close_history_view(
+        &mut self,
+        user_key: impl Into<String>,
+        view: PeriodCloseHistoryView,
+    ) {
+        self.period_close_history.insert(user_key.into(), view);
     }
 
     fn bool_text(value: bool) -> &'static str {
@@ -1716,6 +1769,23 @@ impl ReportPreferences {
                 value
             ));
         }
+        let mut views: Vec<_> = self.period_close_history.iter().collect();
+        views.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, view) in views {
+            for (field, value) in [
+                ("user", view.user.as_str()),
+                ("month", view.month.as_str()),
+                ("action", view.action.as_str()),
+            ] {
+                lines.push(format!(
+                    "{}{}.{}={}",
+                    Self::PERIOD_CLOSE_HISTORY_PREFIX,
+                    user_key,
+                    field,
+                    encode_pref_value(value)
+                ));
+            }
+        }
         let mut paths: Vec<_> = self.export_paths.iter().collect();
         paths.sort_by(|a, b| a.0.cmp(b.0));
         for (key, path) in paths {
@@ -1741,6 +1811,24 @@ impl ReportPreferences {
                     prefs
                         .export_paths
                         .insert(report_key.to_string(), value.to_string());
+                }
+            } else if let Some(view_key) = key.strip_prefix(Self::PERIOD_CLOSE_HISTORY_PREFIX) {
+                let Some((user_key, field)) = view_key.rsplit_once('.') else {
+                    continue;
+                };
+                if user_key.is_empty() {
+                    continue;
+                }
+                let decoded = decode_pref_value(value);
+                let view = prefs
+                    .period_close_history
+                    .entry(user_key.to_string())
+                    .or_default();
+                match field {
+                    "user" => view.user = decoded,
+                    "month" => view.month = decoded,
+                    "action" => view.action = decoded.trim().to_ascii_lowercase(),
+                    _ => {}
                 }
             } else if let Some(option) = key.strip_prefix(Self::OPTION_PREFIX) {
                 let flag = Self::parse_bool(value);
@@ -2135,6 +2223,35 @@ mod tests {
             loaded.export_path(EXPORT_KEY_SECURITY_LOG),
             Some("C:\\Audit\\security.csv")
         );
+    }
+
+    #[test]
+    fn period_close_history_views_round_trip_per_user() {
+        let mut prefs = ReportPreferences::default();
+        let admin = PeriodCloseHistoryView {
+            user: " Ada ".into(),
+            month: "2026-11".into(),
+            action: "closed".into(),
+        };
+        let local = PeriodCloseHistoryView {
+            user: "Local= user|100%".into(),
+            month: "2026".into(),
+            action: "reopened".into(),
+        };
+        prefs.set_period_close_history_view("user-7", admin.clone());
+        prefs.set_period_close_history_view("local", local.clone());
+
+        let text = prefs.to_text();
+        assert!(text.contains("period_close_history.user-7.user=%20Ada%20"));
+        assert!(text.contains("period_close_history.local.user=Local%3D%20user%7C100%"));
+
+        let loaded = ReportPreferences::from_text(&text);
+        assert_eq!(loaded.period_close_history_view("user-7"), Some(&admin));
+        assert_eq!(loaded.period_close_history_view("local"), Some(&local));
+        assert_eq!(loaded.period_close_history_view("user-99"), None);
+
+        let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
+        assert_eq!(old.period_close_history_view("local"), None);
     }
 
     #[test]

@@ -2582,6 +2582,16 @@ impl Session {
     }
 }
 
+/// `reports.txt` key for the current user's saved report views. Anonymous and
+/// login-free sessions share `local`; named users use the stable OD `UserNum`
+/// so a rename does not lose their preferences.
+pub fn period_close_history_user_key(session: Option<&Session>) -> String {
+    match session {
+        Some(session) if session.user_num != 0 => format!("user-{}", session.user_num),
+        _ => "local".to_string(),
+    }
+}
+
 /// One row of the OD `securitylog` audit table.
 #[derive(Clone, Debug)]
 pub struct SecurityEvent {
@@ -2642,6 +2652,19 @@ pub struct Pref {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_preference_keys_are_stable_per_user() {
+        assert_eq!(period_close_history_user_key(None), "local");
+        assert_eq!(period_close_history_user_key(Some(&Session::local())), "local");
+
+        let named = Session {
+            user_num: 7,
+            user_name: "Ada".into(),
+            permissions: Vec::new(),
+        };
+        assert_eq!(period_close_history_user_key(Some(&named)), "user-7");
+    }
 
     #[test]
     fn appointment_status_round_trips_od_values() {

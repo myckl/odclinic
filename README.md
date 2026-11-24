@@ -855,7 +855,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       record is missing), reason, the reason a reopen superseded, and that
       month's *current* posting lock. Case-insensitive **user**, **month** and
       **action** filters narrow the register; every export contains exactly the
-      filtered rows shown on screen. It reads only the security log and the
+      filtered rows shown on screen. Those three filters are saved per signed-in
+      user in `reports.txt` and restored on restart or login/logout. It reads
+      only the security log and the
       persisted preference — there is nothing to edit — and ignores the report
       date range so no sign-off can be missed. It uses the
       `period-close-history` export stem and shares the `ledger_journal_posting`

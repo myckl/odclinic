@@ -62,8 +62,8 @@ use od_domain::eservices::*;
 use od_domain::reports_ext::{LaserInsMode, LaserLabelTab, ProcNoteGroup, UnearnedIncomeTab};
 use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
-    CustomAgingNegative, CustomAgingWriteoffDate, PlanTypeFilter, ProcedureSheetMode, ReferralFilter,
-    ReportFilter, ReportFilterCondition,
+    CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView, PlanTypeFilter,
+    ProcedureSheetMode, ReferralFilter, ReportFilter, ReportFilterCondition,
     ReportPreferences, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
     EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
     CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
@@ -2066,6 +2066,7 @@ impl OdApp {
             display_field_label_text: String::new(),
             display_field_width_text: "80".into(),
         };
+        app.load_period_close_history_filters();
         app.refresh();
         app
     }
@@ -2149,6 +2150,48 @@ impl OdApp {
         self.report_prefs.set_export_path(key, path);
         if let Err(err) = self.report_prefs.save() {
             self.error = Some(format!("Could not save export path preference: {err}"));
+        }
+    }
+
+    /// Stable `reports.txt` key for the current user's history view.
+    fn period_close_history_user_key(&self) -> String {
+        od_domain::period_close_history_user_key(self.session.as_ref())
+    }
+
+    /// Restore the filters saved for the user who is now signed in. Missing or
+    /// unreadable preferences leave the unfiltered register on screen.
+    fn load_period_close_history_filters(&mut self) {
+        let key = self.period_close_history_user_key();
+        match self.report_prefs.period_close_history_view(&key) {
+            Some(view) => {
+                self.period_close_history_user_filter = view.user.clone();
+                self.period_close_history_month_filter = view.month.clone();
+                self.period_close_history_action_filter =
+                    PeriodCloseActionFilter::from_storage(&view.action);
+            }
+            None => {
+                self.period_close_history_user_filter.clear();
+                self.period_close_history_month_filter.clear();
+                self.period_close_history_action_filter = PeriodCloseActionFilter::All;
+            }
+        }
+    }
+
+    /// Save the currently visible filters for this user. Edits are persisted as
+    /// they are made, so switching users or restarting never loses the view.
+    fn persist_period_close_history_filters(&mut self) {
+        let key = self.period_close_history_user_key();
+        let view = PeriodCloseHistoryView {
+            user: self.period_close_history_user_filter.clone(),
+            month: self.period_close_history_month_filter.clone(),
+            action: self.period_close_history_action_filter.storage_key().to_string(),
+        };
+        if self.report_prefs.period_close_history_view(&key) == Some(&view) {
+            return;
+        }
+        self.report_prefs.set_period_close_history_view(key, view);
+        if let Err(err) = self.report_prefs.save() {
+            self.error = Some(format!("Could not save history filters: {err}"));
         }
     }
 
@@ -2342,6 +2385,7 @@ impl OdApp {
             user_name: user_name.clone(),
             permissions,
         });
+        self.load_period_close_history_filters();
         self.login_error = None;
         self.login_pass.clear();
         self.show_settings = false;
@@ -2359,6 +2403,7 @@ impl OdApp {
             self.audit_if(FeatureKey::AuditLogins, Permission::USER_LOG_ON_OFF, 0, text);
         }
         self.session = None;
+        self.load_period_close_history_filters();
     }
 
     fn login_ui(&mut self, ui: &mut Ui) {
@@ -9761,19 +9806,26 @@ impl OdApp {
 
     /// Read-only narrowing for the Period close history report. The filtered
     /// table is the one rendered and exported, so the file matches the screen.
+    /// Every change is saved for the current user in `reports.txt`.
     fn period_close_history_filters(&mut self, ui: &mut Ui) {
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.label("Filter sign-offs:");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.period_close_history_user_filter)
-                    .desired_width(130.0)
-                    .hint_text("user"),
-            );
-            ui.add(
-                egui::TextEdit::singleline(&mut self.period_close_history_month_filter)
-                    .desired_width(100.0)
-                    .hint_text("YYYY-MM"),
-            );
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.period_close_history_user_filter)
+                        .desired_width(130.0)
+                        .hint_text("user"),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.period_close_history_month_filter)
+                        .desired_width(100.0)
+                        .hint_text("YYYY-MM"),
+                )
+                .changed();
+            let action_before = self.period_close_history_action_filter;
             egui::ComboBox::from_label("Action")
                 .selected_text(self.period_close_history_action_filter.label())
                 .show_ui(ui, |ui| {
@@ -9785,13 +9837,18 @@ impl OdApp {
                         );
                     }
                 });
+            changed |= action_before != self.period_close_history_action_filter;
             if ui.button("Clear filters").clicked() {
                 self.period_close_history_user_filter.clear();
                 self.period_close_history_month_filter.clear();
                 self.period_close_history_action_filter = PeriodCloseActionFilter::All;
+                changed = true;
             }
-            ui.weak("User and month match anywhere; exports use the rows shown.");
+            ui.weak("Saved for this user; exports use the rows shown.");
         });
+        if changed {
+            self.persist_period_close_history_filters();
+        }
     }
 
     /// Period-close controls shown with the Ledger tie-out report: close the
