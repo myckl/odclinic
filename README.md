@@ -793,29 +793,33 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       The Balance Sheet uses the range's end date; the Ledger shows opening and
       closing balances per account. Those reports are no longer read-only: the
       Account ledger's adjustment **and payment** rows have a **Post to ledger**
-      action, and the accounting reports offer **Post all unposted charges** to
-      book every completed procedure in one run (toggle
-      `ledger_journal_posting`, on by default, plus the OD *Adjustment Create*
-      permission). Each posting writes one balanced `journalentry` transaction —
-      a debit and a credit of the source amount's absolute value sharing a
-      `TransactionNum` and date — through `Store::post_journal_transaction`,
-      which inserts both lines atomically in MySQL. The batch path uses
-      `Store::post_journal_batch` to write every charge's pair in a single DB
-      transaction, so a failed run can never leave a partial posting. Debit/credit
-      accounts default from the chart by direction (a completed charge or positive
-      adjustment debits A/R and credits income; a write-off debits expense and
-      credits A/R; a collection debits cash and credits A/R; a refund reverses
-      that) and can be overridden. A payment's cheque number is carried onto both
-      lines. Charge amounts are the procedure fee — the same figure the
-      production reports use — and each pair is dated to the procedure. The
-      lines are previewed before confirmation, the patient balance is unchanged,
+      action, and the accounting reports offer **Post all unposted sources** to
+      book every charge, payment and adjustment in the report range in one run
+      (toggle `ledger_journal_posting`, on by default, plus the OD *Adjustment
+      Create* permission). Each posting writes one balanced `journalentry`
+      transaction — a debit and a credit of the source amount's absolute value
+      sharing a `TransactionNum` and date — through
+      `Store::post_journal_transaction`, which inserts both lines atomically in
+      MySQL. The batch path uses `Store::post_journal_batch` to write every
+      source's pair in a single DB transaction, so a failed run can never leave a
+      partial posting. Debit/credit accounts default from the chart by direction
+      (a completed charge or positive adjustment debits A/R and credits income;
+      a write-off debits expense and credits A/R; a collection debits cash and
+      credits A/R; a refund reverses that) and can be overridden — the batch
+      window exposes all four pairs and previews each line with its type, date,
+      source amount and accounts before anything is written. A payment's cheque
+      number is carried onto both lines. Charge amounts are the procedure fee —
+      the same figure the production reports use — and each pair is dated to the
+      procedure. The lines are previewed before confirmation, the patient balance is unchanged,
       and each posting writes an `Adjustment Create` security-log entry so the
       source record stays traceable from the ledger to the accounting reports.
       Each memo carries a stable `[Adj #… pat #…]`, `[Pay #… pat #…]` or
       `[Proc #… pat #…]` reference that is re-attached even when staff edit the
       note, so an already-posted record shows **Posted #⟨transaction⟩** instead
-      of the button (and is skipped by the batch) — no duplicate journal pair can
-      be booked (pre-reference memos are still recognised). The **Journal posting
+      of the button (and is skipped by the batch, which is rebuilt from fresh
+      data on confirm) — no duplicate journal pair can be booked (pre-reference
+      memos are still recognised). The batch writes one audit line per touched
+      patient. The **Journal posting
       audit** report lists every charge, payment and adjustment in a date range
       with its posting status and transaction number, plus posted/unposted totals
       per source, so an unposted record cannot be silently left out of the
@@ -829,7 +833,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       missing posting, a duplicate or an unsourced manual journal entry cannot
       hide behind a report that merely looks complete. It also shows the A/R
       closing balance, the paysplit collections used by the Collections report,
-      and an unposted-source count. On by default with the same feature toggle.
+      and an unposted-source count. Together these turn period close into one
+      reviewed run: **Post all unposted sources**, then re-run the tie-out until
+      every check reads `OK`. On by default with the same feature toggle.
     * **Hidden pay splits** (`FormRpHiddenPaySplits`) — unearned deposits whose
       `paysplit.UnearnedType` is a hidden definition (category 29 with a
       non-empty `ItemValue`, *not* `Definition.IsHidden`). Refunds can be

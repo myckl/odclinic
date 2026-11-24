@@ -8,6 +8,8 @@
 //! event; `Store::post_journal_transaction` and `Store::post_journal_batch`
 //! write them atomically.
 
+use std::collections::BTreeSet;
+
 use od_domain::{
     Account, AccountType, Adjustment, Id, JournalEntry, PaySplit, Payment, Procedure,
 };
@@ -477,6 +479,262 @@ pub fn build_charge_posting_plan(
         }
     }
     plan
+}
+
+/// The four account pairs used when posting a mixed batch. Charges and positive
+/// adjustments debit A/R and credit income; a collection debits cash and credits
+/// A/R (a refund reverses that); a write-off debits expense and credits A/R.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PostingAccountDefaults {
+    pub charge: (Id, Id),
+    pub payment: (Id, Id),
+    pub positive_adjustment: (Id, Id),
+    pub negative_adjustment: (Id, Id),
+}
+
+impl PostingAccountDefaults {
+    /// Take the same defaults the individual posting windows offer from the
+    /// chart of accounts, so a bulk run books to the accounts staff would pick.
+    pub fn from_chart(accounts: &[Account]) -> Self {
+        Self {
+            charge: suggest_charge_ledger_accounts(accounts).unwrap_or((0, 0)),
+            payment: suggest_payment_ledger_accounts(accounts, 1.0).unwrap_or((0, 0)),
+            positive_adjustment: suggest_ledger_accounts(accounts, 1.0).unwrap_or((0, 0)),
+            negative_adjustment: suggest_ledger_accounts(accounts, -1.0).unwrap_or((0, 0)),
+        }
+    }
+
+    /// Every pair must name two different, real accounts before any write.
+    pub fn is_complete(&self) -> bool {
+        [
+            self.charge,
+            self.payment,
+            self.positive_adjustment,
+            self.negative_adjustment,
+        ]
+        .iter()
+        .all(|(debit, credit)| *debit != 0 && *credit != 0 && debit != credit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostingSourceKind {
+    Charge,
+    Payment,
+    Adjustment,
+}
+
+impl PostingSourceKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Charge => "Charge",
+            Self::Payment => "Payment",
+            Self::Adjustment => "Adjustment",
+        }
+    }
+}
+
+/// A source record that can be posted to the journal.
+#[derive(Clone, Debug)]
+pub enum PostingSource {
+    Charge(Procedure),
+    Payment(Payment),
+    Adjustment(Adjustment),
+}
+
+impl PostingSource {
+    pub fn kind(&self) -> PostingSourceKind {
+        match self {
+            Self::Charge(_) => PostingSourceKind::Charge,
+            Self::Payment(_) => PostingSourceKind::Payment,
+            Self::Adjustment(_) => PostingSourceKind::Adjustment,
+        }
+    }
+
+    pub fn number(&self) -> Id {
+        match self {
+            Self::Charge(proc) => proc.proc_num,
+            Self::Payment(payment) => payment.pay_num,
+            Self::Adjustment(adj) => adj.adj_num,
+        }
+    }
+
+    pub fn pat_num(&self) -> Id {
+        match self {
+            Self::Charge(proc) => proc.pat_num,
+            Self::Payment(payment) => payment.pat_num,
+            Self::Adjustment(adj) => adj.pat_num,
+        }
+    }
+
+    pub fn date(&self) -> chrono::NaiveDate {
+        match self {
+            Self::Charge(proc) => proc.proc_date,
+            Self::Payment(payment) => payment.pay_date,
+            Self::Adjustment(adj) => adj.adj_date,
+        }
+    }
+
+    /// Signed source amount, matching the clinical reports (a negative
+    /// adjustment is a write-off; a negative payment is a refund).
+    pub fn amount(&self) -> f64 {
+        match self {
+            Self::Charge(proc) => proc.fee,
+            Self::Payment(payment) => payment.pay_amount,
+            Self::Adjustment(adj) => adj.adj_amount,
+        }
+    }
+
+    pub fn description(&self) -> String {
+        match self {
+            Self::Charge(proc) => procedure_description(proc),
+            Self::Payment(payment) => {
+                let mut text = if payment.note.trim().is_empty() {
+                    format!("Payment type {}", payment.pay_type)
+                } else {
+                    payment.note.trim().to_string()
+                };
+                if !payment.check_num.trim().is_empty() {
+                    text.push_str(&format!(" · cheque {}", payment.check_num.trim()));
+                }
+                text
+            }
+            Self::Adjustment(adj) => {
+                if adj.note.trim().is_empty() {
+                    format!("Adjustment #{}", adj.adj_num)
+                } else {
+                    adj.note.trim().to_string()
+                }
+            }
+        }
+    }
+
+    pub fn is_posted(&self, journal: &[JournalEntry]) -> bool {
+        match self {
+            Self::Charge(proc) => is_procedure_posted(journal, proc.proc_num, proc.pat_num),
+            Self::Payment(payment) => is_payment_posted(journal, payment.pay_num, payment.pat_num),
+            Self::Adjustment(adj) => is_adjustment_posted(journal, adj.adj_num, adj.pat_num),
+        }
+    }
+}
+
+/// One reviewed item in a mixed batch: the source, its account pair and the
+/// transaction group it will be written under.
+#[derive(Clone, Debug)]
+pub struct PostingBatchItem {
+    pub source: PostingSource,
+    pub debit_account: Id,
+    pub credit_account: Id,
+    pub transaction_num: Id,
+}
+
+impl PostingBatchItem {
+    /// Build the balanced pair for this item from its current account pair.
+    pub fn entries(&self) -> Result<[JournalEntry; 2], String> {
+        match &self.source {
+            PostingSource::Charge(proc) => build_charge_journal(
+                proc,
+                self.debit_account,
+                self.credit_account,
+                self.transaction_num,
+            ),
+            PostingSource::Payment(payment) => build_payment_journal(
+                payment,
+                self.debit_account,
+                self.credit_account,
+                self.transaction_num,
+            ),
+            PostingSource::Adjustment(adj) => build_adjustment_journal(
+                adj,
+                self.debit_account,
+                self.credit_account,
+                self.transaction_num,
+            ),
+        }
+    }
+}
+
+fn default_account_pair(defaults: &PostingAccountDefaults, source: &PostingSource) -> (Id, Id) {
+    match source {
+        PostingSource::Charge(_) => defaults.charge,
+        // A refund reverses the normal cash/A/R direction.
+        PostingSource::Payment(payment) if payment.pay_amount < 0.0 => {
+            (defaults.payment.1, defaults.payment.0)
+        }
+        PostingSource::Payment(_) => defaults.payment,
+        PostingSource::Adjustment(adj) if adj.adj_amount < 0.0 => defaults.negative_adjustment,
+        PostingSource::Adjustment(_) => defaults.positive_adjustment,
+    }
+}
+
+/// Plan every unposted charge, payment and adjustment in the date range in one
+/// pass. Each item gets its own transaction number, continuing after the largest
+/// one already in the journal. Already-posted, zero-value and out-of-range
+/// records are skipped, as are items whose account pair is incomplete.
+pub fn build_posting_batch_plan(
+    procedures: &[Procedure],
+    payments: &[Payment],
+    adjustments: &[Adjustment],
+    journal: &[JournalEntry],
+    defaults: &PostingAccountDefaults,
+    from: chrono::NaiveDate,
+    to: chrono::NaiveDate,
+) -> Vec<PostingBatchItem> {
+    let mut next = next_journal_transaction_num(journal);
+    let mut items = Vec::new();
+    let in_range = |date: chrono::NaiveDate| date >= from && date <= to;
+    let mut add = |source: PostingSource| {
+        if !in_range(source.date())
+            || source.is_posted(journal)
+            || !source.amount().is_finite()
+            || source.amount().abs() <= 0.005
+        {
+            return;
+        }
+        let (debit_account, credit_account) = default_account_pair(defaults, &source);
+        if debit_account == 0 || credit_account == 0 || debit_account == credit_account {
+            return;
+        }
+        items.push(PostingBatchItem {
+            source,
+            debit_account,
+            credit_account,
+            transaction_num: next,
+        });
+        next += 1;
+    };
+    for proc in procedures {
+        if proc.proc_status.is_completed() {
+            add(PostingSource::Charge(proc.clone()));
+        }
+    }
+    for payment in payments {
+        add(PostingSource::Payment(payment.clone()));
+    }
+    for adj in adjustments {
+        add(PostingSource::Adjustment(adj.clone()));
+    }
+    items
+}
+
+/// Turn a reviewed plan into journal lines for `Store::post_journal_batch`.
+/// Every pair is checked for balance and transaction uniqueness before any line
+/// is handed to the store.
+pub fn build_journal_batches(items: &[PostingBatchItem]) -> Result<Vec<Vec<JournalEntry>>, String> {
+    let mut seen = BTreeSet::new();
+    let mut batches = Vec::with_capacity(items.len());
+    for item in items {
+        let entries = item.entries()?;
+        validate_balanced_journal(&entries)?;
+        if !seen.insert(item.transaction_num) {
+            return Err(format!(
+                "Transaction number {} is used more than once",
+                item.transaction_num
+            ));
+        }
+        batches.push(entries.to_vec());
+    }
+    Ok(batches)
 }
 
 /// Read-only audit of every posting source in a date range. Each charge,
@@ -1430,5 +1688,133 @@ mod tests {
         assert_eq!(movement[4], "OUT OF BALANCE");
         assert_eq!(row("Unposted sources")[1], "1");
         assert_eq!(row("Unposted sources")[4], "CHECK");
+    }
+
+    #[test]
+    fn mixed_batch_plans_every_source_once_and_is_idempotent() {
+        use od_domain::ProcedureStatus;
+
+        let accounts = accounts();
+        let defaults = PostingAccountDefaults::from_chart(&accounts);
+        assert!(defaults.is_complete());
+        assert_eq!(defaults.charge, (2, 5));
+        assert_eq!(defaults.payment, (1, 2));
+        assert_eq!(defaults.positive_adjustment, (2, 5));
+        assert_eq!(defaults.negative_adjustment, (6, 2));
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let charge = procedure(40.0);
+        let already = Procedure {
+            proc_num: 45,
+            ..charge.clone()
+        };
+        let no_fee = Procedure {
+            proc_num: 46,
+            fee: 0.0,
+            ..charge.clone()
+        };
+        let old = Procedure {
+            proc_num: 47,
+            proc_date: NaiveDate::from_ymd_opt(2026, 10, 1).unwrap(),
+            ..charge.clone()
+        };
+        let draft = Procedure {
+            proc_num: 48,
+            proc_status: ProcedureStatus::TreatmentPlanned,
+            ..charge.clone()
+        };
+        let posted_charge = build_charge_journal(&already, 2, 5, 1).unwrap();
+        let journal = posted_charge.to_vec();
+        let pay = Payment {
+            pay_num: 31,
+            pat_num: 7,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 24).unwrap(),
+            pay_amount: 20.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let adj = adjustment(-5.0);
+
+        let plan = build_posting_batch_plan(
+            &[charge.clone(), already, no_fee, old, draft],
+            &[pay.clone()],
+            &[adj.clone()],
+            &journal,
+            &defaults,
+            from,
+            to,
+        );
+        assert_eq!(plan.len(), 3, "one charge, one payment, one adjustment");
+        assert_eq!(plan[0].source.kind(), PostingSourceKind::Charge);
+        assert_eq!(plan[1].source.kind(), PostingSourceKind::Payment);
+        assert_eq!(plan[2].source.kind(), PostingSourceKind::Adjustment);
+        assert_eq!((plan[0].debit_account, plan[0].credit_account), (2, 5));
+        assert_eq!((plan[1].debit_account, plan[1].credit_account), (1, 2));
+        assert_eq!((plan[2].debit_account, plan[2].credit_account), (6, 2));
+        assert_eq!(
+            plan.iter().map(|i| i.transaction_num).collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        let batches = build_journal_batches(&plan).unwrap();
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|b| b.len() == 2));
+
+        let mut after = journal;
+        for batch in batches {
+            after.extend(batch);
+        }
+        assert!(build_posting_batch_plan(
+            &[charge], &[pay], &[adj], &after, &defaults, from, to
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn mixed_batch_directs_refunds_and_positive_adjustments() {
+        let defaults = PostingAccountDefaults::from_chart(&accounts());
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let refund = Payment {
+            pay_num: 32,
+            pat_num: 7,
+            pay_date: NaiveDate::from_ymd_opt(2026, 11, 25).unwrap(),
+            pay_amount: -10.0,
+            pay_type: 0,
+            ..Default::default()
+        };
+        let plan = build_posting_batch_plan(
+            &[],
+            &[refund],
+            &[adjustment(10.0), adjustment(-5.0)],
+            &[],
+            &defaults,
+            from,
+            to,
+        );
+        assert_eq!(plan.len(), 3);
+        assert_eq!((plan[0].debit_account, plan[0].credit_account), (2, 1));
+        assert_eq!((plan[1].debit_account, plan[1].credit_account), (2, 5));
+        assert_eq!((plan[2].debit_account, plan[2].credit_account), (6, 2));
+        assert!(build_journal_batches(&plan).is_ok());
+    }
+
+    #[test]
+    fn mixed_batch_refuses_reused_transaction_numbers() {
+        let defaults = PostingAccountDefaults::from_chart(&accounts());
+        let from = NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let to = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let mut plan = build_posting_batch_plan(
+            &[procedure(40.0)],
+            &[],
+            &[adjustment(-5.0)],
+            &[],
+            &defaults,
+            from,
+            to,
+        );
+        plan[1].transaction_num = plan[0].transaction_num;
+        assert!(build_journal_batches(&plan)
+            .unwrap_err()
+            .contains("used more than once"));
     }
 }

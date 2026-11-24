@@ -4624,6 +4624,111 @@ fn mysql_live_charge_journal_batch_round_trip() {
     println!("live charge batch: transactions {txns:?} round-tripped and cleaned up");
 }
 
+/// Posts one charge, one payment and one write-off from the live OD chart in a
+/// single atomic call, verifies each balanced pair lands in `journalentry`, then
+/// removes the temporary transactions so the demo database is unchanged.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes temporary journal transactions"]
+fn mysql_live_post_all_batch_round_trip() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let accounts = store.list_accounts().unwrap();
+    let defaults = od_core::PostingAccountDefaults::from_chart(&accounts);
+    assert!(defaults.is_complete(), "chart must supply four distinct pairs");
+    let pat_num = store.list_patients().unwrap()[0].pat_num;
+    let date = NaiveDate::from_ymd_opt(2099, 5, 2).unwrap();
+    let from = NaiveDate::from_ymd_opt(2099, 1, 1).unwrap();
+    let to = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+    let procedures = vec![Procedure {
+        proc_num: 2_100_000_200,
+        pat_num,
+        proc_date: date,
+        proc_status: ProcedureStatus::Complete,
+        fee: 60.0,
+        description_override: "ODCLINIC_LIVE_TEST_POST_ALL_CHARGE".into(),
+        ..Default::default()
+    }];
+    let payments = vec![Payment {
+        pay_num: 2_100_000_201,
+        pat_num,
+        pay_date: date,
+        pay_amount: 40.0,
+        pay_type: 0,
+        note: "ODCLINIC_LIVE_TEST_POST_ALL_PAYMENT".into(),
+        ..Default::default()
+    }];
+    let adjustments = vec![Adjustment {
+        adj_num: 2_100_000_202,
+        adj_date: date,
+        adj_amount: -5.0,
+        pat_num,
+        note: "ODCLINIC_LIVE_TEST_POST_ALL_ADJUSTMENT".into(),
+        ..Default::default()
+    }];
+    let before = store.list_journal_entries().unwrap();
+    let plan = od_core::build_posting_batch_plan(
+        &procedures,
+        &payments,
+        &adjustments,
+        &before,
+        &defaults,
+        from,
+        to,
+    );
+    assert_eq!(plan.len(), 3, "one of each source kind should be planned");
+    assert_eq!(plan[0].source.kind(), od_core::PostingSourceKind::Charge);
+    assert_eq!(plan[1].source.kind(), od_core::PostingSourceKind::Payment);
+    assert_eq!(plan[2].source.kind(), od_core::PostingSourceKind::Adjustment);
+    let batches = od_core::build_journal_batches(&plan).unwrap();
+    let txns = store.post_journal_batch(&batches).unwrap();
+    assert_eq!(txns.len(), 3);
+
+    let after = store.list_journal_entries().unwrap();
+    for item in &plan {
+        let posted: Vec<&JournalEntry> = after
+            .iter()
+            .filter(|e| e.transaction_num == item.transaction_num)
+            .collect();
+        assert_eq!(posted.len(), 2, "each source writes a balanced pair");
+        assert!(posted.iter().any(|e| e.debit_amt == item.source.amount().abs()
+            && e.account_num == item.debit_account
+            && e.date_displayed == date));
+        assert!(posted.iter().any(|e| e.credit_amt == item.source.amount().abs()
+            && e.account_num == item.credit_account));
+    }
+    let flat = after.iter().map(|e| e.memo.as_str()).collect::<Vec<_>>().concat();
+    assert!(flat.contains("ODCLINIC_LIVE_TEST_POST_ALL_CHARGE"));
+    assert!(flat.contains("ODCLINIC_LIVE_TEST_POST_ALL_PAYMENT"));
+    assert!(flat.contains("ODCLINIC_LIVE_TEST_POST_ALL_ADJUSTMENT"));
+    assert!(od_core::is_procedure_posted(&after, procedures[0].proc_num, pat_num));
+    assert!(od_core::is_payment_posted(&after, payments[0].pay_num, pat_num));
+    assert!(od_core::is_adjustment_posted(&after, adjustments[0].adj_num, pat_num));
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    let in_clause = txns
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.query_drop(format!(
+        "DELETE FROM journalentry WHERE TransactionNum IN ({in_clause})"
+    ))
+    .expect("journal cleanup failed");
+    let cleaned = store.list_journal_entries().unwrap();
+    assert!(plan
+        .iter()
+        .all(|item| !cleaned.iter().any(|e| e.transaction_num == item.transaction_num)));
+    println!("live post-all batch: transactions {txns:?} round-tripped and cleaned up");
+}
+
 /// Builds the posting audit from live OD sources. Read-only: it verifies every
 /// charge/payment/adjustment in range is represented with a posting status and
 /// that the three summary rows reconcile with the detail rows.
