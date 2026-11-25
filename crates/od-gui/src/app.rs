@@ -1157,7 +1157,7 @@ impl RegistryTab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReportKind {
     PatientList,
     Production,
@@ -1440,6 +1440,10 @@ impl ReportKind {
                 | ReportKind::PresentedTreatment
                 | ReportKind::TpPresentationStats
         )
+    }
+
+    fn from_file_stem(stem: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.file_stem() == stem)
     }
 
     fn file_stem(self) -> &'static str {
@@ -2224,6 +2228,13 @@ impl OdApp {
                 self.show_report_dates(from, to);
             }
         }
+        if let Some(stem) = self.report_prefs.selected_report_kind(&key).map(str::to_string) {
+            if let Some(kind) = ReportKind::from_file_stem(&stem)
+                .filter(|kind| self.features.enabled(kind.feature_key()))
+            {
+                self.report = kind;
+            }
+        }
     }
 
     /// Replace both the live dates and their editable text. Loading a saved
@@ -2269,6 +2280,20 @@ impl OdApp {
 
     fn report_date_text_valid(&self, uses_date_range: bool) -> bool {
         self.parsed_report_dates(uses_date_range).is_some()
+    }
+
+    /// Remember the selected report for the signed-in user. A saved report whose
+    /// feature is turned off is not overwritten by the temporary fallback.
+    fn persist_selected_report_kind(&mut self) {
+        let key = self.period_close_history_user_key();
+        let stem = self.report.file_stem();
+        if self.report_prefs.selected_report_kind(&key) == Some(stem) {
+            return;
+        }
+        self.report_prefs.set_selected_report_kind(key, stem);
+        if let Err(err) = self.save_report_prefs() {
+            self.error = Some(format!("Could not save selected report: {err}"));
+        }
     }
 
     /// Persist the currently visible reporting window for this user. Missing or
@@ -5982,6 +6007,7 @@ impl OdApp {
                 .map(str::to_string)
                 .unwrap_or_else(|| default_report_path(current, "csv"));
             self.report_export_kind = Some(current);
+            self.persist_selected_report_kind();
         }
         if !current.uses_date_range() {
             if current == ReportKind::PeriodCloseHistory {
@@ -12197,6 +12223,29 @@ mod tests {
             patient_export_key(EXPORT_KEY_SECURITY_LOG, 12)
         );
         assert_eq!(security_log_export_key(None), EXPORT_KEY_SECURITY_LOG);
+    }
+
+    #[test]
+    fn report_kind_file_stems_round_trip() {
+        for kind in ReportKind::ALL {
+            assert_eq!(ReportKind::from_file_stem(kind.file_stem()), Some(kind));
+        }
+        assert_eq!(ReportKind::from_file_stem("not-a-report"), None);
+    }
+
+    #[test]
+    fn loading_user_view_restores_saved_report_kind() {
+        let mut app = OdApp::new();
+        let key = app.period_close_history_user_key();
+        app.report = ReportKind::Production;
+        app.report_prefs
+            .set_selected_report_kind(key.clone(), ReportKind::Aging.file_stem());
+        app.load_report_user_view();
+        assert_eq!(app.report, ReportKind::Aging);
+        assert_eq!(
+            app.report_prefs.selected_report_kind(&key),
+            Some(ReportKind::Aging.file_stem())
+        );
     }
 
     /// Editable report dates mirror the live range and reject partial or

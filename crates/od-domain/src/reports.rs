@@ -1211,6 +1211,9 @@ pub struct ReportPreferences {
     /// Reporting window per signed-in user. The GUI restores the active user's
     /// dates on startup and login/logout instead of resetting to today.
     pub report_ranges: HashMap<String, ReportDateRange>,
+    /// Selected report per signed-in user, stored as the report's stable file
+    /// stem. The GUI restores it alongside the user's dates and options.
+    pub report_kinds: HashMap<String, String>,
 }
 
 impl Default for ReportPreferences {
@@ -1248,6 +1251,7 @@ impl Default for ReportPreferences {
             period_close_history: HashMap::new(),
             user_options: HashMap::new(),
             report_ranges: HashMap::new(),
+            report_kinds: HashMap::new(),
         }
     }
 }
@@ -1318,6 +1322,8 @@ impl ReportPreferences {
     /// Per-user reporting windows, e.g.
     /// `report_range.user-7.from=2026-10-25`.
     const REPORT_RANGE_PREFIX: &'static str = "report_range.";
+    /// Per-user selected report, e.g. `report_kind.user-7=patient-aging`.
+    const REPORT_KIND_PREFIX: &'static str = "report_kind.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1367,6 +1373,7 @@ impl ReportPreferences {
         restored.period_close_history = std::mem::take(&mut self.period_close_history);
         restored.user_options = std::mem::take(&mut self.user_options);
         restored.report_ranges = std::mem::take(&mut self.report_ranges);
+        restored.report_kinds = std::mem::take(&mut self.report_kinds);
         *self = restored;
     }
 
@@ -1376,6 +1383,18 @@ impl ReportPreferences {
 
     pub fn set_report_date_range(&mut self, user_key: impl Into<String>, range: ReportDateRange) {
         self.report_ranges.insert(user_key.into(), range);
+    }
+
+    pub fn selected_report_kind(&self, user_key: &str) -> Option<&str> {
+        self.report_kinds.get(user_key).map(String::as_str)
+    }
+
+    pub fn set_selected_report_kind(
+        &mut self,
+        user_key: impl Into<String>,
+        report_key: impl Into<String>,
+    ) {
+        self.report_kinds.insert(user_key.into(), report_key.into());
     }
 
     fn bool_text(value: bool) -> &'static str {
@@ -1864,6 +1883,16 @@ impl ReportPreferences {
                 encode_pref_value(&range.to)
             ));
         }
+        let mut kind_users: Vec<_> = self.report_kinds.iter().collect();
+        kind_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, report_key) in kind_users {
+            lines.push(format!(
+                "{}{}={}",
+                Self::REPORT_KIND_PREFIX,
+                user_key,
+                encode_pref_value(report_key)
+            ));
+        }
         let mut option_users: Vec<_> = self.user_options.iter().collect();
         option_users.sort_by(|a, b| a.0.cmp(b.0));
         for (user_key, encoded) in option_users {
@@ -1934,6 +1963,12 @@ impl ReportPreferences {
                     "from" => range.from = decoded,
                     "to" => range.to = decoded,
                     _ => {}
+                }
+            } else if let Some(user_key) = key.strip_prefix(Self::REPORT_KIND_PREFIX) {
+                if !user_key.is_empty() {
+                    prefs
+                        .report_kinds
+                        .insert(user_key.to_string(), decode_pref_value(value));
                 }
             } else if let Some(user_key) = key.strip_prefix(Self::USER_OPTIONS_PREFIX) {
                 if !user_key.is_empty() {
@@ -2469,6 +2504,30 @@ mod tests {
 
         let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
         assert_eq!(old.report_date_range("local"), None);
+    }
+
+    #[test]
+    fn selected_report_kinds_round_trip_per_user() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_selected_report_kind("local", "production");
+        prefs.set_selected_report_kind("user-1", "patient-aging");
+
+        let text = prefs.to_text();
+        assert!(text.contains("report_kind.local=production"));
+        assert!(text.contains("report_kind.user-1=patient-aging"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(loaded.selected_report_kind("local"), Some("production"));
+        assert_eq!(loaded.selected_report_kind("user-1"), Some("patient-aging"));
+        assert_eq!(loaded.selected_report_kind("user-2"), None);
+
+        // Switching a user's option set must keep their selected report too.
+        loaded.restore_user_options("user-1");
+        assert_eq!(loaded.selected_report_kind("local"), Some("production"));
+        assert_eq!(loaded.selected_report_kind("user-1"), Some("patient-aging"));
+
+        let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
+        assert_eq!(old.selected_report_kind("local"), None);
     }
 
     #[test]

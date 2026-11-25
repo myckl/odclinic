@@ -559,7 +559,11 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   the usual last-30-days-to-today range. The Reports toolbar now has editable
   `YYYY-MM-DD` start/end fields (an end-only field on "as of" reports), so any
   window can be chosen; the **Last 30 days** and **Next Month** shortcuts also
-  update the saved range.
+  update the saved range. The selected report itself is kept per user as
+  `report_kind.user-<UserNum>` (or `report_kind.local`), so the report, dates and
+  options all come back together on restart or login. If a saved report's feature
+  toggle is off, the toolbar falls back to an enabled report without losing the
+  saved choice.
   These reports use a variable-column `ReportTable` model; the local three-column
   reports are wrapped into it, so the CSV header stays
   `Practice,Report,Item,Value,Detail` for them while upstream exports keep OD's
