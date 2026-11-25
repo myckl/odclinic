@@ -1147,6 +1147,43 @@ pub struct ReportSortState {
     pub descending: bool,
 }
 
+/// Persisted aging-band choice for the Collections worklist. The GUI keeps the
+/// active band here per signed-in user so a restart or login switch restores
+/// the triage view they left on screen. `All` is also the fallback for users
+/// with no saved choice and for unrecognised tokens from older files.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CollectionsAgingBand {
+    #[default]
+    All,
+    Current,
+    Days31To60,
+    Days61To90,
+    Over90,
+}
+
+impl CollectionsAgingBand {
+    /// Stable token written to `reports.txt`, e.g. `collections_bucket.user-7=61-90`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Current => "0-30",
+            Self::Days31To60 => "31-60",
+            Self::Days61To90 => "61-90",
+            Self::Over90 => "90+",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "0-30" => Self::Current,
+            "31-60" => Self::Days31To60,
+            "61-90" => Self::Days61To90,
+            "90+" => Self::Over90,
+            _ => Self::All,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportPreferences {
     /// Printed on exported CSV/HTML so a practice can identify its reports.
@@ -1228,6 +1265,9 @@ pub struct ReportPreferences {
     /// Last column sort per report and signed-in user, so a restart or login
     /// switch restores the order each user left the table in.
     report_sorts: HashMap<String, HashMap<String, ReportSortState>>,
+    /// Selected Collections aging band per signed-in user, stored as a stable
+    /// token. Missing keys mean `All`, matching a fresh installation.
+    collections_buckets: HashMap<String, CollectionsAgingBand>,
 }
 
 impl Default for ReportPreferences {
@@ -1268,6 +1308,7 @@ impl Default for ReportPreferences {
             report_kinds: HashMap::new(),
             user_export_paths: HashMap::new(),
             report_sorts: HashMap::new(),
+            collections_buckets: HashMap::new(),
         }
     }
 }
@@ -1346,6 +1387,8 @@ impl ReportPreferences {
     /// Per-user report sort order, e.g.
     /// `report_sort.user-7.production.column=2`.
     const REPORT_SORT_PREFIX: &'static str = "report_sort.";
+    /// Per-user Collections aging band, e.g. `collections_bucket.user-7=61-90`.
+    const COLLECTIONS_BUCKET_PREFIX: &'static str = "collections_bucket.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1405,6 +1448,23 @@ impl ReportPreferences {
             .insert(report_key.into(), sort);
     }
 
+    /// Aging band left selected in the Collections worklist by one user.
+    /// Users who never picked a band get `All`.
+    pub fn collections_bucket(&self, user_key: &str) -> CollectionsAgingBand {
+        self.collections_buckets
+            .get(user_key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_collections_bucket(
+        &mut self,
+        user_key: impl Into<String>,
+        band: CollectionsAgingBand,
+    ) {
+        self.collections_buckets.insert(user_key.into(), band);
+    }
+
     pub fn period_close_history_view(&self, user_key: &str) -> Option<&PeriodCloseHistoryView> {
         self.period_close_history.get(user_key)
     }
@@ -1448,6 +1508,7 @@ impl ReportPreferences {
         restored.report_kinds = std::mem::take(&mut self.report_kinds);
         restored.user_export_paths = std::mem::take(&mut self.user_export_paths);
         restored.report_sorts = std::mem::take(&mut self.report_sorts);
+        restored.collections_buckets = std::mem::take(&mut self.collections_buckets);
         *self = restored;
     }
 
@@ -1996,6 +2057,16 @@ impl ReportPreferences {
                 ));
             }
         }
+        let mut bucket_users: Vec<_> = self.collections_buckets.iter().collect();
+        bucket_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, band) in bucket_users {
+            lines.push(format!(
+                "{}{}={}",
+                Self::COLLECTIONS_BUCKET_PREFIX,
+                user_key,
+                encode_pref_value(band.as_str())
+            ));
+        }
         let mut path_users: Vec<_> = self.user_export_paths.iter().collect();
         path_users.sort_by(|a, b| a.0.cmp(b.0));
         for (user_key, paths) in path_users {
@@ -2112,6 +2183,11 @@ impl ReportPreferences {
                     prefs
                         .report_kinds
                         .insert(user_key.to_string(), decode_pref_value(value));
+                }
+            } else if let Some(user_key) = key.strip_prefix(Self::COLLECTIONS_BUCKET_PREFIX) {
+                if !user_key.is_empty() {
+                    let band = CollectionsAgingBand::from_str(&decode_pref_value(value));
+                    prefs.collections_buckets.insert(user_key.to_string(), band);
                 }
             } else if let Some(user_key) = key.strip_prefix(Self::USER_OPTIONS_PREFIX) {
                 if !user_key.is_empty() {
@@ -2795,6 +2871,79 @@ mod tests {
                 descending: true
             }
         );
+    }
+
+    #[test]
+    fn collections_aging_band_tokens_cover_every_band() {
+        for (token, band) in [
+            ("all", CollectionsAgingBand::All),
+            ("0-30", CollectionsAgingBand::Current),
+            ("31-60", CollectionsAgingBand::Days31To60),
+            ("61-90", CollectionsAgingBand::Days61To90),
+            ("90+", CollectionsAgingBand::Over90),
+        ] {
+            assert_eq!(band.as_str(), token);
+            assert_eq!(CollectionsAgingBand::from_str(token), band);
+        }
+        assert_eq!(
+            CollectionsAgingBand::from_str(" 61-90 "),
+            CollectionsAgingBand::Days61To90
+        );
+        assert_eq!(
+            CollectionsAgingBand::from_str("unknown"),
+            CollectionsAgingBand::All
+        );
+    }
+
+    #[test]
+    fn collections_aging_bands_round_trip_per_user() {
+        let mut prefs = ReportPreferences::default();
+        assert_eq!(prefs.collections_bucket("local"), CollectionsAgingBand::All);
+        prefs.set_collections_bucket("local", CollectionsAgingBand::Over90);
+        prefs.set_collections_bucket("user-7", CollectionsAgingBand::Days31To60);
+        prefs.set_collections_bucket("user-8", CollectionsAgingBand::All);
+
+        let text = prefs.to_text();
+        assert!(text.contains("collections_bucket.local=90+"));
+        assert!(text.contains("collections_bucket.user-7=31-60"));
+        assert!(text.contains("collections_bucket.user-8=all"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(
+            loaded.collections_bucket("local"),
+            CollectionsAgingBand::Over90
+        );
+        assert_eq!(
+            loaded.collections_bucket("user-7"),
+            CollectionsAgingBand::Days31To60
+        );
+        assert_eq!(loaded.collections_bucket("user-8"), CollectionsAgingBand::All);
+        assert_eq!(loaded.collections_bucket("user-9"), CollectionsAgingBand::All);
+
+        // Switching option snapshots must not discard any user's band.
+        loaded.restore_user_options("user-7");
+        assert_eq!(
+            loaded.collections_bucket("local"),
+            CollectionsAgingBand::Over90
+        );
+        assert_eq!(
+            loaded.collections_bucket("user-7"),
+            CollectionsAgingBand::Days31To60
+        );
+        loaded.restore_user_options("local");
+        assert_eq!(
+            loaded.collections_bucket("user-7"),
+            CollectionsAgingBand::Days31To60
+        );
+
+        let malformed = ReportPreferences::from_text(
+            "collections_bucket.local=unknown\ncollections_bucket.=90+\n",
+        );
+        assert_eq!(
+            malformed.collections_bucket("local"),
+            CollectionsAgingBand::All
+        );
+        assert_eq!(malformed.collections_bucket(""), CollectionsAgingBand::All);
     }
 
     #[test]

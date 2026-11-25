@@ -414,7 +414,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   leaving the report. An aging triage strip groups patients into 0–30, 31–60,
   61–90 and 90+ day bands using the displayed days-overdue value; each band
   shows its patient count and balance total, and selecting a band filters the
-  whole patient rows (never splitting a balance). The summary and exported
+  whole patient rows (never splitting a balance). The selected band is saved per
+  signed-in user in `reports.txt` (`collections_bucket.<user>`), so a restart or
+  login switch restores each user's triage view. The summary and exported
   CSV/HTML follow the visible rows. Zero and credit balances are hidden, as in
   OD's collection lists.
 * **Statements:** generate a patient-only statement (charges, adjustments,

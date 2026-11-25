@@ -64,7 +64,8 @@ use od_domain::eservices::*;
 use od_domain::reports_ext::{LaserInsMode, LaserLabelTab, ProcNoteGroup, UnearnedIncomeTab};
 use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
-    CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView, PlanTypeFilter,
+    CollectionsAgingBand, CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView,
+    PlanTypeFilter,
     ProcedureSheetMode, ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition,
     ReportPreferences, ReportSortState, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
     EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
@@ -129,6 +130,28 @@ fn sort_collections_rows(rows: &mut [CollectionsRow], column: usize, descending:
     });
     if descending {
         rows.reverse();
+    }
+}
+
+/// Translate the persisted band token into the live filter. `All` is both the
+/// explicit choice and the fallback for users with no saved band.
+fn collections_band_from_storage(band: CollectionsAgingBand) -> Option<CollectionsAgingBucket> {
+    match band {
+        CollectionsAgingBand::All => None,
+        CollectionsAgingBand::Current => Some(CollectionsAgingBucket::Current),
+        CollectionsAgingBand::Days31To60 => Some(CollectionsAgingBucket::Days31To60),
+        CollectionsAgingBand::Days61To90 => Some(CollectionsAgingBucket::Days61To90),
+        CollectionsAgingBand::Over90 => Some(CollectionsAgingBucket::Over90),
+    }
+}
+
+fn collections_band_to_storage(selection: Option<CollectionsAgingBucket>) -> CollectionsAgingBand {
+    match selection {
+        None => CollectionsAgingBand::All,
+        Some(CollectionsAgingBucket::Current) => CollectionsAgingBand::Current,
+        Some(CollectionsAgingBucket::Days31To60) => CollectionsAgingBand::Days31To60,
+        Some(CollectionsAgingBucket::Days61To90) => CollectionsAgingBand::Days61To90,
+        Some(CollectionsAgingBucket::Over90) => CollectionsAgingBand::Over90,
     }
 }
 
@@ -2290,6 +2313,8 @@ impl OdApp {
             .unwrap_or_else(|| default_report_path(self.report, "csv"));
         self.report_export_kind = Some(self.report);
         self.load_report_sort(self.report);
+        self.collections_bucket_filter =
+            collections_band_from_storage(self.report_prefs.collections_bucket(&key));
     }
 
     /// Restore the saved column sort for one report. Called on startup, after a
@@ -2316,6 +2341,29 @@ impl OdApp {
         self.report_prefs.set_report_sort(user_key, report_key, sort);
         if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save report sort preference: {err}"));
+        }
+    }
+
+    /// Stage the live Collections band for one user. Returns whether anything
+    /// changed, so a login switch can save the outgoing view without forcing a
+    /// redundant write to `reports.txt`.
+    fn remember_collections_bucket(&mut self, user_key: &str) -> bool {
+        let band = collections_band_to_storage(self.collections_bucket_filter);
+        if self.report_prefs.collections_bucket(user_key) == band {
+            return false;
+        }
+        self.report_prefs.set_collections_bucket(user_key, band);
+        true
+    }
+
+    /// Persist the selected band so a restart restores the same triage view.
+    fn persist_collections_bucket(&mut self) {
+        let user_key = self.period_close_history_user_key();
+        if !self.remember_collections_bucket(&user_key) {
+            return;
+        }
+        if let Err(err) = self.save_report_prefs() {
+            self.error = Some(format!("Could not save Collections aging band preference: {err}"));
         }
     }
 
@@ -2399,6 +2447,7 @@ impl OdApp {
     /// before loading the incoming user's view, then write both snapshots.
     fn switch_report_user_view(&mut self, previous_user_key: &str) {
         self.report_prefs.snapshot_user_options(previous_user_key);
+        self.remember_collections_bucket(previous_user_key);
         self.load_report_user_view();
         if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save report preferences: {err}"));
@@ -8916,6 +8965,7 @@ impl OdApp {
                     .clicked()
                 {
                     self.collections_bucket_filter = None;
+                    self.persist_collections_bucket();
                 }
                 for bucket in CollectionsAgingBucket::ALL {
                     let totals = bucket_totals[bucket.index()];
@@ -8928,6 +8978,7 @@ impl OdApp {
                         .clicked()
                     {
                         self.collections_bucket_filter = Some(bucket);
+                        self.persist_collections_bucket();
                     }
                 }
             });
@@ -12551,6 +12602,9 @@ mod tests {
     #[test]
     fn export_paths_follow_the_signed_in_user() {
         let mut app = OdApp::new();
+        // GUI verification writes real preferences to disk; start clean so this
+        // test does not inherit a saved report kind from another session.
+        app.report_prefs = ReportPreferences::default();
         let key = app.period_close_history_user_key();
         app.report_prefs.set_user_export_path(
             key.clone(),
@@ -12595,6 +12649,86 @@ mod tests {
         app.load_report_sort(ReportKind::Collections);
         assert_eq!(app.report_sort_column, 4);
         assert!(!app.report_sort_desc);
+    }
+
+    #[test]
+    fn collections_band_storage_mapping_round_trips_every_choice() {
+        for band in [
+            CollectionsAgingBand::All,
+            CollectionsAgingBand::Current,
+            CollectionsAgingBand::Days31To60,
+            CollectionsAgingBand::Days61To90,
+            CollectionsAgingBand::Over90,
+        ] {
+            assert_eq!(
+                collections_band_to_storage(collections_band_from_storage(band)),
+                band
+            );
+        }
+    }
+
+    #[test]
+    fn collections_aging_band_follows_the_signed_in_user() {
+        let mut app = OdApp::new();
+        // Ignore bands saved by an earlier run so a fresh user really has none.
+        app.report_prefs = ReportPreferences::default();
+        let local_key = app.period_close_history_user_key();
+        app.collections_bucket_filter = Some(CollectionsAgingBucket::Over90);
+        app.persist_collections_bucket();
+        assert_eq!(
+            app.report_prefs.collections_bucket(&local_key),
+            CollectionsAgingBand::Over90
+        );
+
+        app.session = Some(Session {
+            user_num: 7,
+            user_name: "aharrison".into(),
+            permissions: Permission::ALL.to_vec(),
+        });
+        let named_key = app.period_close_history_user_key();
+        assert_eq!(named_key, "user-7");
+        app.switch_report_user_view(&local_key);
+        assert_eq!(
+            app.collections_bucket_filter, None,
+            "a user with no saved band starts unfiltered"
+        );
+
+        app.collections_bucket_filter = Some(CollectionsAgingBucket::Current);
+        app.persist_collections_bucket();
+        app.session = None;
+        app.switch_report_user_view(&named_key);
+        assert_eq!(
+            app.collections_bucket_filter,
+            Some(CollectionsAgingBucket::Over90),
+            "the local user's band comes back after logout"
+        );
+        assert_eq!(
+            app.report_prefs.collections_bucket(&named_key),
+            CollectionsAgingBand::Current
+        );
+    }
+
+    #[test]
+    fn collections_aging_band_survives_preferences_restart() {
+        let mut app = OdApp::new();
+        app.report_prefs = ReportPreferences::default();
+        app.session = Some(Session {
+            user_num: 7,
+            user_name: "aharrison".into(),
+            permissions: Permission::ALL.to_vec(),
+        });
+        app.collections_bucket_filter = Some(CollectionsAgingBucket::Days61To90);
+        app.persist_collections_bucket();
+
+        let text = app.report_prefs.to_text();
+        assert!(text.contains("collections_bucket.user-7=61-90"));
+        app.report_prefs = ReportPreferences::from_text(&text);
+        app.collections_bucket_filter = None;
+        app.load_report_user_view();
+        assert_eq!(
+            app.collections_bucket_filter,
+            Some(CollectionsAgingBucket::Days61To90)
+        );
     }
 
     /// Editable report dates mirror the live range and reject partial or
