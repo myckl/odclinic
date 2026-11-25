@@ -1139,6 +1139,14 @@ pub struct ReportDateRange {
     pub to: String,
 }
 
+/// How one report's table is sorted for one user. Kept separate from the
+/// report's filters so switching reports does not lose each table's order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReportSortState {
+    pub column: usize,
+    pub descending: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReportPreferences {
     /// Printed on exported CSV/HTML so a practice can identify its reports.
@@ -1217,6 +1225,9 @@ pub struct ReportPreferences {
     /// Last export path per report and signed-in user. Practice-wide `export.*`
     /// values stay as a fallback for users who have not chosen their own.
     user_export_paths: HashMap<String, HashMap<String, String>>,
+    /// Last column sort per report and signed-in user, so a restart or login
+    /// switch restores the order each user left the table in.
+    report_sorts: HashMap<String, HashMap<String, ReportSortState>>,
 }
 
 impl Default for ReportPreferences {
@@ -1256,6 +1267,7 @@ impl Default for ReportPreferences {
             report_ranges: HashMap::new(),
             report_kinds: HashMap::new(),
             user_export_paths: HashMap::new(),
+            report_sorts: HashMap::new(),
         }
     }
 }
@@ -1331,6 +1343,9 @@ impl ReportPreferences {
     /// Per-user export paths, e.g.
     /// `user_export_path.user-7.recall-asap=C%3A%5CReports%5Crecall.csv`.
     const USER_EXPORT_PATH_PREFIX: &'static str = "user_export_path.";
+    /// Per-user report sort order, e.g.
+    /// `report_sort.user-7.production.column=2`.
+    const REPORT_SORT_PREFIX: &'static str = "report_sort.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1366,6 +1381,28 @@ impl ReportPreferences {
     pub fn effective_export_path(&self, user_key: &str, report_key: &str) -> Option<&str> {
         self.user_export_path(user_key, report_key)
             .or_else(|| self.export_path(report_key))
+    }
+
+    /// Sort order saved by one user for one report. Unsorted tables are the
+    /// default, matching a fresh installation.
+    pub fn report_sort(&self, user_key: &str, report_key: &str) -> ReportSortState {
+        self.report_sorts
+            .get(user_key)
+            .and_then(|sorts| sorts.get(report_key))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_report_sort(
+        &mut self,
+        user_key: impl Into<String>,
+        report_key: impl Into<String>,
+        sort: ReportSortState,
+    ) {
+        self.report_sorts
+            .entry(user_key.into())
+            .or_default()
+            .insert(report_key.into(), sort);
     }
 
     pub fn period_close_history_view(&self, user_key: &str) -> Option<&PeriodCloseHistoryView> {
@@ -1410,6 +1447,7 @@ impl ReportPreferences {
         restored.report_ranges = std::mem::take(&mut self.report_ranges);
         restored.report_kinds = std::mem::take(&mut self.report_kinds);
         restored.user_export_paths = std::mem::take(&mut self.user_export_paths);
+        restored.report_sorts = std::mem::take(&mut self.report_sorts);
         *self = restored;
     }
 
@@ -1939,6 +1977,25 @@ impl ReportPreferences {
                 encoded
             ));
         }
+        let mut sort_users: Vec<_> = self.report_sorts.iter().collect();
+        sort_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, sorts) in sort_users {
+            let mut entries: Vec<_> = sorts.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (report_key, sort) in entries {
+                lines.push(format!(
+                    "{}{}.{}.column={}",
+                    Self::REPORT_SORT_PREFIX, user_key, report_key, sort.column
+                ));
+                lines.push(format!(
+                    "{}{}.{}.desc={}",
+                    Self::REPORT_SORT_PREFIX,
+                    user_key,
+                    report_key,
+                    Self::bool_text(sort.descending)
+                ));
+            }
+        }
         let mut path_users: Vec<_> = self.user_export_paths.iter().collect();
         path_users.sort_by(|a, b| a.0.cmp(b.0));
         for (user_key, paths) in path_users {
@@ -1994,6 +2051,27 @@ impl ReportPreferences {
                     .entry(user_key.to_string())
                     .or_default()
                     .insert(report_key.to_string(), decode_pref_value(value));
+            } else if let Some(sort_key) = key.strip_prefix(Self::REPORT_SORT_PREFIX) {
+                let Some((user_report_key, field)) = sort_key.rsplit_once('.') else {
+                    continue;
+                };
+                let Some((user_key, report_key)) = user_report_key.split_once('.') else {
+                    continue;
+                };
+                if user_key.is_empty() || report_key.is_empty() {
+                    continue;
+                }
+                let sort = prefs
+                    .report_sorts
+                    .entry(user_key.to_string())
+                    .or_default()
+                    .entry(report_key.to_string())
+                    .or_default();
+                match field {
+                    "column" => sort.column = value.parse().unwrap_or(0),
+                    "desc" => sort.descending = Self::parse_bool(value),
+                    _ => {}
+                }
             } else if let Some(view_key) = key.strip_prefix(Self::PERIOD_CLOSE_HISTORY_PREFIX) {
                 let Some((user_key, field)) = view_key.rsplit_once('.') else {
                     continue;
@@ -2638,6 +2716,84 @@ mod tests {
         assert_eq!(
             old.effective_export_path("local", "recall-asap"),
             Some("C:\\Old\\recall.csv")
+        );
+    }
+
+    #[test]
+    fn report_sort_round_trips_per_user_and_report() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_report_sort(
+            "local",
+            "production",
+            ReportSortState {
+                column: 3,
+                descending: true,
+            },
+        );
+        prefs.set_report_sort(
+            "user-1",
+            "production",
+            ReportSortState {
+                column: 1,
+                descending: false,
+            },
+        );
+        prefs.set_report_sort(
+            "user-1",
+            "patient-aging",
+            ReportSortState {
+                column: 5,
+                descending: true,
+            },
+        );
+
+        let text = prefs.to_text();
+        assert!(text.contains("report_sort.local.production.column=3"));
+        assert!(text.contains("report_sort.local.production.desc=true"));
+        assert!(text.contains("report_sort.user-1.patient-aging.column=5"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(
+            loaded.report_sort("local", "production"),
+            ReportSortState {
+                column: 3,
+                descending: true
+            }
+        );
+        assert_eq!(
+            loaded.report_sort("user-1", "production"),
+            ReportSortState {
+                column: 1,
+                descending: false
+            }
+        );
+        assert_eq!(
+            loaded.report_sort("user-1", "patient-aging"),
+            ReportSortState {
+                column: 5,
+                descending: true
+            }
+        );
+        assert_eq!(
+            loaded.report_sort("local", "patient-aging"),
+            ReportSortState::default()
+        );
+
+        // A login switch keeps every user's and every report's sort order.
+        loaded.restore_user_options("local");
+        assert_eq!(loaded.report_sort("user-1", "production").column, 1);
+        loaded.restore_user_options("user-1");
+        assert_eq!(loaded.report_sort("user-1", "patient-aging").column, 5);
+
+        let malformed = ReportPreferences::from_text(
+            "report_sort.local.production.column=nope\nreport_sort.local.production.desc=YES\n",
+        );
+        assert_eq!(
+            malformed.report_sort("local", "production"),
+            ReportSortState {
+                column: 0,
+                descending: true
+            }
         );
     }
 

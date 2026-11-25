@@ -64,7 +64,7 @@ use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
     CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView, PlanTypeFilter,
     ProcedureSheetMode, ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition,
-    ReportPreferences, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
+    ReportPreferences, ReportSortState, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
     EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
     CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
     REFERRAL_REPORT_FIELDS,
@@ -1736,13 +1736,15 @@ struct OdApp {
     report_to_text: String,
     report_export_path: String,
     report_export_kind: Option<ReportKind>,
+    /// Report whose saved sort was last loaded into the live sort fields.
+    report_sort_kind: Option<ReportKind>,
     /// Dedicated path for the payment-plan stale-resolved audit export, kept
     /// separate from the general report export so both files survive.
     pay_plan_audit_export_path: String,
     /// Practice name printed on exports and persisted in reports.txt.
     report_prefs: ReportPreferences,
-    /// Click-to-sort state for the report grid; the column index is validated
-    /// against the current table's headers before use.
+    /// Click-to-sort state for the report grid; restored per user and report,
+    /// with the column index validated against the current table's headers.
     report_sort_column: usize,
     report_sort_desc: bool,
     /// Filters for the read-only Period close history report. Blank fields and
@@ -2013,6 +2015,7 @@ impl OdApp {
             report_to_text: today.format("%Y-%m-%d").to_string(),
             report_export_path: String::new(),
             report_export_kind: None,
+            report_sort_kind: None,
             pay_plan_audit_export_path: persisted_export_path(
                 &report_prefs,
                 &startup_user_key,
@@ -2249,6 +2252,34 @@ impl OdApp {
             .map(str::to_string)
             .unwrap_or_else(|| default_report_path(self.report, "csv"));
         self.report_export_kind = Some(self.report);
+        self.load_report_sort(self.report);
+    }
+
+    /// Restore the saved column sort for one report. Called on startup, after a
+    /// login switch, and when the Reports picker changes.
+    fn load_report_sort(&mut self, kind: ReportKind) {
+        let key = self.period_close_history_user_key();
+        let sort = self.report_prefs.report_sort(&key, kind.file_stem());
+        self.report_sort_column = sort.column;
+        self.report_sort_desc = sort.descending;
+        self.report_sort_kind = Some(kind);
+    }
+
+    /// Persist the live sort order for one report so it survives a restart or a
+    /// switch back from another user.
+    fn persist_report_sort(&mut self, report_key: &str) {
+        let user_key = self.period_close_history_user_key();
+        let sort = ReportSortState {
+            column: self.report_sort_column,
+            descending: self.report_sort_desc,
+        };
+        if self.report_prefs.report_sort(&user_key, report_key) == sort {
+            return;
+        }
+        self.report_prefs.set_report_sort(user_key, report_key, sort);
+        if let Err(err) = self.save_report_prefs() {
+            self.error = Some(format!("Could not save report sort preference: {err}"));
+        }
     }
 
     /// Replace both the live dates and their editable text. Loading a saved
@@ -5945,6 +5976,9 @@ impl OdApp {
                 .unwrap_or_else(|| default_report_path(current, "csv"));
             self.report_export_kind = Some(current);
         }
+        if self.report_sort_kind != Some(current) {
+            self.load_report_sort(current);
+        }
 
         ui.horizontal(|ui| {
             egui::ComboBox::from_label("Report")
@@ -6023,6 +6057,7 @@ impl OdApp {
                 .map(str::to_string)
                 .unwrap_or_else(|| default_report_path(current, "csv"));
             self.report_export_kind = Some(current);
+            self.load_report_sort(current);
             self.persist_selected_report_kind();
         }
         if !current.uses_date_range() {
@@ -8704,6 +8739,7 @@ impl OdApp {
         if self.report_sort_column >= table.headers.len() {
             self.report_sort_column = 0;
             self.report_sort_desc = false;
+            self.persist_report_sort(current.file_stem());
         }
 
         // Click-to-sort header row. Keeping it separate from the data grid
@@ -8726,6 +8762,7 @@ impl OdApp {
                         self.report_sort_column = index;
                         self.report_sort_desc = false;
                     }
+                    self.persist_report_sort(current.file_stem());
                 }
             }
             ui.label("(click a column to sort; exports use this order)");
@@ -12298,6 +12335,35 @@ mod tests {
             app.report_prefs.effective_export_path(&key, "account-audit.12"),
             Some("D:\\Audit\\12.csv")
         );
+    }
+
+    #[test]
+    fn report_sort_follows_the_signed_in_user_and_report() {
+        let mut app = OdApp::new();
+        let key = app.period_close_history_user_key();
+        app.report_prefs.set_report_sort(
+            key.clone(),
+            ReportKind::Production.file_stem(),
+            ReportSortState {
+                column: 2,
+                descending: true,
+            },
+        );
+        app.report_prefs.set_report_sort(
+            key,
+            ReportKind::Collections.file_stem(),
+            ReportSortState {
+                column: 4,
+                descending: false,
+            },
+        );
+
+        app.load_report_sort(ReportKind::Production);
+        assert_eq!(app.report_sort_column, 2);
+        assert!(app.report_sort_desc);
+        app.load_report_sort(ReportKind::Collections);
+        assert_eq!(app.report_sort_column, 4);
+        assert!(!app.report_sort_desc);
     }
 
     /// Editable report dates mirror the live range and reject partial or
