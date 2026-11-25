@@ -76,12 +76,13 @@ pub use od_domain::reports::{
 };
 pub use reports::{
     active_patient_report, adj_sheet_report, aging_report, appointments_report, asap_report,
-    birthday_report, broken_appointments_report, confirmation_report, custom_aging_report,
-    finance_charge_report,
+    birthday_report, broken_appointments_report, collections_worklist, confirmation_report,
+    custom_aging_report, finance_charge_report,
     new_patient_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, payment_plan_report,
     patients_report, prescriptions_report, procedure_codes_report, prod_inc_report, procedure_sheet_report,
     recall_fields_report, recall_report, referral_analysis_report, referrals_report,
-    render_report_csv, render_report_html, treatment_plan_report, ReportRow, ReportTable,
+    render_report_csv, render_report_html, treatment_plan_report, CollectionsRow, ReportRow,
+    ReportTable,
 };
 pub use reports_upstream::{
     balance_sheet_report, carrier_label_addresses, dental_sealant_measure_report, discount_plan_report,

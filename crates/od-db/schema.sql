@@ -347,6 +347,7 @@ CREATE TABLE IF NOT EXISTS paysplit (
   ProcNum bigint NOT NULL DEFAULT 0,
   SplitAmt double NOT NULL DEFAULT 0,
   DatePay date NOT NULL,
+  ProcDate date NOT NULL DEFAULT '2000-01-01',
   ProvNum bigint NOT NULL DEFAULT 0,
   PayPlanNum bigint NOT NULL DEFAULT 0,
   AdjNum bigint NOT NULL DEFAULT 0,

@@ -330,6 +330,10 @@ fn ensure_pay_plan_schema(conn: &mut PooledConn) -> Result<(), String> {
         &[
             ("PayPlanChargeNum", "bigint NOT NULL DEFAULT 0"),
             ("PayPlanDebitType", "int NOT NULL DEFAULT 0"),
+            // record_payment_splits writes OD's paysplit.ProcDate alongside
+            // DatePay. Fresh schemas include it, but older demo databases do
+            // not, which would make every payment write fail.
+            ("ProcDate", "date NOT NULL DEFAULT '2000-01-01'"),
         ],
     )
 }

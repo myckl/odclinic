@@ -248,7 +248,7 @@ to the OD tables with their original column names.
 
 ### Live database verification
 
-Sixteen ignored integration tests check the backend against a real OD schema:
+Thirty-seven ignored integration tests check the backend against a real OD schema:
 
 ```bash
 # Read every table/column the port uses
@@ -262,8 +262,11 @@ This runs `mysql_backend_reads_compatible_od_tables`,
 `mysql_backend_supports_billing_tables`. The write tests create one temporary
 patient, one temporary appointment and one temporary `securitylog` row, plus one
 temporary `adjustment` and a `payment`/`paysplit` pair, read them back, then
-delete them before asserting. Two more tests cover payment plans, multi-split
-payments and statement rows; `mysql_backend_supports_recall_and_asap` writes a
+delete them before asserting. More tests cover payment plans, multi-split
+payments and statement rows; `mysql_backend_collections_worklist_tracks_patient_payment`
+checks that a temporary overdue charge appears in the per-patient worklist and
+that a recorded payment reduces that same balance.
+`mysql_backend_supports_recall_and_asap` writes a
 temporary `recall` and ASAP-flagged `appointment`, reads both back through the
 `Store` API and deletes them. `mysql_eservices_rules_outbox_and_dedupe_round_trip`
 adds a temporary `apptreminderrule` rule, a port-local patient contact, a dedupe
@@ -396,11 +399,20 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   Enabled by default; toggle **Payment plans** off in Settings to hide the whole
   feature.
 * **Multi-split payments:** the Record payment dialog allocates one payment
-  across several procedures, payment plans or unallocated cash, with a live
-  "allocated vs payment" check. It writes one `payment` row and one `paysplit`
-  row per allocation in a single transaction, so a single cheque covering a
-  family's treatment is recorded as OD expects. Allocation amounts must sum to
+  across several procedures, payment plans or unallocated cash **for one
+  individual patient**, with a live "allocated vs payment" check. It writes one
+  `payment` row and one `paysplit` row per allocation in a single transaction.
+  There is no family, guarantor or cross-patient target picker: every split
+  stays inside the selected patient's account. Allocation amounts must sum to
   `payment.PayAmt`.
+* **Collections worklist:** the Collections report is an actionable, per-patient
+  list of outstanding accounts sorted oldest-first. It shows the patient-only
+  balance, days overdue (from the oldest still-unpaid charge after credits are
+  applied oldest-first), last payment, amount due now on open payment plans and
+  a contact number. Each row can **Open account**, **Record payment** or
+  generate a **Statement**, so staff can close the collection loop without
+  leaving the report. The exported CSV/HTML uses exactly the visible, sorted
+  rows. Zero and credit balances are hidden, as in OD's collection lists.
 * **Statements:** generate a patient-only statement (charges, adjustments,
   payments and per-plan balances, with no insurance columns), write a dated OD
   `statement` row and open a print-ready HTML page in the browser. **Save PDF**
@@ -778,8 +790,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
     `claimsnapshot.Writeoff` (a `-1` nulls to 0) on the procedure date and the
     remaining delta on `DateSuppReceived`. Because this port has no
     `claimproc.DateCP`, `DateSuppReceived` (falling back to the procedure date)
-    stands in for OD's insurance payment date. **Family** grouping aggregates
-    every member's transactions under `patient.Guarantor`; provider, clinic,
+    stands in for OD's insurance payment date. An upstream **Family** grouping
+    option remains a display-only compatibility choice for that report; it is
+    never used for payments, balances or the Collections worklist, which always
+    treat each patient as an individual. Provider, clinic,
     billing-type and patient-status filters apply to that grouped row. `Billing
     Types` (none selected = all), **Exclude inactive** (`PatStatus != 2`) and
     **Exclude archive** (`PatStatus != 3`) mirror upstream's final WHERE.
@@ -854,9 +868,10 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
       figure, the variance and an explicit `OK` or `OUT OF BALANCE` status, so a
       missing posting, a duplicate or an unsourced manual journal entry cannot
       hide behind a report that merely looks complete. It also shows the A/R
-      closing balance, the paysplit collections used by the Collections report,
-      and an unposted-source count. Together these turn period close into one
-      reviewed run: **Post all unposted sources**, then re-run the tie-out until
+      closing balance, the paysplit collections that fund patient balances in
+      the Collections worklist, and an unposted-source count. Together these
+      turn period close into one reviewed run: **Post all unposted sources**,
+      then re-run the tie-out until
       every check reads `OK`. On by default with the same feature toggle.
       Closing is now an enforced gate, not just a report: once the tie-out
       reconciles, **Close period** signs off the month shown in the range. It

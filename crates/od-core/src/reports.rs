@@ -25,7 +25,7 @@ use od_domain::reports::{
 use od_domain::*;
 
 use crate::{
-    asap_appointments, recall_due_date, recall_due_state,
+    asap_appointments, pay_plan_due_now, recall_due_date, recall_due_state,
     treat_plan_total, RecallDueState,
 };
 
@@ -387,6 +387,161 @@ pub fn treatment_plan_report(
         format!("{total:.2}"),
         format!("{} plan(s)", plans.len()),
     ));
+    rows
+}
+
+// ---------------------------------------------------------------------------
+// Individual-patient collections worklist
+// ---------------------------------------------------------------------------
+
+/// One actionable row in the Collections worklist. Every row is exactly one
+/// patient account: there is no family/guarantor grouping or cross-patient
+/// allocation here, matching this port's individual-patient domain model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollectionsRow {
+    pub pat_num: Id,
+    pub patient: String,
+    /// Patient-only balance: completed charges + adjustments − paysplits.
+    pub balance: f64,
+    /// Days from the oldest still-unpaid charge to `as_of`; 0 when current.
+    pub days_overdue: i64,
+    pub last_payment: Option<NaiveDate>,
+    /// Amount due now across this patient's open payment plans.
+    pub plan_due_now: f64,
+    /// Mobile number first, falling back to the home number.
+    pub phone: String,
+}
+
+impl CollectionsRow {
+    pub fn as_table_row(&self) -> Vec<String> {
+        vec![
+            self.patient.clone(),
+            format!("{:.2}", self.balance),
+            self.days_overdue.to_string(),
+            self.last_payment
+                .map(|date| date.to_string())
+                .unwrap_or_default(),
+            format!("{:.2}", self.plan_due_now),
+            self.phone.clone(),
+        ]
+    }
+}
+
+/// Patients with an outstanding individual balance, oldest debt first.
+///
+/// Uses the same patient-only arithmetic as the Account view and the aging
+/// report: only completed procedures and adjustments dated on or before
+/// `as_of` are charges, and paysplits dated on or before `as_of` are credits.
+/// Credits are applied to the oldest charge first, so `days_overdue` starts
+/// from the oldest charge that still has an unpaid portion. Payment plans are
+/// reported alongside the account balance but are not added to it (OD records
+/// their payments as paysplits already).
+pub fn collections_worklist(
+    patients: &[Patient],
+    procedures: &[Procedure],
+    adjustments: &[Adjustment],
+    splits: &[PaySplit],
+    plans: &[PayPlan],
+    plan_charges: &[PayPlanCharge],
+    as_of: NaiveDate,
+) -> Vec<CollectionsRow> {
+    let mut rows = Vec::new();
+    for patient in patients {
+        let mut charges: Vec<(NaiveDate, f64)> = procedures
+            .iter()
+            .filter(|p| {
+                p.pat_num == patient.pat_num
+                    && p.proc_status.is_completed()
+                    && p.proc_date <= as_of
+            })
+            .map(|p| (p.proc_date, p.fee))
+            .chain(
+                adjustments
+                    .iter()
+                    .filter(|a| a.pat_num == patient.pat_num && a.adj_date <= as_of)
+                    .map(|a| (a.adj_date, a.adj_amount)),
+            )
+            .collect();
+        let patient_splits: Vec<&PaySplit> = splits
+            .iter()
+            .filter(|s| s.pat_num == patient.pat_num && s.date_pay <= as_of)
+            .collect();
+        let credits: f64 = patient_splits.iter().map(|s| s.split_amount).sum();
+        let balance: f64 = charges.iter().map(|(_, amount)| *amount).sum::<f64>() - credits;
+        // OD hides zero and credit balances from collection lists.
+        if balance <= 0.005 {
+            continue;
+        }
+
+        // Apply credits oldest-first to date the oldest still-unpaid charge.
+        charges.sort_by_key(|(date, _)| *date);
+        let mut credit_left = credits;
+        let mut oldest_unpaid = None;
+        for (date, amount) in &charges {
+            if *amount <= 0.0 {
+                // Negative adjustments behave like extra credit.
+                credit_left -= *amount;
+                continue;
+            }
+            let applied = credit_left.min(*amount);
+            credit_left -= applied;
+            if *amount - applied > 0.005 {
+                oldest_unpaid = Some(*date);
+                break;
+            }
+        }
+        let days_overdue = oldest_unpaid
+            .map(|date| (as_of - date).num_days().max(0))
+            .unwrap_or(0);
+
+        let plan_due_now: f64 = plans
+            .iter()
+            .filter(|plan| plan.pat_num == patient.pat_num && !plan.is_closed)
+            .map(|plan| {
+                let plan_charge_rows: Vec<PayPlanCharge> = plan_charges
+                    .iter()
+                    .filter(|charge| charge.pay_plan_num == plan.pay_plan_num)
+                    .cloned()
+                    .collect();
+                let plan_split_rows: Vec<PaySplit> = patient_splits
+                    .iter()
+                    .copied()
+                    .filter(|split| split.pay_plan_num == plan.pay_plan_num)
+                    .cloned()
+                    .collect();
+                pay_plan_due_now(plan, &plan_charge_rows, &plan_split_rows, as_of)
+            })
+            .sum();
+        // Floating-point cancellation can leave a tiny negative residue that
+        // formats as "-0.00"; a paid-off plan is simply zero.
+        let plan_due_now = if plan_due_now.abs() < 0.005 {
+            0.0
+        } else {
+            plan_due_now
+        };
+
+        let phone = if patient.wireless_phone.trim().is_empty() {
+            patient.home_phone.clone()
+        } else {
+            patient.wireless_phone.clone()
+        };
+
+        rows.push(CollectionsRow {
+            pat_num: patient.pat_num,
+            patient: patient.display_name(),
+            balance,
+            days_overdue,
+            last_payment: patient_splits.iter().map(|split| split.date_pay).max(),
+            plan_due_now,
+            phone,
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.days_overdue
+            .cmp(&a.days_overdue)
+            .then_with(|| b.balance.total_cmp(&a.balance))
+            .then_with(|| a.patient.cmp(&b.patient))
+    });
     rows
 }
 
@@ -3915,6 +4070,171 @@ mod tests {
             f_name: "Ada".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn collections_worklist_ages_oldest_unpaid_charge_after_credits() {
+        let patients = [
+            patient(1, "Alvarez"),
+            patient(2, "Bennett"),
+            patient(3, "Chen"),
+            patient(4, "Diaz"),
+        ];
+        let procedures = [
+            Procedure {
+                proc_num: 1,
+                pat_num: 1,
+                proc_date: day(2026, 1, 1),
+                proc_status: ProcedureStatus::Complete,
+                fee: 100.0,
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 2,
+                pat_num: 1,
+                proc_date: day(2026, 6, 1),
+                proc_status: ProcedureStatus::Complete,
+                fee: 100.0,
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 3,
+                pat_num: 2,
+                proc_date: day(2026, 5, 1),
+                proc_status: ProcedureStatus::Complete,
+                fee: 200.0,
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 4,
+                pat_num: 3,
+                proc_date: day(2026, 1, 1),
+                proc_status: ProcedureStatus::Complete,
+                fee: 100.0,
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 5,
+                pat_num: 4,
+                proc_date: day(2026, 1, 1),
+                proc_status: ProcedureStatus::Complete,
+                fee: 100.0,
+                ..Default::default()
+            },
+            // Treatment-planned work is not a charge.
+            Procedure {
+                proc_num: 6,
+                pat_num: 2,
+                proc_date: day(2025, 1, 1),
+                fee: 900.0,
+                ..Default::default()
+            },
+        ];
+        let splits = [
+            // The 150 credit clears the old Alvarez charge first, so the
+            // remaining 50 is dated from the June charge, not January.
+            PaySplit {
+                pat_num: 1,
+                split_amount: 150.0,
+                date_pay: day(2026, 6, 15),
+                ..Default::default()
+            },
+            PaySplit {
+                pat_num: 3,
+                split_amount: 100.0,
+                date_pay: day(2026, 6, 15),
+                ..Default::default()
+            },
+            PaySplit {
+                pat_num: 4,
+                split_amount: 120.0,
+                date_pay: day(2026, 6, 15),
+                ..Default::default()
+            },
+        ];
+        let rows = collections_worklist(
+            &patients,
+            &procedures,
+            &[],
+            &splits,
+            &[],
+            &[],
+            day(2026, 7, 1),
+        );
+        // Chen is paid, Diaz has a credit balance; neither is collectable.
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].patient, "Bennett, Ada");
+        assert_eq!(rows[0].balance, 200.0);
+        assert_eq!(rows[0].days_overdue, 61);
+        assert_eq!(rows[0].last_payment, None);
+        assert_eq!(rows[1].patient, "Alvarez, Ada");
+        assert_eq!(rows[1].balance, 50.0);
+        assert_eq!(rows[1].days_overdue, 30);
+        assert_eq!(rows[1].last_payment, Some(day(2026, 6, 15)));
+    }
+
+    #[test]
+    fn collections_worklist_shows_plan_due_and_contact_number() {
+        let mut patient = patient(9, "Hailu");
+        patient.wireless_phone = String::new();
+        patient.home_phone = "+251 11 222 333".into();
+        let procedures = [Procedure {
+            proc_num: 1,
+            pat_num: 9,
+            proc_date: day(2026, 6, 1),
+            proc_status: ProcedureStatus::Complete,
+            fee: 200.0,
+            ..Default::default()
+        }];
+        let plans = [PayPlan {
+            pay_plan_num: 7,
+            pat_num: 9,
+            guarantor: 9,
+            pay_plan_date: day(2026, 6, 1),
+            ..Default::default()
+        }];
+        let plan_charges = [PayPlanCharge {
+            pay_plan_charge_num: 1,
+            pay_plan_num: 7,
+            pat_num: 9,
+            charge_date: day(2026, 6, 1),
+            charge_type: PayPlanChargeType::Debit,
+            principal: 100.0,
+            ..Default::default()
+        }];
+        let splits = [
+            PaySplit {
+                pat_num: 9,
+                split_amount: 25.0,
+                date_pay: day(2026, 6, 20),
+                pay_plan_num: 7,
+                ..Default::default()
+            },
+            PaySplit {
+                pat_num: 9,
+                split_amount: 25.0,
+                date_pay: day(2026, 6, 21),
+                ..Default::default()
+            },
+        ];
+        let rows = collections_worklist(
+            &[patient],
+            &procedures,
+            &[],
+            &splits,
+            &plans,
+            &plan_charges,
+            day(2026, 7, 1),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].pat_num, 9);
+        assert_eq!(rows[0].balance, 150.0);
+        assert_eq!(rows[0].plan_due_now, 75.0);
+        assert_eq!(rows[0].phone, "+251 11 222 333");
+        assert_eq!(rows[0].last_payment, Some(day(2026, 6, 21)));
+        let values = rows[0].as_table_row();
+        assert_eq!(values[1], "150.00");
+        assert_eq!(values[4], "75.00");
     }
 
     #[test]

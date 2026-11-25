@@ -13,7 +13,8 @@ use mysql::prelude::Queryable;
 use od_core::{
     account_summary_without_insurance, active_patient_report, adj_sheet_report, aging_report,
     appointments_report, asap_report, balance_sheet_report, birthday_report,
-    broken_appointments_report, build_statement_document, ClosedPeriods, confirmation_report,
+    broken_appointments_report, build_statement_document, collections_worklist, ClosedPeriods,
+    confirmation_report,
     custom_aging_report,
     dental_sealant_measure_report, discount_amount, discount_plan_report, dpp_overcharged_report,
     annual_bucket, charge_generation_block, generate_plan_charges, DiscountInput, FrequencyCodeSets,
@@ -586,6 +587,121 @@ fn mysql_backend_writes_multi_split_payments() {
     pay_write.expect("record_payment_splits failed");
     assert!(split_cleanup.is_ok(), "paysplit cleanup failed");
     assert!(pay_cleanup.is_ok(), "payment cleanup failed");
+}
+
+/// End-to-end individual-patient collection path: an overdue completed charge
+/// appears in the worklist, a recorded payment reduces that same patient's
+/// balance, and all temporary rows are removed. Constructing `MySqlStore` also
+/// verifies the `paysplit.ProcDate` schema fix that payment writes depend on.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes temporary collection rows"]
+fn mysql_backend_collections_worklist_tracks_patient_payment() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    let proc_date_columns: u64 = conn
+        .query_first(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'paysplit' \
+             AND COLUMN_NAME = 'ProcDate'",
+        )
+        .expect("could not inspect paysplit schema")
+        .unwrap_or(0);
+    assert_eq!(
+        proc_date_columns, 1,
+        "paysplit.ProcDate must exist before any payment write"
+    );
+
+    let pat_num = 2_100_000_010u32;
+    let mut patient = Patient::default();
+    patient.pat_num = pat_num;
+    patient.l_name = "ODCLINIC_LIVE_COLLECTIONS".into();
+    patient.f_name = "TEMP".into();
+    patient.home_phone = "+251 11 000 000".into();
+    store
+        .upsert_patient(&patient)
+        .expect("temporary patient write failed");
+
+    let as_of = NaiveDate::from_ymd_opt(2099, 6, 1).unwrap();
+    let mut procedure = Procedure::default();
+    procedure.pat_num = pat_num;
+    procedure.proc_date = NaiveDate::from_ymd_opt(2099, 4, 1).unwrap();
+    procedure.fee = 300.0;
+    let proc_num = store
+        .insert_procedure(&procedure)
+        .expect("temporary procedure write failed");
+    store
+        .set_procedure_complete(proc_num, 0.0)
+        .expect("could not complete temporary procedure");
+
+    let worklist_for = || {
+        let patients = store.list_patients().unwrap_or_default();
+        let mut procedures = Vec::new();
+        let mut splits = Vec::new();
+        for p in &patients {
+            procedures.extend(store.list_procedures(p.pat_num).unwrap_or_default());
+            splits.extend(store.list_pay_splits(p.pat_num).unwrap_or_default());
+        }
+        collections_worklist(&patients, &procedures, &[], &splits, &[], &[], as_of)
+            .into_iter()
+            .find(|row| row.pat_num == pat_num)
+    };
+
+    let before = worklist_for().expect("overdue patient missing from worklist");
+    assert_eq!(before.balance, 300.0);
+    assert_eq!(before.days_overdue, 61);
+    assert_eq!(before.phone, "+251 11 000 000");
+
+    let payment = Payment {
+        pat_num,
+        pay_date: as_of,
+        pay_amount: 100.0,
+        note: "ODCLINIC_LIVE_COLLECTIONS_PAY".into(),
+        ..Default::default()
+    };
+    let allocation = PaymentAllocation {
+        target: PaymentTarget::Procedure(proc_num),
+        amount: 100.0,
+        ..Default::default()
+    };
+    let pay_write = store.record_payment_splits(&payment, &[allocation]);
+    let pay_num = pay_write.clone().unwrap_or(0);
+
+    let after = worklist_for().expect("patient missing from worklist after payment");
+    assert_eq!(after.balance, 200.0, "payment did not reduce the balance");
+    assert_eq!(
+        after.days_overdue, 61,
+        "partially paid charge keeps its original due date"
+    );
+    assert_eq!(after.last_payment, Some(as_of));
+
+    // Delete children before their parents.
+    let split_cleanup = conn.query_drop(format!("DELETE FROM paysplit WHERE PayNum = {pay_num}"));
+    let pay_cleanup = conn.query_drop(format!("DELETE FROM payment WHERE PayNum = {pay_num}"));
+    let proc_cleanup = conn.query_drop(format!("DELETE FROM procedurelog WHERE ProcNum = {proc_num}"));
+    let patient_cleanup = store.delete_patient(pat_num);
+    println!(
+        "collection cleanup: split {:?}, payment {:?}, procedure {:?}, patient {:?}",
+        split_cleanup.is_ok(),
+        pay_cleanup.is_ok(),
+        proc_cleanup.is_ok(),
+        patient_cleanup.is_ok()
+    );
+
+    pay_write.expect("record_payment_splits failed");
+    assert!(split_cleanup.is_ok(), "paysplit cleanup failed");
+    assert!(pay_cleanup.is_ok(), "payment cleanup failed");
+    assert!(proc_cleanup.is_ok(), "procedurelog cleanup failed");
+    assert!(patient_cleanup.is_ok(), "patient cleanup failed");
 }
 
 /// Writes a temporary payment plan, one charge and a plan-linked payment,

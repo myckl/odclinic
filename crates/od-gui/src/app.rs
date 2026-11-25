@@ -18,6 +18,7 @@ use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
     adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
+    collections_worklist, CollectionsRow,
     build_adjustment_journal, build_invoice_document, build_journal_batches,
     build_payment_journal, build_posting_batch_plan_with_closed,
     build_refund_transfer_receipt, build_statement_document,
@@ -102,6 +103,33 @@ fn open_in_browser(target: &str) -> Result<(), String> {
 // mutates sorting state). OD splits can reference patients other than the one
 // who paid, so the per-patient reads are de-duplicated by primary key.
 // ---------------------------------------------------------------------------
+
+/// Row action offered by the per-patient Collections worklist.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CollectionsAction {
+    OpenAccount,
+    RecordPayment,
+    Statement,
+}
+
+/// Sort the worklist by the same visible values the exported grid uses, so the
+/// action buttons stay aligned with the row the staff member clicked.
+fn sort_collections_rows(rows: &mut [CollectionsRow], column: usize, descending: bool) {
+    if column >= 6 {
+        return;
+    }
+    rows.sort_by(|a, b| {
+        let left = a.as_table_row();
+        let right = b.as_table_row();
+        match (left[column].parse::<f64>(), right[column].parse::<f64>()) {
+            (Ok(x), Ok(y)) => x.total_cmp(&y),
+            _ => left[column].cmp(&right[column]),
+        }
+    });
+    if descending {
+        rows.reverse();
+    }
+}
 
 fn gather_procedures(store: &dyn Store, patients: &[Patient]) -> Vec<Procedure> {
     let mut out = Vec::new();
@@ -1728,6 +1756,9 @@ struct OdApp {
     treat_plan_line_fee_text: String,
 
     report: ReportKind,
+    /// Rows behind the interactive Collections worklist. The exported report
+    /// grid only carries strings, so actions read the patient numbers here.
+    collections_rows: Vec<CollectionsRow>,
     report_from: NaiveDate,
     report_to: NaiveDate,
     /// Editable ISO copies of the reporting window. Invalid text is kept on
@@ -2009,6 +2040,7 @@ impl OdApp {
             treat_plan_line_tooth_text: String::new(),
             treat_plan_line_fee_text: String::new(),
             report: ReportKind::Production,
+            collections_rows: Vec::new(),
             report_from: today - Duration::days(30),
             report_to: today,
             report_from_text: (today - Duration::days(30)).format("%Y-%m-%d").to_string(),
@@ -5176,59 +5208,7 @@ impl OdApp {
             ui.horizontal(|ui| {
                 if billing_edits && self.can(Permission::BILLING) {
                     if ui.button("Generate statement").clicked() {
-                        let today = chrono::Local::now().date_naive();
-                        let patient_name = self
-                            .store
-                            .get_patient(num)
-                            .ok()
-                            .flatten()
-                            .map(|p| p.display_name())
-                            .unwrap_or_else(|| format!("Patient #{num}"));
-                        let note = format!("Statement generated {}", today);
-                        let doc = build_statement_document(
-                            num,
-                            &patient_name,
-                            &procedures,
-                            &adjustments,
-                            &splits,
-                            &plans,
-                            &plan_charges,
-                            &summary,
-                            today,
-                            &note,
-                        );
-                        let html = render_statement_html(&doc);
-                        let statement = Statement {
-                            pat_num: num,
-                            date_sent: Some(today),
-                            note: note.clone(),
-                            is_invoice: false,
-                            ..Default::default()
-                        };
-                        match self.store.insert_statement(&statement) {
-                            Ok(statement_num) => {
-                                match open_statement_in_browser(&html, num) {
-                                    Ok(path) => {
-                                        self.audit_if(
-                                            FeatureKey::AuditBillingChanges,
-                                            Permission::BILLING,
-                                            num,
-                                            format!(
-                                                "Statement {statement_num} generated for {patient_name}: balance {:.2}, {} line(s), opened {path}",
-                                                doc.balance,
-                                                doc.lines.len()
-                                            ),
-                                        );
-                                        self.notice = Some(format!(
-                                            "Statement {statement_num} generated and opened for printing"
-                                        ));
-                                        self.error = None;
-                                    }
-                                    Err(e) => self.error = Some(e),
-                                }
-                            }
-                            Err(e) => self.error = Some(e),
-                        }
+                        self.generate_statement_for(num);
                     }
                 }
             });
@@ -5953,6 +5933,133 @@ impl OdApp {
     }
 
     // ---------------------------------------------------------------- Reports
+
+    /// Navigate a Collections row's individual patient into the Account view.
+    fn open_patient_account(&mut self, pat_num: Id) -> bool {
+        if !self.features.module_enabled(Module::Account) {
+            self.error = Some("Account module is turned off in Settings".into());
+            return false;
+        }
+        self.selected_patient = Some(pat_num);
+        self.module = Module::Account;
+        self.show_settings = false;
+        self.error = None;
+        true
+    }
+
+    /// Shared by the Account view and the Collections worklist so both paths
+    /// create an identical patient-only statement and audit it the same way.
+    fn generate_statement_for(&mut self, num: Id) {
+        let today = Local::now().date_naive();
+        let procedures = self.store.list_procedures(num).unwrap_or_default();
+        let adjustments = self.store.list_adjustments(num).unwrap_or_default();
+        let splits = self.store.list_pay_splits(num).unwrap_or_default();
+        let plans = self.store.list_pay_plans(num).unwrap_or_default();
+        let plan_charges = self.store.list_pay_plan_charges(num).unwrap_or_default();
+        let summary = account_summary_without_insurance(&procedures, &adjustments, &splits);
+        let patient_name = self
+            .store
+            .get_patient(num)
+            .ok()
+            .flatten()
+            .map(|p| p.display_name())
+            .unwrap_or_else(|| format!("Patient #{num}"));
+        let note = format!("Statement generated {}", today);
+        let doc = build_statement_document(
+            num,
+            &patient_name,
+            &procedures,
+            &adjustments,
+            &splits,
+            &plans,
+            &plan_charges,
+            &summary,
+            today,
+            &note,
+        );
+        let html = render_statement_html(&doc);
+        let statement = Statement {
+            pat_num: num,
+            date_sent: Some(today),
+            note: note.clone(),
+            is_invoice: false,
+            ..Default::default()
+        };
+        match self.store.insert_statement(&statement) {
+            Ok(statement_num) => match open_statement_in_browser(&html, num) {
+                Ok(path) => {
+                    self.audit_if(
+                        FeatureKey::AuditBillingChanges,
+                        Permission::BILLING,
+                        num,
+                        format!(
+                            "Statement {statement_num} generated for {patient_name}: balance {:.2}, {} line(s), opened {path}",
+                            doc.balance,
+                            doc.lines.len()
+                        ),
+                    );
+                    self.notice = Some(format!(
+                        "Statement {statement_num} generated and opened for printing"
+                    ));
+                    self.error = None;
+                }
+                Err(e) => self.error = Some(e),
+            },
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    fn apply_collections_action(&mut self, pat_num: Id, action: CollectionsAction) {
+        match action {
+            CollectionsAction::OpenAccount => {
+                if self.open_patient_account(pat_num) {
+                    self.notice = Some(format!("Opened account for patient #{pat_num}"));
+                }
+            }
+            CollectionsAction::RecordPayment => {
+                if !self.open_patient_account(pat_num) {
+                    return;
+                }
+                if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+                    && self.can(Permission::PAYMENT_CREATE))
+                {
+                    self.error =
+                        Some("Payment permission/feature required to record a payment".into());
+                    return;
+                }
+                let procedures = self.store.list_procedures(pat_num).unwrap_or_default();
+                self.payment_edit = Some(Payment {
+                    pat_num,
+                    pay_date: Local::now().date_naive(),
+                    ..Default::default()
+                });
+                self.payment_date_text = Local::now().format("%Y-%m-%d").to_string();
+                self.payment_amount_text.clear();
+                self.payment_rows = vec![PaymentRow {
+                    target: procedures
+                        .first()
+                        .map(|p| PaymentTarget::Procedure(p.proc_num))
+                        .unwrap_or(PaymentTarget::Unallocated),
+                    amount_text: String::new(),
+                }];
+                self.payment_edit_open = true;
+                self.error = None;
+            }
+            CollectionsAction::Statement => {
+                if !self.features.enabled(FeatureKey::AccountShowStatements) {
+                    self.error = Some("Statements are turned off in Settings".into());
+                    return;
+                }
+                if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+                    && self.can(Permission::BILLING))
+                {
+                    self.error = Some("Billing permission/feature required for statements".into());
+                    return;
+                }
+                self.generate_statement_for(pat_num);
+            }
+        }
+    }
 
     fn reports_ui(&mut self, ui: &mut Ui) {
         let enabled_reports: Vec<ReportKind> = ReportKind::ALL
@@ -7672,21 +7779,40 @@ impl OdApp {
                 }
             }
             ReportKind::Collections => {
-                let mut total = 0.0;
-                for p in &patients {
-                    // OD payments can be split across patients/procedures, so
-                    // collections are credited from paysplits, not payment totals.
-                    for split in self.store.list_pay_splits(p.pat_num).unwrap_or_default() {
-                        if split.date_pay >= self.report_from && split.date_pay <= self.report_to {
-                            total += split.split_amount;
-                        }
-                    }
+                // One row per individual patient with an outstanding balance.
+                // The report's end date is the "as of" date, matching the other
+                // balance reports; the start date is not used for aging.
+                let procedures = gather_procedures(&*self.store, &patients);
+                let adjustments = gather_adjustments(&*self.store, &patients);
+                let splits = gather_splits(&*self.store, &patients);
+                let plans = gather_pay_plans(&*self.store, &patients);
+                let plan_charges = gather_pay_plan_charges(&*self.store, &patients);
+                let worklist = collections_worklist(
+                    &patients,
+                    &procedures,
+                    &adjustments,
+                    &splits,
+                    &plans,
+                    &plan_charges,
+                    self.report_to,
+                );
+                let mut table = ReportTable::new(&[
+                    "Patient",
+                    "Balance Due",
+                    "Days Overdue",
+                    "Last Payment",
+                    "Plan Due Now",
+                    "Phone",
+                ]);
+                for row in &worklist {
+                    let values = row.as_table_row();
+                    table.rows.push(values);
                 }
-                rows.push(ReportRow::new(
-                    "Payments recorded",
-                    format!("{total:.2}"),
-                    format!("{} to {}", self.report_from, self.report_to),
-                ));
+                if worklist.is_empty() {
+                    table.push(&["No overdue patient accounts", "", "", "", "", ""]);
+                }
+                self.collections_rows = worklist;
+                upstream_table = Some(table);
             }
             ReportKind::Schedule => {
                 let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
@@ -8767,23 +8893,86 @@ impl OdApp {
             }
             ui.label("(click a column to sort; exports use this order)");
         });
-        table.sort_by_column(self.report_sort_column, self.report_sort_desc);
+        if current == ReportKind::Collections {
+            // Keep the exported grid and the clickable rows in the same order.
+            sort_collections_rows(
+                &mut self.collections_rows,
+                self.report_sort_column,
+                self.report_sort_desc,
+            );
+            let mut sorted = ReportTable {
+                headers: table.headers.clone(),
+                rows: Vec::new(),
+            };
+            for row in &self.collections_rows {
+                sorted.rows.push(row.as_table_row());
+            }
+            if sorted.rows.is_empty() {
+                sorted.rows.push(vec![
+                    "No overdue patient accounts".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ]);
+            }
+            table = sorted;
+        } else {
+            table.sort_by_column(self.report_sort_column, self.report_sort_desc);
+        }
 
         let practice = self.report_prefs.practice_name.clone();
         let csv = render_report_csv(current.label(), &practice, &table);
         let html = render_report_html(current.label(), &practice, &table);
 
+        if current == ReportKind::Collections {
+            let total_balance: f64 = self.collections_rows.iter().map(|row| row.balance).sum();
+            ui.label(format!(
+                "{} individual patient account(s) · total balance {:.2} · as of {}",
+                self.collections_rows.len(),
+                total_balance,
+                self.report_to
+            ));
+        }
+
+        // Collect clicks first so the grid can borrow the worklist immutably
+        // while the actions are applied to `self` afterwards.
+        let mut worklist_actions: Vec<(Id, CollectionsAction)> = Vec::new();
         egui::Grid::new("report_grid")
-            .num_columns(table.headers.len())
+            .num_columns(table.headers.len() + usize::from(current == ReportKind::Collections))
             .striped(true)
             .show(ui, |ui| {
-                for row in &table.rows {
+                for (index, row) in table.rows.iter().enumerate() {
                     for value in row {
                         ui.label(value);
+                    }
+                    if current == ReportKind::Collections {
+                        if let Some(entry) = self.collections_rows.get(index) {
+                            ui.horizontal(|ui| {
+                                if ui.button("Open account").clicked() {
+                                    worklist_actions
+                                        .push((entry.pat_num, CollectionsAction::OpenAccount));
+                                }
+                                if ui.button("Record payment").clicked() {
+                                    worklist_actions
+                                        .push((entry.pat_num, CollectionsAction::RecordPayment));
+                                }
+                                if ui.button("Statement").clicked() {
+                                    worklist_actions
+                                        .push((entry.pat_num, CollectionsAction::Statement));
+                                }
+                            });
+                        } else {
+                            ui.label("");
+                        }
                     }
                     ui.end_row();
                 }
             });
+        for (pat_num, action) in worklist_actions {
+            self.apply_collections_action(pat_num, action);
+        }
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Export");
@@ -12997,6 +13186,104 @@ mod tests {
         ];
         assert!(app.store.post_journal_batch(&bad).is_err());
         assert_eq!(app.store.list_journal_entries().unwrap().len(), before.len());
+    }
+
+    #[test]
+    fn collections_worklist_demo_rows_have_clean_money_formatting() {
+        let app = OdApp::new();
+        let patients = &app.patients;
+        let procedures = gather_procedures(&*app.store, patients);
+        let adjustments = gather_adjustments(&*app.store, patients);
+        let splits = gather_splits(&*app.store, patients);
+        let plans = gather_pay_plans(&*app.store, patients);
+        let plan_charges = gather_pay_plan_charges(&*app.store, patients);
+        let rows = collections_worklist(
+            patients,
+            &procedures,
+            &adjustments,
+            &splits,
+            &plans,
+            &plan_charges,
+            app.report_to,
+        );
+        assert!(!rows.is_empty(), "demo data should have overdue accounts");
+        for row in &rows {
+            // A paid-off plan must never render as "-0.00" in the worklist.
+            assert!(
+                row.plan_due_now >= 0.0,
+                "{} has a negative plan due: {:?}",
+                row.patient,
+                row.plan_due_now
+            );
+            assert!(
+                !row.as_table_row().iter().any(|cell| cell.starts_with("-0.00")),
+                "{} has a negative-zero cell: {:?}",
+                row.patient,
+                row.as_table_row()
+            );
+        }
+    }
+
+    #[test]
+    fn collections_worklist_sort_keeps_action_rows_aligned() {
+        let mut rows = vec![
+            CollectionsRow {
+                pat_num: 1,
+                patient: "Alvarez, Ada".into(),
+                balance: 50.0,
+                days_overdue: 30,
+                last_payment: None,
+                plan_due_now: 0.0,
+                phone: String::new(),
+            },
+            CollectionsRow {
+                pat_num: 2,
+                patient: "Bennett, Ada".into(),
+                balance: 200.0,
+                days_overdue: 61,
+                last_payment: None,
+                plan_due_now: 0.0,
+                phone: String::new(),
+            },
+        ];
+        sort_collections_rows(&mut rows, 1, false);
+        assert_eq!(rows[0].pat_num, 1, "50 sorts before 200 numerically");
+        sort_collections_rows(&mut rows, 2, true);
+        assert_eq!(rows[0].pat_num, 2, "61 sorts before 30 when descending");
+        assert_eq!(rows[0].as_table_row()[2], "61", "visible row follows the action");
+    }
+
+    #[test]
+    fn collections_worklist_actions_open_account_and_payment_for_one_patient() {
+        let mut app = OdApp::new();
+        app.refresh();
+        // The worklist honours the same feature/permission gates as Account.
+        app.features.set(FeatureKey::AccountBillingEdits, true);
+        app.session = Some(Session::local());
+        let patient = app.patients.first().expect("demo patients").clone();
+        app.collections_rows = vec![CollectionsRow {
+            pat_num: patient.pat_num,
+            patient: patient.display_name(),
+            balance: 125.0,
+            days_overdue: 45,
+            last_payment: None,
+            plan_due_now: 0.0,
+            phone: String::new(),
+        }];
+
+        app.module = Module::Reports;
+        app.apply_collections_action(patient.pat_num, CollectionsAction::OpenAccount);
+        assert_eq!(app.module, Module::Account);
+        assert_eq!(app.selected_patient, Some(patient.pat_num));
+
+        app.apply_collections_action(patient.pat_num, CollectionsAction::RecordPayment);
+        assert!(app.payment_edit_open, "payment dialog should open from worklist");
+        assert_eq!(
+            app.payment_edit.as_ref().map(|payment| payment.pat_num),
+            Some(patient.pat_num),
+            "payment must stay on the clicked individual patient"
+        );
+        assert_eq!(app.payment_rows.len(), 1);
     }
 
     /// Headless smoke test: the full app constructs, loads demo data and the
