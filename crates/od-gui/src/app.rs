@@ -18,7 +18,8 @@ use od_core::{
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
     aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
     adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
-    collections_worklist, CollectionsRow,
+    collections_bucket_totals, collections_worklist, filter_collections_rows,
+    CollectionsAgingBucket, CollectionsRow,
     build_adjustment_journal, build_invoice_document, build_journal_batches,
     build_payment_journal, build_posting_batch_plan_with_closed,
     build_refund_transfer_receipt, build_statement_document,
@@ -1759,6 +1760,9 @@ struct OdApp {
     /// Rows behind the interactive Collections worklist. The exported report
     /// grid only carries strings, so actions read the patient numbers here.
     collections_rows: Vec<CollectionsRow>,
+    /// Active aging band in the Collections triage strip. `None` shows all
+    /// bands; filtering only removes whole patient rows.
+    collections_bucket_filter: Option<CollectionsAgingBucket>,
     report_from: NaiveDate,
     report_to: NaiveDate,
     /// Editable ISO copies of the reporting window. Invalid text is kept on
@@ -2041,6 +2045,7 @@ impl OdApp {
             treat_plan_line_fee_text: String::new(),
             report: ReportKind::Production,
             collections_rows: Vec::new(),
+            collections_bucket_filter: None,
             report_from: today - Duration::days(30),
             report_to: today,
             report_from_text: (today - Duration::days(30)).format("%Y-%m-%d").to_string(),
@@ -8893,6 +8898,9 @@ impl OdApp {
             }
             ui.label("(click a column to sort; exports use this order)");
         });
+        // Rows left after the aging-band filter. Kept local so the grid can
+        // borrow it while the row actions are collected from `self`.
+        let mut visible_collections_rows: Vec<CollectionsRow> = Vec::new();
         if current == ReportKind::Collections {
             // Keep the exported grid and the clickable rows in the same order.
             sort_collections_rows(
@@ -8900,16 +8908,45 @@ impl OdApp {
                 self.report_sort_column,
                 self.report_sort_desc,
             );
+            let bucket_totals = collections_bucket_totals(&self.collections_rows);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Aging:");
+                if ui
+                    .selectable_label(self.collections_bucket_filter.is_none(), "All")
+                    .clicked()
+                {
+                    self.collections_bucket_filter = None;
+                }
+                for bucket in CollectionsAgingBucket::ALL {
+                    let totals = bucket_totals[bucket.index()];
+                    let label = format!(
+                        "{} ({} · {:.2})",
+                        bucket.label(), totals.patients, totals.balance
+                    );
+                    if ui
+                        .selectable_label(self.collections_bucket_filter == Some(bucket), label)
+                        .clicked()
+                    {
+                        self.collections_bucket_filter = Some(bucket);
+                    }
+                }
+            });
+            visible_collections_rows =
+                filter_collections_rows(&self.collections_rows, self.collections_bucket_filter);
             let mut sorted = ReportTable {
                 headers: table.headers.clone(),
                 rows: Vec::new(),
             };
-            for row in &self.collections_rows {
+            for row in &visible_collections_rows {
                 sorted.rows.push(row.as_table_row());
             }
             if sorted.rows.is_empty() {
+                let empty = match self.collections_bucket_filter {
+                    Some(bucket) => format!("No patient accounts in {} bucket", bucket.label()),
+                    None => "No overdue patient accounts".to_string(),
+                };
                 sorted.rows.push(vec![
-                    "No overdue patient accounts".into(),
+                    empty,
                     String::new(),
                     String::new(),
                     String::new(),
@@ -8927,11 +8964,16 @@ impl OdApp {
         let html = render_report_html(current.label(), &practice, &table);
 
         if current == ReportKind::Collections {
-            let total_balance: f64 = self.collections_rows.iter().map(|row| row.balance).sum();
+            let total_balance: f64 = visible_collections_rows.iter().map(|row| row.balance).sum();
+            let scope = match self.collections_bucket_filter {
+                Some(bucket) => format!(" · {} band", bucket.label()),
+                None => String::new(),
+            };
             ui.label(format!(
-                "{} individual patient account(s) · total balance {:.2} · as of {}",
-                self.collections_rows.len(),
+                "{} individual patient account(s) · total balance {:.2}{} · as of {}",
+                visible_collections_rows.len(),
                 total_balance,
+                scope,
                 self.report_to
             ));
         }
@@ -8948,7 +8990,7 @@ impl OdApp {
                         ui.label(value);
                     }
                     if current == ReportKind::Collections {
-                        if let Some(entry) = self.collections_rows.get(index) {
+                        if let Some(entry) = visible_collections_rows.get(index) {
                             ui.horizontal(|ui| {
                                 if ui.button("Open account").clicked() {
                                     worklist_actions
@@ -13188,6 +13230,23 @@ mod tests {
         assert_eq!(app.store.list_journal_entries().unwrap().len(), before.len());
     }
 
+    fn collections_test_row(
+        pat_num: Id,
+        patient: &str,
+        days_overdue: i64,
+        balance: f64,
+    ) -> CollectionsRow {
+        CollectionsRow {
+            pat_num,
+            patient: patient.into(),
+            balance,
+            days_overdue,
+            last_payment: None,
+            plan_due_now: 0.0,
+            phone: String::new(),
+        }
+    }
+
     #[test]
     fn collections_worklist_demo_rows_have_clean_money_formatting() {
         let app = OdApp::new();
@@ -13222,6 +13281,18 @@ mod tests {
                 row.as_table_row()
             );
         }
+        let totals = collections_bucket_totals(&rows);
+        assert_eq!(
+            totals.iter().map(|t| t.patients).sum::<usize>(),
+            rows.len(),
+            "aging bands must cover every demo patient exactly once"
+        );
+        for bucket in CollectionsAgingBucket::ALL {
+            let filtered = filter_collections_rows(&rows, Some(bucket));
+            let balance: f64 = filtered.iter().map(|row| row.balance).sum();
+            assert_eq!(filtered.len(), totals[bucket.index()].patients);
+            assert!((balance - totals[bucket.index()].balance).abs() < 0.005);
+        }
     }
 
     #[test]
@@ -13251,6 +13322,37 @@ mod tests {
         sort_collections_rows(&mut rows, 2, true);
         assert_eq!(rows[0].pat_num, 2, "61 sorts before 30 when descending");
         assert_eq!(rows[0].as_table_row()[2], "61", "visible row follows the action");
+    }
+
+    #[test]
+    fn collections_aging_filter_keeps_export_and_actions_aligned() {
+        let mut app = OdApp::new();
+        app.collections_rows = vec![
+            collections_test_row(1, "Alvarez, Ada", 91, 100.0),
+            collections_test_row(2, "Bennett, Bo", 30, 50.0),
+            collections_test_row(3, "Chen, Cai", 61, 25.0),
+            collections_test_row(4, "Diaz, Dee", 60, 75.0),
+        ];
+        let totals = collections_bucket_totals(&app.collections_rows);
+        assert_eq!(totals[CollectionsAgingBucket::Current.index()].patients, 1);
+        assert_eq!(
+            totals[CollectionsAgingBucket::Days61To90.index()].balance,
+            25.0
+        );
+        assert_eq!(totals[CollectionsAgingBucket::Over90.index()].balance, 100.0);
+
+        app.collections_bucket_filter = Some(CollectionsAgingBucket::Days61To90);
+        sort_collections_rows(&mut app.collections_rows, 1, false);
+        let visible =
+            filter_collections_rows(&app.collections_rows, app.collections_bucket_filter);
+        assert_eq!(visible.len(), 1, "one row for the one patient in the band");
+        assert_eq!(visible[0].pat_num, 3);
+        let exported = visible[0].as_table_row();
+        assert_eq!(exported[0], "Chen, Cai");
+        assert_eq!(exported[1], "25.00");
+        assert_eq!(exported[2], "61");
+        assert_eq!(app.collections_rows[0].patient, exported[0]);
+        assert_eq!(filter_collections_rows(&app.collections_rows, None).len(), 4);
     }
 
     #[test]

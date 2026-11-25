@@ -411,8 +411,12 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   applied oldest-first), last payment, amount due now on open payment plans and
   a contact number. Each row can **Open account**, **Record payment** or
   generate a **Statement**, so staff can close the collection loop without
-  leaving the report. The exported CSV/HTML uses exactly the visible, sorted
-  rows. Zero and credit balances are hidden, as in OD's collection lists.
+  leaving the report. An aging triage strip groups patients into 0–30, 31–60,
+  61–90 and 90+ day bands using the displayed days-overdue value; each band
+  shows its patient count and balance total, and selecting a band filters the
+  whole patient rows (never splitting a balance). The summary and exported
+  CSV/HTML follow the visible rows. Zero and credit balances are hidden, as in
+  OD's collection lists.
 * **Statements:** generate a patient-only statement (charges, adjustments,
   payments and per-plan balances, with no insurance columns), write a dated OD
   `statement` row and open a print-ready HTML page in the browser. **Save PDF**

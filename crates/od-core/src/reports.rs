@@ -427,6 +427,93 @@ impl CollectionsRow {
     }
 }
 
+/// Aging band used by the Collections triage strip. Bands mirror the OD aging
+/// report's 0-30 / 31-60 / 61-90 / over-90 columns, but classify a patient by
+/// the age of their oldest unpaid charge instead of splitting the balance
+/// across columns.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CollectionsAgingBucket {
+    Current,
+    Days31To60,
+    Days61To90,
+    Over90,
+}
+
+impl CollectionsAgingBucket {
+    /// All bands in display order; also the order of the totals array.
+    pub const ALL: [Self; 4] = [
+        Self::Current,
+        Self::Days31To60,
+        Self::Days61To90,
+        Self::Over90,
+    ];
+
+    /// Bucket a worklist row using the same `days_overdue` it displays.
+    pub fn from_days_overdue(days: i64) -> Self {
+        match days {
+            days if days <= 30 => Self::Current,
+            days if days <= 60 => Self::Days31To60,
+            days if days <= 90 => Self::Days61To90,
+            _ => Self::Over90,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Current => "0-30 days",
+            Self::Days31To60 => "31-60 days",
+            Self::Days61To90 => "61-90 days",
+            Self::Over90 => "90+ days",
+        }
+    }
+
+    /// Position in `ALL`, used to index the per-band totals.
+    pub fn index(self) -> usize {
+        match self {
+            Self::Current => 0,
+            Self::Days31To60 => 1,
+            Self::Days61To90 => 2,
+            Self::Over90 => 3,
+        }
+    }
+}
+
+/// Patient count and balance for one Collections aging band.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CollectionsBucketTotals {
+    pub patients: usize,
+    pub balance: f64,
+}
+
+/// Per-band totals for a whole worklist, indexed by
+/// `CollectionsAgingBucket::index()`. Every patient contributes to exactly one
+/// band, so the counts and balances add back up to the unfiltered worklist.
+pub fn collections_bucket_totals(rows: &[CollectionsRow]) -> [CollectionsBucketTotals; 4] {
+    let mut totals = [CollectionsBucketTotals::default(); 4];
+    for row in rows {
+        let bucket = CollectionsAgingBucket::from_days_overdue(row.days_overdue);
+        totals[bucket.index()].patients += 1;
+        totals[bucket.index()].balance += row.balance;
+    }
+    totals
+}
+
+/// Triage by whole patient rows: filtering removes rows but never splits a
+/// balance across bands. `None` shows every band.
+pub fn filter_collections_rows(
+    rows: &[CollectionsRow],
+    bucket: Option<CollectionsAgingBucket>,
+) -> Vec<CollectionsRow> {
+    rows.iter()
+        .filter(|row| {
+            bucket.map_or(true, |selected| {
+                selected == CollectionsAgingBucket::from_days_overdue(row.days_overdue)
+            })
+        })
+        .cloned()
+        .collect()
+}
+
 /// Patients with an outstanding individual balance, oldest debt first.
 ///
 /// Uses the same patient-only arithmetic as the Account view and the aging
@@ -4235,6 +4322,97 @@ mod tests {
         let values = rows[0].as_table_row();
         assert_eq!(values[1], "150.00");
         assert_eq!(values[4], "75.00");
+    }
+
+    fn collection_row(pat_num: Id, days_overdue: i64, balance: f64) -> CollectionsRow {
+        CollectionsRow {
+            pat_num,
+            patient: format!("Patient {pat_num}"),
+            balance,
+            days_overdue,
+            last_payment: None,
+            plan_due_now: 0.0,
+            phone: String::new(),
+        }
+    }
+
+    #[test]
+    fn collections_aging_buckets_cover_the_day_boundaries() {
+        use CollectionsAgingBucket::*;
+        for days in [-5, 0, 29, 30] {
+            assert_eq!(CollectionsAgingBucket::from_days_overdue(days), Current);
+        }
+        for days in [31, 45, 60] {
+            assert_eq!(CollectionsAgingBucket::from_days_overdue(days), Days31To60);
+        }
+        for days in [61, 75, 90] {
+            assert_eq!(CollectionsAgingBucket::from_days_overdue(days), Days61To90);
+        }
+        for days in [91, 365] {
+            assert_eq!(CollectionsAgingBucket::from_days_overdue(days), Over90);
+        }
+        let labels: Vec<_> = CollectionsAgingBucket::ALL
+            .iter()
+            .map(|bucket| bucket.label())
+            .collect();
+        assert_eq!(labels, ["0-30 days", "31-60 days", "61-90 days", "90+ days"]);
+        for (index, bucket) in CollectionsAgingBucket::ALL.iter().enumerate() {
+            assert_eq!(bucket.index(), index);
+        }
+    }
+
+    #[test]
+    fn collections_bucket_totals_and_filter_keep_one_row_per_patient() {
+        use CollectionsAgingBucket::*;
+        let rows = vec![
+            collection_row(1, 91, 100.0),
+            collection_row(2, 30, 50.0),
+            collection_row(3, 61, 25.0),
+            collection_row(4, 60, 75.0),
+            collection_row(5, 31, 10.0),
+        ];
+        let totals = collections_bucket_totals(&rows);
+        assert_eq!(
+            totals[Current.index()],
+            CollectionsBucketTotals {
+                patients: 1,
+                balance: 50.0
+            }
+        );
+        assert_eq!(
+            totals[Days31To60.index()],
+            CollectionsBucketTotals {
+                patients: 2,
+                balance: 85.0
+            }
+        );
+        assert_eq!(
+            totals[Days61To90.index()],
+            CollectionsBucketTotals {
+                patients: 1,
+                balance: 25.0
+            }
+        );
+        assert_eq!(
+            totals[Over90.index()],
+            CollectionsBucketTotals {
+                patients: 1,
+                balance: 100.0
+            }
+        );
+        assert_eq!(
+            totals.iter().map(|t| t.patients).sum::<usize>(),
+            rows.len(),
+            "each patient belongs to exactly one band"
+        );
+
+        let filtered = filter_collections_rows(&rows, Some(Days61To90));
+        assert_eq!(
+            filtered.iter().map(|row| row.pat_num).collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(filtered[0].balance, 25.0, "whole balance stays on its row");
+        assert_eq!(filter_collections_rows(&rows, None).len(), rows.len());
     }
 
     #[test]
