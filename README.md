@@ -547,10 +547,13 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
     since this port does not store referrals or preferred names, those columns
     are blank.
   Every option above lives in the "Report options (as in Open Dental)" panel.
-  The practice name and export paths stay practice-wide, while each option set
-  is saved per signed-in user in `reports.txt` (as `user_options.user-<UserNum>`
-  or `user_options.local`) and restored on restart or login/logout, so two staff
-  members can keep different report defaults without overwriting each other.
+  The practice name stays practice-wide, while each option set and last export
+  path are saved per signed-in user in `reports.txt` (as
+  `user_options.user-<UserNum>` / `user_export_path.user-<UserNum>.<report>` or
+  their `local` equivalents) and restored on restart or login/logout, so two
+  staff members can keep different report defaults and filing locations without
+  overwriting each other. A user who has not set a path still inherits the older
+  practice-wide `export.*` value.
   Options from an older shared installation become the first user's starting
   set rather than being discarded. The visible reporting window is stored the
   same way as `report_range.user-<UserNum>.from`/`.to` (or

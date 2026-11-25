@@ -540,9 +540,13 @@ fn default_report_path(kind: ReportKind, extension: &str) -> String {
         .into_owned()
 }
 
-/// A persisted practice-wide export path, blank when the clinic has never set one.
-fn persisted_export_path(prefs: &ReportPreferences, key: &str) -> String {
-    prefs.export_path(key).map(str::to_string).unwrap_or_default()
+/// A persisted export path for the signed-in user, blank when neither they nor
+/// the practice have set one.
+fn persisted_export_path(prefs: &ReportPreferences, user_key: &str, key: &str) -> String {
+    prefs
+        .effective_export_path(user_key, key)
+        .map(str::to_string)
+        .unwrap_or_default()
 }
 
 /// Dedicated exports that carry a patient number use one filing location per
@@ -554,13 +558,14 @@ fn patient_export_key(base_key: &str, pat_num: Id) -> String {
 
 fn patient_export_path(
     prefs: &ReportPreferences,
+    user_key: &str,
     base_key: &str,
     pat_num: Id,
     fallback: String,
 ) -> String {
     prefs
-        .export_path(&patient_export_key(base_key, pat_num))
-        .or_else(|| prefs.export_path(base_key))
+        .effective_export_path(user_key, &patient_export_key(base_key, pat_num))
+        .or_else(|| prefs.effective_export_path(user_key, base_key))
         .map(str::to_string)
         .unwrap_or(fallback)
 }
@@ -1822,6 +1827,7 @@ struct OdApp {
 impl OdApp {
     fn new() -> Self {
         let features = FeatureSettings::load();
+        let startup_user_key = od_domain::period_close_history_user_key(None);
         let (store, db_label) = if features.enabled(FeatureKey::PreferDemoData) {
             (
                 Arc::new(Backend::Demo(DemoStore::seeded())) as Arc<dyn Store>,
@@ -2009,6 +2015,7 @@ impl OdApp {
             report_export_kind: None,
             pay_plan_audit_export_path: persisted_export_path(
                 &report_prefs,
+                &startup_user_key,
                 EXPORT_KEY_PAY_PLAN_AUDIT,
             ),
             report_prefs,
@@ -2150,15 +2157,16 @@ impl OdApp {
 
     // ------------------------------------------------------------ Export paths
 
-    /// Persist a dedicated export path next to the per-report paths in
-    /// `reports.txt`, so a clinic's filing location survives a restart. Skips
-    /// redundant writes; a failed save is surfaced without hiding a successful
-    /// file write that may already have happened.
+    /// Persist a dedicated export path for the signed-in user, so each user's
+    /// filing location survives a restart or login switch. Skips redundant
+    /// writes; a failed save is surfaced without hiding a successful file write
+    /// that may already have happened.
     fn remember_export_path(&mut self, key: &str, path: &str) {
-        if self.report_prefs.export_path(key) == Some(path) {
+        let user_key = self.period_close_history_user_key();
+        if self.report_prefs.user_export_path(&user_key, key) == Some(path) {
             return;
         }
-        self.report_prefs.set_export_path(key, path);
+        self.report_prefs.set_user_export_path(user_key, key, path);
         if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save export path preference: {err}"));
         }
@@ -2235,6 +2243,12 @@ impl OdApp {
                 self.report = kind;
             }
         }
+        self.report_export_path = self
+            .report_prefs
+            .effective_export_path(&key, self.report.file_stem())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_report_path(self.report, "csv"));
+        self.report_export_kind = Some(self.report);
     }
 
     /// Replace both the live dates and their editable text. Loading a saved
@@ -3964,6 +3978,7 @@ impl OdApp {
             self.account_ledger_export_patient = num;
             let path = patient_export_path(
                 &self.report_prefs,
+                &self.period_close_history_user_key(),
                 EXPORT_KEY_ACCOUNT_LEDGER,
                 num,
                 default_account_ledger_export_path(num),
@@ -4328,6 +4343,7 @@ impl OdApp {
                 self.account_audit_export_patient = num;
                 let path = patient_export_path(
                     &self.report_prefs,
+                    &self.period_close_history_user_key(),
                     EXPORT_KEY_ACCOUNT_AUDIT,
                     num,
                     default_account_audit_export_path(num),
@@ -5924,7 +5940,7 @@ impl OdApp {
         if self.report_export_kind != Some(current) {
             self.report_export_path = self
                 .report_prefs
-                .export_path(current.file_stem())
+                .effective_export_path(&self.period_close_history_user_key(), current.file_stem())
                 .map(str::to_string)
                 .unwrap_or_else(|| default_report_path(current, "csv"));
             self.report_export_kind = Some(current);
@@ -6003,7 +6019,7 @@ impl OdApp {
             self.report = current;
             self.report_export_path = self
                 .report_prefs
-                .export_path(current.file_stem())
+                .effective_export_path(&self.period_close_history_user_key(), current.file_stem())
                 .map(str::to_string)
                 .unwrap_or_else(|| default_report_path(current, "csv"));
             self.report_export_kind = Some(current);
@@ -8738,8 +8754,12 @@ impl OdApp {
                 egui::TextEdit::singleline(&mut self.report_export_path).desired_width(360.0),
             );
             if response.changed() {
-                self.report_prefs
-                    .set_export_path(current.file_stem(), self.report_export_path.clone());
+                let user_key = self.period_close_history_user_key();
+                self.report_prefs.set_user_export_path(
+                    user_key,
+                    current.file_stem(),
+                    self.report_export_path.clone(),
+                );
                 if let Err(err) = self.save_report_prefs() {
                     self.error = Some(format!("Could not save report preferences: {err}"));
                 }
@@ -8758,8 +8778,9 @@ impl OdApp {
                 Err(err) => self.error = Some(format!("Could not write report: {err}")),
             }
             self.report_export_path = path_text.clone();
+            let user_key = self.period_close_history_user_key();
             self.report_prefs
-                .set_export_path(current.file_stem(), path_text);
+                .set_user_export_path(user_key, current.file_stem(), path_text);
             if let Err(err) = self.save_report_prefs() {
                 self.error = Some(format!("Could not save report preferences: {err}"));
             }
@@ -9167,13 +9188,17 @@ impl OdApp {
                 let path = match patient_filter {
                     Some(num) => patient_export_path(
                         &self.report_prefs,
+                        &self.period_close_history_user_key(),
                         EXPORT_KEY_SECURITY_LOG,
                         num,
                         default_security_log_export_path(Some(num)),
                     ),
                     None => {
-                        let persisted =
-                            persisted_export_path(&self.report_prefs, EXPORT_KEY_SECURITY_LOG);
+                        let persisted = persisted_export_path(
+                            &self.report_prefs,
+                            &self.period_close_history_user_key(),
+                            EXPORT_KEY_SECURITY_LOG,
+                        );
                         if persisted.is_empty() {
                             default_security_log_export_path(None)
                         } else {
@@ -12183,39 +12208,46 @@ mod tests {
     #[test]
     fn dedicated_export_paths_load_from_preferences() {
         let mut prefs = ReportPreferences::default();
-        prefs.set_export_path(EXPORT_KEY_ACCOUNT_AUDIT, "C:\\Audit\\account.csv");
-        prefs.set_export_path(
+        prefs.set_export_path(EXPORT_KEY_ACCOUNT_AUDIT, "C:\\Audit\\practice.csv");
+        prefs.set_user_export_path("local", EXPORT_KEY_ACCOUNT_AUDIT, "C:\\Audit\\account.csv");
+        prefs.set_user_export_path(
+            "local",
             patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, 12),
             "C:\\Audit\\patient-12.csv",
         );
-        prefs.set_export_path(EXPORT_KEY_ACCOUNT_LEDGER, "C:\\Audit\\ledger.csv");
-        prefs.set_export_path(EXPORT_KEY_PAY_PLAN_AUDIT, "C:\\Audit\\plans.csv");
+        prefs.set_user_export_path("local", EXPORT_KEY_ACCOUNT_LEDGER, "C:\\Audit\\ledger.csv");
+        prefs.set_user_export_path("local", EXPORT_KEY_PAY_PLAN_AUDIT, "C:\\Audit\\plans.csv");
         prefs.set_export_path(EXPORT_KEY_SECURITY_LOG, "C:\\Audit\\security.csv");
         let prefs = ReportPreferences::from_text(&prefs.to_text());
 
         assert_eq!(
-            persisted_export_path(&prefs, EXPORT_KEY_PAY_PLAN_AUDIT),
+            persisted_export_path(&prefs, "local", EXPORT_KEY_PAY_PLAN_AUDIT),
             "C:\\Audit\\plans.csv"
         );
         assert_eq!(
-            persisted_export_path(&prefs, EXPORT_KEY_ACCOUNT_LEDGER),
+            persisted_export_path(&prefs, "local", EXPORT_KEY_ACCOUNT_LEDGER),
             "C:\\Audit\\ledger.csv"
         );
         assert_eq!(
-            persisted_export_path(&prefs, EXPORT_KEY_SECURITY_LOG),
-            "C:\\Audit\\security.csv"
+            persisted_export_path(&prefs, "local", EXPORT_KEY_SECURITY_LOG),
+            "C:\\Audit\\security.csv",
+            "a user without their own path inherits the practice-wide default"
         );
         assert_eq!(
-            patient_export_path(&prefs, EXPORT_KEY_ACCOUNT_AUDIT, 12, "fallback".into()),
+            persisted_export_path(&prefs, "user-1", EXPORT_KEY_ACCOUNT_AUDIT),
+            "C:\\Audit\\practice.csv"
+        );
+        assert_eq!(
+            patient_export_path(&prefs, "local", EXPORT_KEY_ACCOUNT_AUDIT, 12, "fallback".into()),
             "C:\\Audit\\patient-12.csv"
         );
         assert_eq!(
-            patient_export_path(&prefs, EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            patient_export_path(&prefs, "local", EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
             "C:\\Audit\\account.csv",
-            "an account without its own path inherits the practice-wide default"
+            "an account without its own path inherits the user's default"
         );
         assert_eq!(
-            patient_export_path(&ReportPreferences::default(), EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            patient_export_path(&ReportPreferences::default(), "local", EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
             "fallback"
         );
         assert_eq!(
@@ -12245,6 +12277,26 @@ mod tests {
         assert_eq!(
             app.report_prefs.selected_report_kind(&key),
             Some(ReportKind::Aging.file_stem())
+        );
+    }
+
+    #[test]
+    fn export_paths_follow_the_signed_in_user() {
+        let mut app = OdApp::new();
+        let key = app.period_close_history_user_key();
+        app.report_prefs.set_user_export_path(
+            key.clone(),
+            ReportKind::Production.file_stem(),
+            "C:\\Reports\\mine.csv",
+        );
+        app.load_report_user_view();
+        assert_eq!(app.report_export_path, "C:\\Reports\\mine.csv");
+
+        app.report_prefs
+            .set_user_export_path(key.clone(), "account-audit.12", "D:\\Audit\\12.csv");
+        assert_eq!(
+            app.report_prefs.effective_export_path(&key, "account-audit.12"),
+            Some("D:\\Audit\\12.csv")
         );
     }
 

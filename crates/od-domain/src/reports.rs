@@ -1214,6 +1214,9 @@ pub struct ReportPreferences {
     /// Selected report per signed-in user, stored as the report's stable file
     /// stem. The GUI restores it alongside the user's dates and options.
     pub report_kinds: HashMap<String, String>,
+    /// Last export path per report and signed-in user. Practice-wide `export.*`
+    /// values stay as a fallback for users who have not chosen their own.
+    user_export_paths: HashMap<String, HashMap<String, String>>,
 }
 
 impl Default for ReportPreferences {
@@ -1252,6 +1255,7 @@ impl Default for ReportPreferences {
             user_options: HashMap::new(),
             report_ranges: HashMap::new(),
             report_kinds: HashMap::new(),
+            user_export_paths: HashMap::new(),
         }
     }
 }
@@ -1324,6 +1328,9 @@ impl ReportPreferences {
     const REPORT_RANGE_PREFIX: &'static str = "report_range.";
     /// Per-user selected report, e.g. `report_kind.user-7=patient-aging`.
     const REPORT_KIND_PREFIX: &'static str = "report_kind.";
+    /// Per-user export paths, e.g.
+    /// `user_export_path.user-7.recall-asap=C%3A%5CReports%5Crecall.csv`.
+    const USER_EXPORT_PATH_PREFIX: &'static str = "user_export_path.";
 
     pub fn export_path(&self, report_key: &str) -> Option<&str> {
         self.export_paths.get(report_key).map(String::as_str)
@@ -1331,6 +1338,34 @@ impl ReportPreferences {
 
     pub fn set_export_path(&mut self, report_key: impl Into<String>, path: impl Into<String>) {
         self.export_paths.insert(report_key.into(), path.into());
+    }
+
+    /// Export path chosen by one user for one report (patient-scoped keys work
+    /// too). Practice-wide paths remain available as a fallback.
+    pub fn user_export_path(&self, user_key: &str, report_key: &str) -> Option<&str> {
+        self.user_export_paths
+            .get(user_key)
+            .and_then(|paths| paths.get(report_key))
+            .map(String::as_str)
+    }
+
+    pub fn set_user_export_path(
+        &mut self,
+        user_key: impl Into<String>,
+        report_key: impl Into<String>,
+        path: impl Into<String>,
+    ) {
+        self.user_export_paths
+            .entry(user_key.into())
+            .or_default()
+            .insert(report_key.into(), path.into());
+    }
+
+    /// The path the GUI should use: this user's choice first, then the legacy
+    /// practice-wide setting.
+    pub fn effective_export_path(&self, user_key: &str, report_key: &str) -> Option<&str> {
+        self.user_export_path(user_key, report_key)
+            .or_else(|| self.export_path(report_key))
     }
 
     pub fn period_close_history_view(&self, user_key: &str) -> Option<&PeriodCloseHistoryView> {
@@ -1374,6 +1409,7 @@ impl ReportPreferences {
         restored.user_options = std::mem::take(&mut self.user_options);
         restored.report_ranges = std::mem::take(&mut self.report_ranges);
         restored.report_kinds = std::mem::take(&mut self.report_kinds);
+        restored.user_export_paths = std::mem::take(&mut self.user_export_paths);
         *self = restored;
     }
 
@@ -1903,6 +1939,21 @@ impl ReportPreferences {
                 encoded
             ));
         }
+        let mut path_users: Vec<_> = self.user_export_paths.iter().collect();
+        path_users.sort_by(|a, b| a.0.cmp(b.0));
+        for (user_key, paths) in path_users {
+            let mut entries: Vec<_> = paths.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (report_key, path) in entries {
+                lines.push(format!(
+                    "{}{}.{}={}",
+                    Self::USER_EXPORT_PATH_PREFIX,
+                    user_key,
+                    report_key,
+                    encode_pref_value(path)
+                ));
+            }
+        }
         let mut paths: Vec<_> = self.export_paths.iter().collect();
         paths.sort_by(|a, b| a.0.cmp(b.0));
         for (key, path) in paths {
@@ -1929,6 +1980,20 @@ impl ReportPreferences {
                         .export_paths
                         .insert(report_key.to_string(), value.to_string());
                 }
+            } else if let Some(user_report_key) =
+                key.strip_prefix(Self::USER_EXPORT_PATH_PREFIX)
+            {
+                let Some((user_key, report_key)) = user_report_key.split_once('.') else {
+                    continue;
+                };
+                if user_key.is_empty() || report_key.is_empty() {
+                    continue;
+                }
+                prefs
+                    .user_export_paths
+                    .entry(user_key.to_string())
+                    .or_default()
+                    .insert(report_key.to_string(), decode_pref_value(value));
             } else if let Some(view_key) = key.strip_prefix(Self::PERIOD_CLOSE_HISTORY_PREFIX) {
                 let Some((user_key, field)) = view_key.rsplit_once('.') else {
                     continue;
@@ -2528,6 +2593,52 @@ mod tests {
 
         let old = ReportPreferences::from_text("practice_name=Clinic\noption.aging.age=any\n");
         assert_eq!(old.selected_report_kind("local"), None);
+    }
+
+    #[test]
+    fn export_paths_round_trip_per_user_with_practice_fallback() {
+        let mut prefs = ReportPreferences::default();
+        prefs.set_export_path("recall-asap", "C:\\Shared\\recall.csv");
+        prefs.set_user_export_path("local", "recall-asap", "C:\\Local\\recall.csv");
+        prefs.set_user_export_path("user-1", "account-audit.12", "D:\\Audit\\12.csv");
+
+        let text = prefs.to_text();
+        assert!(text.contains("user_export_path.local.recall-asap=C:\\Local\\recall.csv"));
+        assert!(text.contains("user_export_path.user-1.account-audit.12=D:\\Audit\\12.csv"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert_eq!(
+            loaded.effective_export_path("local", "recall-asap"),
+            Some("C:\\Local\\recall.csv")
+        );
+        assert_eq!(
+            loaded.effective_export_path("user-1", "recall-asap"),
+            Some("C:\\Shared\\recall.csv")
+        );
+        assert_eq!(
+            loaded.effective_export_path("user-1", "account-audit.12"),
+            Some("D:\\Audit\\12.csv")
+        );
+
+        // Switching users keeps every user's paths and never touches the
+        // practice-wide fallback.
+        loaded.restore_user_options("local");
+        assert_eq!(loaded.export_path("recall-asap"), Some("C:\\Shared\\recall.csv"));
+        assert_eq!(
+            loaded.user_export_path("user-1", "account-audit.12"),
+            Some("D:\\Audit\\12.csv")
+        );
+        loaded.restore_user_options("user-1");
+        assert_eq!(
+            loaded.effective_export_path("user-1", "account-audit.12"),
+            Some("D:\\Audit\\12.csv")
+        );
+
+        let old = ReportPreferences::from_text("export.recall-asap=C:\\Old\\recall.csv\n");
+        assert_eq!(
+            old.effective_export_path("local", "recall-asap"),
+            Some("C:\\Old\\recall.csv")
+        );
     }
 
     #[test]
