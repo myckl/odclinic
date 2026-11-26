@@ -155,6 +155,18 @@ fn collections_band_to_storage(selection: Option<CollectionsAgingBucket>) -> Col
     }
 }
 
+/// Export title for the Collections worklist. The title is repeated on every
+/// CSV row and becomes the HTML heading, so naming the active aging band there
+/// records which triage slice a saved file came from. Other reports keep their
+/// plain title.
+fn collections_export_title(filter: Option<CollectionsAgingBucket>) -> String {
+    let scope = match filter {
+        Some(bucket) => format!("{} band", bucket.label()),
+        None => "All bands".to_string(),
+    };
+    format!("{} ({})", ReportKind::Collections.label(), scope)
+}
+
 fn gather_procedures(store: &dyn Store, patients: &[Patient]) -> Vec<Procedure> {
     let mut out = Vec::new();
     for patient in patients {
@@ -9011,8 +9023,13 @@ impl OdApp {
         }
 
         let practice = self.report_prefs.practice_name.clone();
-        let csv = render_report_csv(current.label(), &practice, &table);
-        let html = render_report_html(current.label(), &practice, &table);
+        let export_title = if current == ReportKind::Collections {
+            collections_export_title(self.collections_bucket_filter)
+        } else {
+            current.label().to_string()
+        };
+        let csv = render_report_csv(&export_title, &practice, &table);
+        let html = render_report_html(&export_title, &practice, &table);
 
         if current == ReportKind::Collections {
             let total_balance: f64 = visible_collections_rows.iter().map(|row| row.balance).sum();
@@ -12604,7 +12621,10 @@ mod tests {
         let mut app = OdApp::new();
         // GUI verification writes real preferences to disk; start clean so this
         // test does not inherit a saved report kind from another session.
+        // `OdApp::new()` already loaded that kind into `self.report`, so reset
+        // both the preferences and the live selection.
         app.report_prefs = ReportPreferences::default();
+        app.report = ReportKind::Production;
         let key = app.period_close_history_user_key();
         app.report_prefs.set_user_export_path(
             key.clone(),
@@ -12665,6 +12685,42 @@ mod tests {
                 band
             );
         }
+    }
+
+    #[test]
+    fn collections_export_title_records_the_active_aging_band() {
+        assert_eq!(collections_export_title(None), "Collections (All bands)");
+        for (bucket, expected) in [
+            (
+                CollectionsAgingBucket::Current,
+                "Collections (0-30 days band)",
+            ),
+            (
+                CollectionsAgingBucket::Days31To60,
+                "Collections (31-60 days band)",
+            ),
+            (
+                CollectionsAgingBucket::Days61To90,
+                "Collections (61-90 days band)",
+            ),
+            (
+                CollectionsAgingBucket::Over90,
+                "Collections (90+ days band)",
+            ),
+        ] {
+            assert_eq!(collections_export_title(Some(bucket)), expected);
+        }
+
+        // Both saved formats carry the band in their header, not just on screen.
+        let table = ReportTable {
+            headers: vec!["Patient".into(), "Balance".into()],
+            rows: vec![vec!["Chen, Mei".into(), "99.00".into()]],
+        };
+        let title = collections_export_title(Some(CollectionsAgingBucket::Days61To90));
+        let csv = render_report_csv(&title, "Highland Dental", &table);
+        assert!(csv.contains("Collections (61-90 days band)"), "{csv}");
+        let html = render_report_html(&title, "Highland Dental", &table);
+        assert!(html.contains("Collections (61-90 days band)"), "{html}");
     }
 
     #[test]

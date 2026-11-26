@@ -417,7 +417,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   whole patient rows (never splitting a balance). The selected band is saved per
   signed-in user in `reports.txt` (`collections_bucket.<user>`), so a restart or
   login switch restores each user's triage view. The summary and exported
-  CSV/HTML follow the visible rows. Zero and credit balances are hidden, as in
+  CSV/HTML follow the visible rows, and the active band is named in the export
+  header (`Collections (61-90 days band)`, or `All bands`) so a saved file
+  records which slice it represents. Zero and credit balances are hidden, as in
   OD's collection lists.
 * **Statements:** generate a patient-only statement (charges, adjustments,
   payments and per-plan balances, with no insurance columns), write a dated OD
