@@ -155,16 +155,35 @@ fn collections_band_to_storage(selection: Option<CollectionsAgingBucket>) -> Col
     }
 }
 
+/// Money text that never prints "-0.00": summing an empty `f64` iterator is
+/// negative zero, which would otherwise leak into an empty band's summary and
+/// export header.
+fn money_text(value: f64) -> String {
+    format!("{:.2}", if value == 0.0 { 0.0 } else { value })
+}
+
 /// Export title for the Collections worklist. The title is repeated on every
-/// CSV row and becomes the HTML heading, so naming the active aging band there
-/// records which triage slice a saved file came from. Other reports keep their
-/// plain title.
-fn collections_export_title(filter: Option<CollectionsAgingBucket>) -> String {
+/// CSV row and becomes the HTML heading, so recording the active aging band,
+/// as-of date and visible-row totals there makes a saved file self-describing
+/// after sorting or filing. Other reports keep their plain title.
+fn collections_export_title(
+    filter: Option<CollectionsAgingBucket>,
+    as_of: NaiveDate,
+    visible_rows: &[CollectionsRow],
+) -> String {
     let scope = match filter {
         Some(bucket) => format!("{} band", bucket.label()),
         None => "All bands".to_string(),
     };
-    format!("{} ({})", ReportKind::Collections.label(), scope)
+    let total_balance: f64 = visible_rows.iter().map(|row| row.balance).sum();
+    format!(
+        "{} ({} · as of {} · {} patient account(s) · {} total)",
+        ReportKind::Collections.label(),
+        scope,
+        as_of.format("%Y-%m-%d"),
+        visible_rows.len(),
+        money_text(total_balance)
+    )
 }
 
 fn gather_procedures(store: &dyn Store, patients: &[Patient]) -> Vec<Procedure> {
@@ -693,6 +712,33 @@ fn default_security_log_export_path(patient_num: Option<Id>) -> String {
         .into_owned()
 }
 
+/// The filing location for an audit-log export. `None` is the practice-wide
+/// path and must still be read from preferences: a zero patient number is not
+/// the same thing as "no patient filter".
+fn security_log_export_path_for(
+    prefs: &ReportPreferences,
+    user_key: &str,
+    patient_filter: Option<Id>,
+) -> String {
+    match patient_filter {
+        Some(num) => patient_export_path(
+            prefs,
+            user_key,
+            EXPORT_KEY_SECURITY_LOG,
+            num,
+            default_security_log_export_path(Some(num)),
+        ),
+        None => {
+            let persisted = persisted_export_path(prefs, user_key, EXPORT_KEY_SECURITY_LOG);
+            if persisted.is_empty() {
+                default_security_log_export_path(None)
+            } else {
+                persisted
+            }
+        }
+    }
+}
+
 /// Security-log rows as an auditable export table. The patient number is kept
 /// as its own column so a stale-resolution row can be filed against the right
 /// patient/account record outside this app.
@@ -1114,7 +1160,13 @@ fn default_pay_plan_audit_export_path() -> String {
 /// subset even if the staff member did not tick the report filter checkbox.
 fn stale_resolved_export_table(table: &ReportTable) -> ReportTable {
     let Some(resolved_index) = table.headers.iter().position(|header| header == "Resolved") else {
-        return table.clone();
+        // No Resolved column means the report was generated with reasons off,
+        // so there is no evidence for an audit subset. Never fall back to
+        // exporting every plan as if it had stale charges.
+        return ReportTable {
+            headers: table.headers.clone(),
+            rows: Vec::new(),
+        };
     };
     ReportTable {
         headers: table.headers.clone(),
@@ -1501,6 +1553,7 @@ impl ReportKind {
                 | ReportKind::DppOvercharged
                 | ReportKind::PatientPortionUncollected
                 | ReportKind::TreatmentFinder
+                | ReportKind::PayPlanDetail
                 | ReportKind::PayPlanChargeApplications
                 | ReportKind::Routing
                 | ReportKind::LaserLabels
@@ -1722,6 +1775,10 @@ struct OdApp {
     account_audit_export_path: String,
     /// Patient whose audit-bundle path is currently loaded.
     account_audit_export_patient: Id,
+    /// `None` is the practice-wide security log; `Some(pat_num)` is a patient
+    /// filter. `Some(0)` is never a valid patient number, so this doubles as
+    /// the "not loaded yet" sentinel that forces the saved path to be read.
+    security_log_export_patient: Option<Id>,
     plan_refund_transfer_target: PaymentTarget,
 
     // Payment plan state.
@@ -1848,9 +1905,6 @@ struct OdApp {
     /// scoped to one patient and filed against that record.
     security_log_patient_text: String,
     security_log_export_path: String,
-    /// Patient filter currently applied to the persisted security-log path
-    /// (`0` means the practice-wide, unscoped path).
-    security_log_export_patient: Id,
     login_name: String,
     login_pass: String,
     login_error: Option<String>,
@@ -2024,6 +2078,7 @@ impl OdApp {
             account_ledger_export_patient: 0,
             account_audit_export_path: String::new(),
             account_audit_export_patient: 0,
+            security_log_export_patient: None,
             plan_refund_transfer_target: PaymentTarget::Unallocated,
             plan_recon_as_of_text: chrono::Local::now().format("%Y-%m-%d").to_string(),
             stale_resolution_reasons: HashMap::new(),
@@ -2118,7 +2173,6 @@ impl OdApp {
             security_log_filter: String::new(),
             security_log_patient_text: String::new(),
             security_log_export_path: String::new(),
-            security_log_export_patient: 0,
             login_name: String::new(),
             login_pass: String::new(),
             login_error: None,
@@ -2327,6 +2381,13 @@ impl OdApp {
         self.load_report_sort(self.report);
         self.collections_bucket_filter =
             collections_band_from_storage(self.report_prefs.collections_bucket(&key));
+        // Dedicated export paths are filed under the signed-in user, while the
+        // in-memory patient sentinels are not. Force the next account view to
+        // reload its path so a login switch cannot reuse another user's folder.
+        self.account_ledger_export_patient = 0;
+        self.account_audit_export_patient = 0;
+        self.statement_pdf_patient = 0;
+        self.security_log_export_patient = None;
     }
 
     /// Restore the saved column sort for one report. Called on startup, after a
@@ -4127,8 +4188,9 @@ impl OdApp {
                 ledger_path_changed = Some(self.account_ledger_export_path.clone());
             }
             let table = account_ledger_export_table(&filtered_rows);
-            let csv = render_report_csv("Account ledger (filtered)", "", &table);
-            let html = render_report_html("Account ledger (filtered)", "", &table);
+            let practice = self.report_prefs.practice_name.clone();
+            let csv = render_report_csv("Account ledger (filtered)", &practice, &table);
+            let html = render_report_html("Account ledger (filtered)", &practice, &table);
             if ui.button("Save CSV").clicked() {
                 let path = report_export_path(&self.account_ledger_export_path, "csv");
                 match std::fs::write(&path, &csv) {
@@ -6312,6 +6374,23 @@ impl OdApp {
                 | ReportKind::ReferralAnalysis
                 | ReportKind::Referrals
                 | ReportKind::Patients
+                | ReportKind::BalanceSheet
+                | ReportKind::GeneralLedger
+                | ReportKind::ProfitLoss
+                | ReportKind::HiddenPaySplits
+                | ReportKind::UnearnedIncome
+                | ReportKind::ProcOverpaid
+                | ReportKind::ProcNote
+                | ReportKind::DentalSealant
+                | ReportKind::DiscountPlan
+                | ReportKind::TreatmentFinder
+                | ReportKind::PhRawPop
+                | ReportKind::PhRawScreen
+                | ReportKind::ProdGoal
+                | ReportKind::LaserLabels
+                | ReportKind::Routing
+                | ReportKind::Statement
+                | ReportKind::PrintPreview
         ) {
             let mut options_changed = false;
             let insurance = self.features.enabled(FeatureKey::InsuranceEnabled);
@@ -7803,6 +7882,16 @@ impl OdApp {
         let mut upstream_table: Option<ReportTable> = None;
         let patients = self.patients.clone();
         let providers = self.providers.clone();
+        // Insurance is off by default in this port (Ethiopia uses patient
+        // payments and plans). Skip the claim query entirely and hand builders
+        // an empty slice so insurance money and write-offs cannot leak into a
+        // report that was not explicitly given an insurance toggle.
+        let insurance_enabled = self.features.enabled(FeatureKey::InsuranceEnabled);
+        let claim_procs = if insurance_enabled {
+            gather_claim_procs(&*self.store, &patients)
+        } else {
+            Vec::new()
+        };
         let from_dt = self.report_from.and_hms_opt(0, 0, 0).unwrap_or_default();
         let to_dt = (self.report_to + Duration::days(1))
             .and_hms_opt(0, 0, 0)
@@ -7907,7 +7996,10 @@ impl OdApp {
                 for row in &mut recalls {
                     row.detail = format!("Recall · {}", row.detail);
                 }
-                let mut asap = asap_report(&self.appointments, &patients, from_dt, to_dt);
+                // The schedule cache holds only `schedule_day`, so read the
+                // report window itself for ASAP appointments.
+                let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
+                let mut asap = asap_report(&appts, &patients, from_dt, to_dt);
                 for row in &mut asap {
                     row.detail = format!("ASAP · {}", row.detail);
                 }
@@ -8630,7 +8722,6 @@ impl OdApp {
             ReportKind::ProcOverpaid => {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let codes = self.store.list_procedure_codes().unwrap_or_default();
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let splits = gather_splits(&*self.store, &patients);
                 upstream_table = Some(proc_overpaid_report(
                     &patients,
@@ -8647,7 +8738,6 @@ impl OdApp {
                 let definitions = self.store.list_definitions().unwrap_or_default();
                 let procedures = gather_procedures(&*self.store, &patients);
                 let splits = gather_splits(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 upstream_table = Some(receivables_breakdown_report(
                     &patients,
                     &definitions,
@@ -8661,7 +8751,6 @@ impl OdApp {
             ReportKind::ServiceDateView => {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let splits = gather_splits(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 upstream_table = Some(service_date_view_report(
                     &patients,
                     &procedures,
@@ -8708,7 +8797,6 @@ impl OdApp {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let codes = self.store.list_procedure_codes().unwrap_or_default();
                 let adjustments = gather_adjustments(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let links = self.store.list_pay_plan_links().unwrap_or_default();
                 let plans = gather_pay_plans(&*self.store, &patients);
                 let charges = gather_pay_plan_charges(&*self.store, &patients);
@@ -8733,7 +8821,6 @@ impl OdApp {
                 let codes = self.store.list_procedure_codes().unwrap_or_default();
                 let adjustments = gather_adjustments(&*self.store, &patients);
                 let splits = gather_splits(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let definitions = self.store.list_definitions().unwrap_or_default();
                 upstream_table = Some(patient_portion_uncollected_report(
                     &patients,
@@ -8751,7 +8838,6 @@ impl OdApp {
             ReportKind::TreatmentFinder => {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let codes = self.store.list_procedure_codes().unwrap_or_default();
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let carriers = self.store.list_carriers().unwrap_or_default();
                 let today = Local::now().date_naive();
                 let appt_from = today.and_hms_opt(0, 0, 0).unwrap_or_default();
@@ -8781,10 +8867,13 @@ impl OdApp {
             }
             ReportKind::PhRawPop => {
                 let procedures = gather_procedures(&*self.store, &patients);
+                // Broken-appointment counts come from the report window, not
+                // from the single-day schedule cache.
+                let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
                 let rows = gather_public_health_population(
                     &*self.store,
                     &patients,
-                    &self.appointments,
+                    &appts,
                     &procedures,
                     self.report_from,
                     self.report_to,
@@ -8802,11 +8891,18 @@ impl OdApp {
             }
             ReportKind::Routing => {
                 let procedures = gather_procedures(&*self.store, &patients);
+                // Routing slips cover the selected day; the schedule cache may
+                // be parked on a different day entirely.
+                let appt_from = self.report_from.and_hms_opt(0, 0, 0).unwrap_or_default();
+                let appt_to = (self.report_from + Duration::days(1))
+                    .and_hms_opt(0, 0, 0)
+                    .unwrap_or_default();
+                let appts = self.store.list_appointments(appt_from, appt_to).unwrap_or_default();
                 upstream_table = Some(routing_slips_report(
                     &patients,
                     &providers,
                     &procedures,
-                    &self.appointments,
+                    &appts,
                     self.report_from,
                 ));
             }
@@ -8852,7 +8948,6 @@ impl OdApp {
             ReportKind::ProdGoal => {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let adjustments = gather_adjustments(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let schedules = self.store.list_schedules().unwrap_or_default();
                 let schedule_ops = self.store.list_schedule_ops().unwrap_or_default();
                 let operatories = self.store.list_operatories().unwrap_or_default();
@@ -8871,7 +8966,6 @@ impl OdApp {
             }
             ReportKind::ProviderPayroll => {
                 let procedures = gather_procedures(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let snapshots = self.store.list_claim_snapshots().unwrap_or_default();
                 let adjustments = gather_adjustments(&*self.store, &patients);
                 let splits = gather_splits(&*self.store, &patients);
@@ -8892,7 +8986,6 @@ impl OdApp {
                 let procedures = gather_procedures(&*self.store, &patients);
                 let plans = gather_treat_plans(&*self.store, &patients);
                 let lines = gather_treat_plan_lines(&*self.store, &plans);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let adjustments = gather_adjustments(&*self.store, &patients);
                 upstream_table = Some(presented_treatment_production_report(
                     &patients,
@@ -8911,7 +9004,6 @@ impl OdApp {
                 let plans = gather_treat_plans(&*self.store, &patients);
                 let lines = gather_treat_plan_lines(&*self.store, &plans);
                 let procedures = gather_procedures(&*self.store, &patients);
-                let claim_procs = gather_claim_procs(&*self.store, &patients);
                 let adjustments = gather_adjustments(&*self.store, &patients);
                 upstream_table = Some(treat_plan_presentation_statistics_report(
                     &providers,
@@ -9024,7 +9116,11 @@ impl OdApp {
 
         let practice = self.report_prefs.practice_name.clone();
         let export_title = if current == ReportKind::Collections {
-            collections_export_title(self.collections_bucket_filter)
+            collections_export_title(
+                self.collections_bucket_filter,
+                self.report_to,
+                &visible_collections_rows,
+            )
         } else {
             current.label().to_string()
         };
@@ -9038,9 +9134,9 @@ impl OdApp {
                 None => String::new(),
             };
             ui.label(format!(
-                "{} individual patient account(s) · total balance {:.2}{} · as of {}",
+                "{} individual patient account(s) · total balance {}{} · as of {}",
                 visible_collections_rows.len(),
-                total_balance,
+                money_text(total_balance),
                 scope,
                 self.report_to
             ));
@@ -9518,35 +9614,23 @@ impl OdApp {
             let mut log_path_changed: Option<String> = None;
             let mut log_file_saved: Option<String> = None;
             let patient_filter = security_log_patient_filter(&self.security_log_patient_text);
-            let log_pat_num = patient_filter.unwrap_or(0);
-            if self.security_log_export_patient != log_pat_num {
-                self.security_log_export_patient = log_pat_num;
-                let path = match patient_filter {
-                    Some(num) => patient_export_path(
-                        &self.report_prefs,
-                        &self.period_close_history_user_key(),
-                        EXPORT_KEY_SECURITY_LOG,
-                        num,
-                        default_security_log_export_path(Some(num)),
-                    ),
-                    None => {
-                        let persisted = persisted_export_path(
-                            &self.report_prefs,
-                            &self.period_close_history_user_key(),
-                            EXPORT_KEY_SECURITY_LOG,
-                        );
-                        if persisted.is_empty() {
-                            default_security_log_export_path(None)
-                        } else {
-                            persisted
-                        }
-                    }
-                };
+            if self.security_log_export_patient != patient_filter {
+                self.security_log_export_patient = patient_filter;
+                let path = security_log_export_path_for(
+                    &self.report_prefs,
+                    &self.period_close_history_user_key(),
+                    patient_filter,
+                );
                 self.security_log_export_path = path.clone();
                 self.remember_export_path(&security_log_export_key(patient_filter), &path);
             }
-            let log: Vec<&SecurityEvent> = self
-                .security_log
+            // The Setup view keeps only 50 rows, but an export must include
+            // every matching entry the database can return.
+            let full_log = match self.store.list_security_log(1000) {
+                Ok(rows) => rows,
+                Err(_) => self.security_log.clone(),
+            };
+            let log: Vec<&SecurityEvent> = full_log
                 .iter()
                 .filter(|event| {
                     security_log_matches(event, &self.security_log_filter)
@@ -9562,7 +9646,7 @@ impl OdApp {
                 format!(
                     "Security log ({}/{})",
                     log.len(),
-                    self.security_log.len()
+                    full_log.len()
                 ),
                 |ui| {
                     ui.horizontal(|ui| {
@@ -12423,6 +12507,15 @@ mod tests {
             "",
         ]);
 
+        let without_reasons = ReportTable {
+            headers: vec!["Provider".into(), "Guarantor".into(), "Paid".into()],
+            rows: vec![vec!["Smith".into(), "Bennett".into(), "10.00".into()]],
+        };
+        assert!(
+            stale_resolved_export_table(&without_reasons).rows.is_empty(),
+            "without a Resolved column there is no audit evidence to export"
+        );
+
         let filtered = stale_resolved_export_table(&table);
         assert_eq!(filtered.headers, table.headers);
         assert_eq!(filtered.rows.len(), 1, "footer and clean plan are excluded");
@@ -12594,6 +12687,35 @@ mod tests {
     }
 
     #[test]
+    fn security_log_export_path_defaults_to_the_practice_wide_file() {
+        let prefs = ReportPreferences::default();
+        let path = security_log_export_path_for(&prefs, "local", None);
+        assert_eq!(path, default_security_log_export_path(None));
+        assert!(!path.is_empty(), "the unscoped path must not be skipped");
+
+        let mut prefs = ReportPreferences::default();
+        prefs.set_user_export_path("local", EXPORT_KEY_SECURITY_LOG, "D:\\Audit\\all.csv");
+        assert_eq!(
+            security_log_export_path_for(&prefs, "local", None),
+            "D:\\Audit\\all.csv"
+        );
+        assert_eq!(
+            security_log_export_path_for(&prefs, "local", Some(12)),
+            "D:\\Audit\\all.csv",
+            "a practice-wide path is inherited until the patient has its own"
+        );
+        prefs.set_user_export_path(
+            "local",
+            patient_export_key(EXPORT_KEY_SECURITY_LOG, 12),
+            "D:\\Audit\\patient-12.csv",
+        );
+        assert_eq!(
+            security_log_export_path_for(&prefs, "local", Some(12)),
+            "D:\\Audit\\patient-12.csv"
+        );
+    }
+
+    #[test]
     fn report_kind_file_stems_round_trip() {
         for kind in ReportKind::ALL {
             assert_eq!(ReportKind::from_file_stem(kind.file_stem()), Some(kind));
@@ -12643,6 +12765,26 @@ mod tests {
     }
 
     #[test]
+    fn dedicated_export_caches_reset_when_the_user_changes() {
+        let mut app = OdApp::new();
+        app.report_prefs = ReportPreferences::default();
+        assert_eq!(app.security_log_export_patient, None);
+
+        // A previous user's account view leaves these sentinels pointing at a
+        // patient. Restoring another user's report view must invalidate them
+        // so the next view reloads that user's filing locations.
+        app.account_ledger_export_patient = 12;
+        app.account_audit_export_patient = 12;
+        app.statement_pdf_patient = 12;
+        app.security_log_export_patient = Some(12);
+        app.load_report_user_view();
+        assert_eq!(app.account_ledger_export_patient, 0);
+        assert_eq!(app.account_audit_export_patient, 0);
+        assert_eq!(app.statement_pdf_patient, 0);
+        assert_eq!(app.security_log_export_patient, None);
+    }
+
+    #[test]
     fn report_sort_follows_the_signed_in_user_and_report() {
         let mut app = OdApp::new();
         let key = app.period_close_history_user_key();
@@ -12688,39 +12830,49 @@ mod tests {
     }
 
     #[test]
-    fn collections_export_title_records_the_active_aging_band() {
-        assert_eq!(collections_export_title(None), "Collections (All bands)");
-        for (bucket, expected) in [
-            (
-                CollectionsAgingBucket::Current,
-                "Collections (0-30 days band)",
-            ),
-            (
-                CollectionsAgingBucket::Days31To60,
-                "Collections (31-60 days band)",
-            ),
-            (
-                CollectionsAgingBucket::Days61To90,
-                "Collections (61-90 days band)",
-            ),
-            (
-                CollectionsAgingBucket::Over90,
-                "Collections (90+ days band)",
-            ),
+    fn collections_export_title_records_band_date_and_visible_totals() {
+        let rows = vec![
+            collections_test_row(1, "Alvarez, Marta", 8, 50.0),
+            collections_test_row(2, "Chen, Lily", 1, 148.0),
+        ];
+        let as_of = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let suffix = "as of 2026-11-26 · 2 patient account(s) · 198.00 total";
+
+        assert_eq!(
+            collections_export_title(None, as_of, &rows),
+            format!("Collections (All bands · {suffix})")
+        );
+        for (bucket, scope) in [
+            (CollectionsAgingBucket::Current, "0-30 days band"),
+            (CollectionsAgingBucket::Days31To60, "31-60 days band"),
+            (CollectionsAgingBucket::Days61To90, "61-90 days band"),
+            (CollectionsAgingBucket::Over90, "Over 90 days band"),
         ] {
-            assert_eq!(collections_export_title(Some(bucket)), expected);
+            assert_eq!(
+                collections_export_title(Some(bucket), as_of, &rows),
+                format!("Collections ({scope} · {suffix})")
+            );
         }
 
-        // Both saved formats carry the band in their header, not just on screen.
+        // An empty band still records zero visible rows and a zero total.
+        let empty = collections_export_title(Some(CollectionsAgingBucket::Over90), as_of, &[]);
+        assert_eq!(
+            empty,
+            "Collections (Over 90 days band · as of 2026-11-26 · 0 patient account(s) · 0.00 total)"
+        );
+
+        // Both saved formats carry the whole header, not just the on-screen
+        // summary; the count and total describe the visible (filtered) rows.
         let table = ReportTable {
             headers: vec!["Patient".into(), "Balance".into()],
-            rows: vec![vec!["Chen, Mei".into(), "99.00".into()]],
+            rows: vec![vec!["Chen, Lily".into(), "148.00".into()]],
         };
-        let title = collections_export_title(Some(CollectionsAgingBucket::Days61To90));
+        let title = collections_export_title(Some(CollectionsAgingBucket::Current), as_of, &rows);
+        let expected = "Collections (0-30 days band · as of 2026-11-26 · 2 patient account(s) · 198.00 total)";
         let csv = render_report_csv(&title, "Highland Dental", &table);
-        assert!(csv.contains("Collections (61-90 days band)"), "{csv}");
+        assert!(csv.contains(expected), "{csv}");
         let html = render_report_html(&title, "Highland Dental", &table);
-        assert!(html.contains("Collections (61-90 days band)"), "{html}");
+        assert!(html.contains(expected), "{html}");
     }
 
     #[test]
@@ -13645,6 +13797,9 @@ mod tests {
         );
         assert_eq!(ReportKind::LedgerTieOut.file_stem(), "ledger-tie-out");
         assert!(ReportKind::LedgerTieOut.uses_date_range());
+        // The plan-creation filter reads the hidden start date, so the picker
+        // must show both dates for this report.
+        assert!(ReportKind::PayPlanDetail.uses_date_range());
         assert_eq!(ReportKind::PeriodCloseHistory.label(), "Period close history");
         assert_eq!(
             ReportKind::PeriodCloseHistory.feature_key(),

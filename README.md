@@ -412,15 +412,18 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   a contact number. Each row can **Open account**, **Record payment** or
   generate a **Statement**, so staff can close the collection loop without
   leaving the report. An aging triage strip groups patients into 0–30, 31–60,
-  61–90 and 90+ day bands using the displayed days-overdue value; each band
-  shows its patient count and balance total, and selecting a band filters the
+  61–90 and Over 90 day bands (day 90 stays in 61–90; the saved token remains
+  `90+`) using the displayed days-overdue value; each band shows its patient
+  count and balance total, and selecting a band filters the
   whole patient rows (never splitting a balance). The selected band is saved per
   signed-in user in `reports.txt` (`collections_bucket.<user>`), so a restart or
   login switch restores each user's triage view. The summary and exported
-  CSV/HTML follow the visible rows, and the active band is named in the export
-  header (`Collections (61-90 days band)`, or `All bands`) so a saved file
-  records which slice it represents. Zero and credit balances are hidden, as in
-  OD's collection lists.
+  CSV/HTML follow the visible rows, and the export header records the active
+  band, as-of date and visible-row count and balance total, e.g.
+  `Collections (61-90 days band · as of 2026-11-26 · 2 patient account(s) ·
+  198.00 total)` (or `All bands` when unfiltered), so a filed CSV or HTML is
+  self-describing. Zero and credit balances are hidden, as in OD's collection
+  lists.
 * **Statements:** generate a patient-only statement (charges, adjustments,
   payments and per-plan balances, with no insurance columns), write a dated OD
   `statement` row and open a print-ready HTML page in the browser. **Save PDF**
@@ -536,7 +539,7 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
 * Upstream `FormRp*` tranche 1: four reports ported from the public 24_3 C#
   source with OD's own column layout, each with its own toggle (on by default):
   * **Patient aging** (`FormRpAging` / `Ledgers.GetAgingQueryString`): balances
-    in `0-30`, `31-60`, `61-90` and `> 90` buckets, credits applied to the oldest
+    in `0-30`, `31-60`, `61-90` and `Over 90` buckets, credits applied to the oldest
     debt first, and a total row. Charges after the as-of date are excluded, so a
     past date is reproducible. Its "Age of Account" radios (Any / Over 30 / Over
     60 / Over 90), negative-balance checkboxes, "Last Pay Date" and "Age
@@ -1069,11 +1072,13 @@ The original contains roughly 32,000 methods, so the following remain to be
 built once the foundation is validated: claim creation/submission and
 adjudication, the remaining eServices transports (WhatsApp Cloud API, GSM
 modem, Africa's Talking, SMS.to) and patient forms. Implemented reports are the
-local slices (recall/ASAP, payment-plan balances, treatment-plan summaries)
-plus 44 upstream `FormRp*` ports across four fidelity tranches — 51 report kinds in total
-(the first tranche through Patients, plus the accounting, ledger, clinical,
-production, plan, public-health, print-oriented and payment/unscheduled-treatment
-reports listed above).
+local slices (recall/ASAP, payment-plan balances, treatment-plan summaries,
+patient list, production, Collections, schedule, charge applications and
+ledger/period-close reports) plus 44 upstream `FormRp*` ports across four
+fidelity tranches — 55 report kinds in total (the first tranche through
+Patients, plus the accounting, ledger, clinical, production, plan,
+public-health, print-oriented and payment/unscheduled-treatment reports listed
+above).
 Fourteen upstream forms remain deliberately skipped: twelve insurance/claims-
 bound reports (off by default for the Ethiopia domain, where patient payments
 and payment plans are primary) and two Arizona-specific reports. The local

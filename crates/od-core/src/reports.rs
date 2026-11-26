@@ -463,7 +463,7 @@ impl CollectionsAgingBucket {
             Self::Current => "0-30 days",
             Self::Days31To60 => "31-60 days",
             Self::Days61To90 => "61-90 days",
-            Self::Over90 => "90+ days",
+            Self::Over90 => "Over 90 days",
         }
     }
 
@@ -1498,9 +1498,16 @@ pub fn pay_plan_detail_report(
             .filter(|charge| charge.charge_date <= as_of)
             .map(|charge| charge.interest)
             .sum();
+        // Match the as-of filter used by `pay_plan_balance_breakdown`, so Paid
+        // cannot include a payment made after the report's as-of date.
         let paid: f64 = splits
             .iter()
-            .filter(|split| split.pay_plan_num == plan.pay_plan_num)
+            .filter(|split| {
+                split.pay_plan_num == plan.pay_plan_num
+                    && (split.date_pay == chrono::NaiveDate::default()
+                        || split.date_pay.year() <= 1
+                        || split.date_pay <= as_of)
+            })
             .map(|split| split.split_amount)
             .sum();
         let breakdown = crate::pay_plan_balance_breakdown(plan, charges, splits, as_of);
@@ -1556,10 +1563,25 @@ pub fn pay_plan_detail_report(
         }
         table.push(&values.iter().map(String::as_str).collect::<Vec<_>>());
 
-        for (total_index, column) in numeric_columns.iter().enumerate() {
-            if let Ok(number) = values[*column].parse::<f64>() {
-                totals[total_index] += number;
-            }
+        // Accumulate from the numbers, not the rendered cells: the unapplied
+        // credit cell may carry reconciliation text that is not parseable.
+        let mut row_numbers = vec![
+            princ,
+            interest,
+            paid,
+            balance,
+            due,
+            not_due,
+            unapplied_credit,
+        ];
+        if options.show_family_balance {
+            row_numbers.push(family_balance);
+        }
+        if show_reasons {
+            row_numbers.push(resolved_count as f64);
+        }
+        for (total, number) in totals.iter_mut().zip(row_numbers) {
+            *total += number;
         }
         shown += 1;
     }
@@ -1583,7 +1605,9 @@ pub fn pay_plan_detail_report(
 /// wraps the new year (from > to) still works. The age is calculated as of the
 /// report date, as in the original's `Age` column.
 fn month_day_ordinal(month: u32, day: u32) -> u32 {
-    const MONTH_STARTS: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    // A 366-slot calendar gives Feb 29 its own day: on a non-leap year an
+    // ordinal of 60 used to mean both Feb 29 and Mar 1.
+    const MONTH_STARTS: [u32; 12] = [0, 31, 60, 91, 121, 152, 182, 213, 244, 274, 305, 335];
     MONTH_STARTS[(month - 1) as usize] + day
 }
 
@@ -1606,7 +1630,7 @@ pub fn birthday_report(
             let ordinal = month_day_ordinal(birth.month(), birth.day());
             // Rotate the calendar so a range wrapping the new year stays in
             // chronological order from the selected start date.
-            let offset = (ordinal + 365 - from_ordinal) % 365;
+            let offset = (ordinal + 366 - from_ordinal) % 366;
             let in_range = if from_ordinal <= to_ordinal {
                 from_ordinal <= ordinal && ordinal <= to_ordinal
             } else {
@@ -4355,7 +4379,10 @@ mod tests {
             .iter()
             .map(|bucket| bucket.label())
             .collect();
-        assert_eq!(labels, ["0-30 days", "31-60 days", "61-90 days", "90+ days"]);
+        assert_eq!(
+            labels,
+            ["0-30 days", "31-60 days", "61-90 days", "Over 90 days"]
+        );
         for (index, bucket) in CollectionsAgingBucket::ALL.iter().enumerate() {
             assert_eq!(bucket.index(), index);
         }
@@ -4610,6 +4637,139 @@ mod tests {
         let row = &table.rows[0];
         assert!(row[8].contains("issued 1/2"), "reconciliation shows issued/expected-due: {:?}", row[8]);
         assert!(row[8].contains("missing 1"), "reconciliation shows missing due: {:?}", row[8]);
+    }
+
+    #[test]
+    fn pay_plan_detail_paid_and_footer_follow_as_of() {
+        let patients = [patient(1, "Alvarez")];
+        let plan = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 1,
+            guarantor: 1,
+            pay_plan_date: day(2026, 1, 1),
+            ..Default::default()
+        };
+        let charges = [PayPlanCharge {
+            pay_plan_num: 8,
+            charge_date: day(2026, 1, 1),
+            charge_type: PayPlanChargeType::Debit,
+            principal: 100.0,
+            ..Default::default()
+        }];
+        let splits = [
+            PaySplit {
+                pay_plan_num: 8,
+                split_amount: 30.0,
+                date_pay: day(2026, 1, 15),
+                ..Default::default()
+            },
+            PaySplit {
+                pay_plan_num: 8,
+                split_amount: 20.0,
+                date_pay: day(2026, 3, 1),
+                ..Default::default()
+            },
+        ];
+        let table = pay_plan_detail_report(
+            &[plan],
+            &charges,
+            &splits,
+            &[],
+            &[],
+            &[],
+            &patients,
+            &[],
+            &[],
+            day(2026, 1, 1),
+            day(2026, 2, 1),
+            false,
+            PayPlanReportOptions::default(),
+        );
+        assert_eq!(table.rows[0][4], "30.00", "Paid excludes post-as-of splits");
+        assert_eq!(
+            table.rows.last().unwrap()[4],
+            "30.00",
+            "footer Paid must match the visible as-of amount"
+        );
+    }
+
+    #[test]
+    fn pay_plan_detail_footer_totals_unapplied_credit_with_reconciliation_text() {
+        let patients = [patient(1, "Alvarez")];
+        let providers = [Provider {
+            provider_num: 7,
+            l_name: "Smith".into(),
+            f_name: "Jo".into(),
+            ..Default::default()
+        }];
+        let plan = PayPlan {
+            pay_plan_num: 8,
+            pat_num: 1,
+            guarantor: 1,
+            pay_plan_date: day(2026, 1, 1),
+            is_dynamic: true,
+            pay_amt: 100.0,
+            charge_frequency: od_domain::PayPlanFrequency::Monthly,
+            pay_schedule: od_domain::PaymentSchedule::Monthly,
+            date_pay_plan_start: Some(day(2026, 1, 1)),
+            ..Default::default()
+        };
+        let links = [PayPlanLink {
+            pay_plan_link_num: 1,
+            pay_plan_num: 8,
+            link_type: PayPlanLink::PROCEDURE,
+            fkey: 100,
+            ..Default::default()
+        }];
+        let procedures = [Procedure {
+            proc_num: 100,
+            pat_num: 1,
+            proc_status: ProcedureStatus::Complete,
+            fee: 300.0,
+            proc_date: day(2026, 1, 2),
+            ..Default::default()
+        }];
+        let charges = [PayPlanCharge {
+            pay_plan_num: 8,
+            charge_date: day(2026, 1, 1),
+            charge_type: PayPlanChargeType::Debit,
+            principal: 100.0,
+            provider_num: 7,
+            fkey: 100,
+            link_type: PayPlanLink::PROCEDURE,
+            ..Default::default()
+        }];
+        let splits = [PaySplit {
+            pay_plan_num: 8,
+            split_amount: 120.0,
+            date_pay: day(2026, 1, 15),
+            ..Default::default()
+        }];
+        let table = pay_plan_detail_report(
+            &[plan],
+            &charges,
+            &splits,
+            &links,
+            &procedures,
+            &[],
+            &patients,
+            &providers,
+            &[],
+            day(2026, 1, 1),
+            day(2026, 2, 15),
+            false,
+            PayPlanReportOptions::default(),
+        );
+        assert!(
+            table.rows[0][8].starts_with("20.00"),
+            "row cell should carry credit plus reconciliation text: {:?}",
+            table.rows[0][8]
+        );
+        assert_eq!(
+            table.rows.last().unwrap()[8],
+            "20.00",
+            "footer must total the numeric credit, not parse the decorated cell"
+        );
     }
 
     #[test]
@@ -5438,6 +5598,23 @@ mod tests {
             },
         );
         assert_eq!(excluded.rows.len(), 1, "no production means no detail row");
+    }
+
+    #[test]
+    fn birthday_report_keeps_leap_day_distinct_from_march_first() {
+        let mut leap = patient(1, "Leap");
+        leap.birth_date = Some(day(2000, 2, 29));
+        let mut march = patient(2, "March");
+        march.birth_date = Some(day(2000, 3, 1));
+        let patients = [leap, march];
+
+        let feb = birthday_report(&patients, day(2028, 2, 29), day(2028, 2, 29), day(2026, 6, 1));
+        assert_eq!(feb.rows.len(), 1, "Feb 29 must have its own day in the range");
+        assert_eq!(feb.rows[0][0], "Leap");
+
+        let mar = birthday_report(&patients, day(2026, 3, 1), day(2026, 3, 1), day(2026, 6, 1));
+        assert_eq!(mar.rows.len(), 1, "Mar 1 range must not pick up Feb 29");
+        assert_eq!(mar.rows[0][0], "March");
     }
 
     #[test]

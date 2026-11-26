@@ -1536,8 +1536,14 @@ impl ReportPreferences {
         if value { "true" } else { "false" }
     }
 
-    fn parse_bool(value: &str) -> bool {
-        matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+    /// `None` means the token is not a boolean at all (or is malformed), so
+    /// callers can keep their existing/default value instead of guessing false.
+    fn parse_bool(value: &str) -> Option<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some(true),
+            "0" | "false" | "no" => Some(false),
+            _ => None,
+        }
     }
 
     /// Parse a comma-separated field list, keeping only recognised names in the
@@ -1608,6 +1614,10 @@ impl ReportPreferences {
             ("pay_plans.show_family_balance", self.pay_plans.show_family_balance),
             ("pay_plans.limit_date_range", self.pay_plans.limit_date_range),
             ("pay_plans.hide_completed", self.pay_plans.hide_completed),
+            (
+                "pay_plans.show_stale_resolved",
+                self.pay_plans.show_stale_resolved,
+            ),
             ("pay_plans.only_stale_resolved", self.pay_plans.only_stale_resolved),
             (
                 "pay_plan_charge_applications.only_refunds_transfers",
@@ -2094,6 +2104,17 @@ impl ReportPreferences {
 
     pub fn from_text(text: &str) -> Self {
         let mut prefs = Self::default();
+        // The canonical option serializer writes every checkbox as `true` or
+        // `false`. Deriving the fallback set from it avoids a second list that
+        // could drift, and keeps a malformed token from silently switching a
+        // default-on option off.
+        let defaults_text = Self::default().to_text();
+        let bool_defaults: HashMap<&str, bool> = defaults_text
+            .lines()
+            .filter_map(|line| line.strip_prefix(Self::OPTION_PREFIX))
+            .filter_map(|line| line.split_once('='))
+            .filter_map(|(name, value)| Self::parse_bool(value).map(|flag| (name, flag)))
+            .collect();
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -2140,7 +2161,7 @@ impl ReportPreferences {
                     .or_default();
                 match field {
                     "column" => sort.column = value.parse().unwrap_or(0),
-                    "desc" => sort.descending = Self::parse_bool(value),
+                    "desc" => sort.descending = Self::parse_bool(value).unwrap_or(false),
                     _ => {}
                 }
             } else if let Some(view_key) = key.strip_prefix(Self::PERIOD_CLOSE_HISTORY_PREFIX) {
@@ -2196,7 +2217,9 @@ impl ReportPreferences {
                         .insert(user_key.to_string(), value.to_string());
                 }
             } else if let Some(option) = key.strip_prefix(Self::OPTION_PREFIX) {
-                let flag = Self::parse_bool(value);
+                let flag = Self::parse_bool(value)
+                    .or_else(|| bool_defaults.get(option).copied())
+                    .unwrap_or(false);
                 match option {
                     "aging.age" => prefs.aging.age = AgingAgeFilter::from_str(value),
                     "aging.include_negative" => prefs.aging.include_negative = flag,
@@ -2280,6 +2303,9 @@ impl ReportPreferences {
                     "pay_plans.show_family_balance" => prefs.pay_plans.show_family_balance = flag,
                     "pay_plans.limit_date_range" => prefs.pay_plans.limit_date_range = flag,
                     "pay_plans.hide_completed" => prefs.pay_plans.hide_completed = flag,
+                    "pay_plans.show_stale_resolved" => {
+                        prefs.pay_plans.show_stale_resolved = flag
+                    }
                     "pay_plans.only_stale_resolved" => {
                         prefs.pay_plans.only_stale_resolved = flag
                     }
@@ -2660,6 +2686,44 @@ mod tests {
             loaded.export_path("recall-asap"),
             Some("C:\\Reports\\recall.csv")
         );
+    }
+
+    #[test]
+    fn pay_plan_stale_resolved_option_survives_preferences_round_trip() {
+        let mut prefs = ReportPreferences::default();
+        assert!(prefs.pay_plans.show_stale_resolved);
+        prefs.pay_plans.show_stale_resolved = false;
+        prefs.snapshot_user_options("user-3");
+
+        let text = prefs.to_text();
+        assert!(text.contains("option.pay_plans.show_stale_resolved=false"));
+
+        let mut loaded = ReportPreferences::from_text(&text);
+        assert!(!loaded.pay_plans.show_stale_resolved);
+        loaded.restore_user_options("user-3");
+        assert!(
+            !loaded.pay_plans.show_stale_resolved,
+            "the checkbox must not revert to its default after a restart or login switch"
+        );
+    }
+
+    #[test]
+    fn malformed_bool_tokens_keep_the_factory_default() {
+        let prefs = ReportPreferences::from_text(
+            "option.prod_inc.include_unearned=on\noption.pay_plans.show_stale_resolved=maybe\n",
+        );
+        assert!(
+            prefs.prod_inc.include_unearned,
+            "an unrecognised value must not turn a default-on option off"
+        );
+        assert!(prefs.pay_plans.show_stale_resolved);
+
+        // Explicit false still wins, and default-off options stay off.
+        let prefs = ReportPreferences::from_text(
+            "option.prod_inc.include_unearned=false\noption.pay_plans.hide_completed=on\n",
+        );
+        assert!(!prefs.prod_inc.include_unearned);
+        assert!(!prefs.pay_plans.hide_completed);
     }
 
     #[test]

@@ -212,7 +212,7 @@ impl LaserInsMode {
 /// upstream's selection-button fields: a start/end carrier name paired with
 /// its address. OD concatenates them (plus `City` for the range query) to
 /// build the SQL key.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LaserLabelOptions {
     pub tab: LaserLabelTab,
     /// Selection mode on the insurance-company tab.
@@ -223,6 +223,22 @@ pub struct LaserLabelOptions {
     pub start_addr: String,
     pub end_name: String,
     pub end_addr: String,
+}
+
+impl Default for LaserLabelOptions {
+    fn default() -> Self {
+        Self {
+            tab: LaserLabelTab::default(),
+            ins_mode: LaserInsMode::default(),
+            // The GUI only allows 1..=100 and the builder clamps at 1, so a
+            // persisted default of 0 would be outside its own valid range.
+            ins_copies: 1,
+            start_name: String::new(),
+            start_addr: String::new(),
+            end_name: String::new(),
+            end_addr: String::new(),
+        }
+    }
 }
 
 /// The four tabs of `FormRpUnearnedIncome`.
@@ -343,4 +359,19 @@ pub struct TreatmentFinderReportOptions {
     /// empty `code1` disables the filter.
     pub code1: String,
     pub code2: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LaserLabelOptions;
+
+    #[test]
+    fn laser_label_default_copies_match_the_gui_range() {
+        let options = LaserLabelOptions::default();
+        assert!(
+            (1..=100).contains(&options.ins_copies),
+            "default {} is outside the GUI's 1..=100 range",
+            options.ins_copies
+        );
+    }
 }

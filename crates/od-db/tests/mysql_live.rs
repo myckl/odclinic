@@ -622,6 +622,18 @@ fn mysql_backend_collections_worklist_tracks_patient_payment() {
     );
 
     let pat_num = 2_100_000_010u32;
+    // An earlier aborted run can leave this test's synthetic patient and its
+    // child rows behind. Remove only that exact fixture before writing, so the
+    // worklist starts from a known 300.00 charge.
+    for cleanup in [
+        format!("DELETE FROM paysplit WHERE PatNum = {pat_num}"),
+        format!("DELETE FROM payment WHERE PatNum = {pat_num}"),
+        format!("DELETE FROM procedurelog WHERE PatNum = {pat_num}"),
+        format!("DELETE FROM patient WHERE PatNum = {pat_num}"),
+    ] {
+        conn.query_drop(cleanup)
+            .expect("stale collections fixture cleanup failed");
+    }
     let mut patient = Patient::default();
     patient.pat_num = pat_num;
     patient.l_name = "ODCLINIC_LIVE_COLLECTIONS".into();
@@ -4655,6 +4667,23 @@ fn mysql_live_charge_journal_batch_round_trip() {
     let accounts: Vec<Account> = store.list_accounts().expect("list_accounts failed");
     assert!(accounts.len() >= 2, "need two accounts for a balanced pair");
     let pat_num = store.list_patients().unwrap()[0].pat_num;
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    // If an earlier run aborted before its cleanup, these synthetic journal
+    // lines are still posted and make the "not yet posted" precondition fail.
+    // Delete only this test's two labelled charges first.
+    conn.query_drop(
+        "DELETE FROM journalentry \
+         WHERE LOCATE('ODCLINIC_LIVE_TEST_CHARGE_0', Memo) > 0 \
+            OR LOCATE('ODCLINIC_LIVE_TEST_CHARGE_1', Memo) > 0",
+    )
+    .expect("stale charge journal cleanup failed");
     let procedures: Vec<Procedure> = [0, 1]
         .map(|i| Procedure {
             proc_num: 2_100_000_100 + i,
@@ -4718,14 +4747,6 @@ fn mysql_live_charge_journal_batch_round_trip() {
     assert!(flat.contains("ODCLINIC_LIVE_TEST_CHARGE_0"));
     assert!(flat.contains("ODCLINIC_LIVE_TEST_CHARGE_1"));
 
-    let normalized = if url.contains("://") {
-        url.trim().to_string()
-    } else {
-        format!("mysql://{}", url.trim())
-    };
-    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
-    let pool = mysql::Pool::new(opts).expect("bad pool");
-    let mut conn = pool.get_conn().expect("bad connection");
     let in_clause = txns
         .iter()
         .map(ToString::to_string)

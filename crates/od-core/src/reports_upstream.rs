@@ -174,13 +174,15 @@ pub fn balance_sheet_report(
         for account in accounts
             .iter()
             .filter(|a| a.account_type == account_type)
-            .filter(|a| !a.inactive)
         {
             let entries: Vec<&JournalEntry> = journal
                 .iter()
                 .filter(|e| e.account_num == account.account_num && e.date_displayed <= as_of)
                 .collect();
             let mut balance = account_movement(&entries, account_type.debit_is_pos());
+            if account.inactive && balance == 0.0 {
+                continue;
+            }
             if account.is_retained_earnings {
                 // Prior-year income/expense flows into retained earnings.
                 for entry in journal.iter().filter(|e| {
@@ -211,7 +213,11 @@ pub fn balance_sheet_report(
         let mut net = 0.0;
         for entry in journal
             .iter()
-            .filter(|e| e.date_displayed.year() == year && is_income_or_expense(accounts, e.account_num))
+            .filter(|e| {
+                e.date_displayed.year() == year
+                    && e.date_displayed <= as_of
+                    && is_income_or_expense(accounts, e.account_num)
+            })
         {
             net += net_income_contribution(entry, true);
         }
@@ -1669,18 +1675,25 @@ pub fn receivables_breakdown_report(
     let mut table = ReportTable::new(&headers);
     let mut buckets: BTreeMap<Id, [f64; 5]> = BTreeMap::new();
     let mut paid_by_proc: HashMap<Id, f64> = HashMap::new();
-    for split in splits {
+    for split in splits.iter().filter(|split| split.date_pay <= as_of) {
         *paid_by_proc.entry(split.proc_num).or_default() += split.split_amount;
     }
-    let mut ins_est_by_pat: HashMap<Id, f64> = HashMap::new();
+    // Each estimate belongs to one billing-type row, not to every row.
+    let mut ins_est_by_type: HashMap<Id, f64> = HashMap::new();
     if insurance_enabled {
         for cp in claim_procs.iter().filter(|cp| matches!(cp.status, 0 | 6)) {
-            *ins_est_by_pat.entry(cp.proc_num).or_default() += cp.ins_pay_est;
+            let Some(proc) = procedures.iter().find(|p| p.proc_num == cp.proc_num) else {
+                continue;
+            };
+            let Some(pat) = patients.iter().find(|p| p.pat_num == proc.pat_num) else {
+                continue;
+            };
+            *ins_est_by_type.entry(pat.billing_type).or_default() += cp.ins_pay_est;
         }
     }
     for proc in procedures
         .iter()
-        .filter(|p| p.proc_status == ProcedureStatus::Complete)
+        .filter(|p| p.proc_status == ProcedureStatus::Complete && p.proc_date <= as_of)
     {
         let pat = match patients.iter().find(|pat| pat.pat_num == proc.pat_num) {
             Some(pat) => pat,
@@ -1708,7 +1721,7 @@ pub fn receivables_breakdown_report(
         let mut values: Vec<String> = amounts.iter().map(|a| money(*a)).collect();
         values.insert(0, label);
         if insurance_enabled {
-            let ins: f64 = ins_est_by_pat.values().sum();
+            let ins = ins_est_by_type.get(&billing_type).copied().unwrap_or(0.0);
             values.push(money(ins));
         }
         table.push(&values.iter().map(String::as_str).collect::<Vec<_>>());
@@ -1907,11 +1920,21 @@ pub fn dpp_overcharged_report(
                 continue;
             }
             let pat_overpaid = (-round2(portion_on_plan - paid_on_plan)).max(0.0);
+            let provider = charges
+                .iter()
+                .find(|c| {
+                    c.pay_plan_num == plan.pay_plan_num
+                        && c.charge_type == PayPlanChargeType::Debit
+                        && c.provider_num != 0
+                })
+                .and_then(|c| providers.iter().find(|p| p.provider_num == c.provider_num))
+                .map(|p| p.abbreviation.clone())
+                .unwrap_or_default();
             table.push(&[
                 &plan.date_pay_plan_start.map(short_date).unwrap_or_default(),
                 &patient_last_first(patients, plan.pat_num),
                 &patient_last_first(patients, plan.guarantor),
-                &providers.first().map(|p| p.abbreviation.clone()).unwrap_or_default(),
+                &provider,
                 &"",
                 &"",
                 &money(plan.completed_amt),
@@ -2819,6 +2842,66 @@ mod tests {
     }
 
     #[test]
+    fn balance_sheet_honours_as_of_and_keeps_only_nonzero_inactive_accounts() {
+        let accounts = vec![
+            Account {
+                account_num: 1,
+                description: "Inactive Cash".into(),
+                account_type: AccountType::Asset,
+                inactive: true,
+                ..Default::default()
+            },
+            Account {
+                account_num: 2,
+                description: "Zero Cash".into(),
+                account_type: AccountType::Asset,
+                inactive: true,
+                ..Default::default()
+            },
+            Account {
+                account_num: 3,
+                description: "Fees".into(),
+                account_type: AccountType::Income,
+                ..Default::default()
+            },
+        ];
+        let journal = vec![
+            JournalEntry {
+                journal_entry_num: 1,
+                account_num: 1,
+                date_displayed: date(2026, 2, 1),
+                debit_amt: 50.0,
+                ..Default::default()
+            },
+            JournalEntry {
+                journal_entry_num: 2,
+                account_num: 3,
+                date_displayed: date(2026, 3, 1),
+                credit_amt: 50.0,
+                ..Default::default()
+            },
+            JournalEntry {
+                journal_entry_num: 3,
+                account_num: 3,
+                date_displayed: date(2026, 9, 1),
+                credit_amt: 999.0,
+                ..Default::default()
+            },
+        ];
+        let table = balance_sheet_report(&accounts, &journal, date(2026, 6, 30), true);
+        assert!(row_matches(&table, &["Inactive Cash", "", "50.00"]));
+        assert!(
+            !row_matches(&table, &["Zero Cash", "", "0.00"]),
+            "zero inactive accounts should stay hidden"
+        );
+        assert!(
+            row_matches(&table, &["NetIncomeThisYear", "Equity", "-50.00"]),
+            "the September entry is after the as-of date: {:?}",
+            table.rows
+        );
+    }
+
+    #[test]
     fn retained_earnings_fold_prior_year_results() {
         let accounts = vec![
             Account {
@@ -3074,6 +3157,104 @@ mod tests {
             true,
         );
         assert_eq!(with_ins.headers.len(), 7);
+    }
+
+    #[test]
+    fn receivables_uses_as_of_for_payments_and_future_procedures() {
+        let mut pat = patient(1, "Ada", "Lovelace");
+        pat.billing_type = 5;
+        let definitions = vec![Definition {
+            def_num: 5,
+            category: DefinitionCategory::BILLING_TYPES,
+            item_name: "Cash".into(),
+            ..Default::default()
+        }];
+        let procedures = vec![
+            procedure(1, 1, 1, date(2026, 12, 15), 100.0),
+            procedure(2, 1, 1, date(2027, 1, 15), 50.0),
+        ];
+        let splits = vec![
+            PaySplit {
+                split_num: 1,
+                proc_num: 1,
+                split_amount: 10.0,
+                date_pay: date(2026, 12, 20),
+                ..Default::default()
+            },
+            PaySplit {
+                split_num: 2,
+                proc_num: 1,
+                split_amount: 40.0,
+                date_pay: date(2027, 1, 10),
+                ..Default::default()
+            },
+        ];
+        let table = receivables_breakdown_report(
+            &[pat],
+            &definitions,
+            &procedures,
+            &splits,
+            &[],
+            date(2026, 12, 31),
+            false,
+        );
+        assert!(
+            row_matches(
+                &table,
+                &["Cash", "90.00", "0.00", "0.00", "0.00", "90.00"]
+            ),
+            "payments after the as-of date and future procedures must be excluded: {:?}",
+            table.rows
+        );
+    }
+
+    #[test]
+    fn receivables_insurance_estimate_stays_on_its_billing_type() {
+        let mut cash = patient(1, "Ada", "Lovelace");
+        cash.billing_type = 5;
+        let mut other = patient(2, "Ben", "Chen");
+        other.billing_type = 6;
+        let definitions = vec![
+            Definition {
+                def_num: 5,
+                category: DefinitionCategory::BILLING_TYPES,
+                item_name: "Cash".into(),
+                ..Default::default()
+            },
+            Definition {
+                def_num: 6,
+                category: DefinitionCategory::BILLING_TYPES,
+                item_name: "Other".into(),
+                ..Default::default()
+            },
+        ];
+        let procedures = vec![
+            procedure(1, 1, 1, date(2026, 12, 1), 100.0),
+            procedure(2, 2, 1, date(2026, 12, 1), 100.0),
+        ];
+        let claim_procs = vec![ClaimProc {
+            claim_proc_num: 1,
+            proc_num: 1,
+            status: 0,
+            ins_pay_est: 25.0,
+            ..Default::default()
+        }];
+        let table = receivables_breakdown_report(
+            &[cash, other],
+            &definitions,
+            &procedures,
+            &[],
+            &claim_procs,
+            date(2026, 12, 31),
+            true,
+        );
+        let estimates: Vec<&str> = table
+            .rows
+            .iter()
+            .map(|row| (row[0].as_str(), row[6].as_str()))
+            .filter_map(|(label, ins)| (label == "Cash" || label == "Other").then_some(ins))
+            .collect();
+        assert_eq!(estimates, vec!["25.00", "0.00"]);
     }
 
     #[test]
