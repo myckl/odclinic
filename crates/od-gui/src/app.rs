@@ -6,9 +6,11 @@
 
 mod definitions;
 mod eservices;
+mod schedule_board;
 
 use definitions::DefinitionsTab;
 use eservices::EServicesTab;
+use schedule_board::ScheduleBoard;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1739,6 +1741,8 @@ struct OdApp {
     search: String,
     selected_patient: Option<Id>,
     schedule_day: NaiveDate,
+    /// Day/week board state: view, stage quick-actions, holds and drag preview.
+    board: ScheduleBoard,
 
     patient_edit: Option<Patient>,
     patient_edit_open: bool,
@@ -2065,6 +2069,7 @@ impl OdApp {
             search: String::new(),
             selected_patient: None,
             schedule_day: today,
+            board: ScheduleBoard::load(today),
             patient_edit: None,
             patient_edit_open: false,
             birth_text: String::new(),
@@ -2286,8 +2291,9 @@ impl OdApp {
         if let Ok(rows) = self.store.list_operatories() {
             self.operatories = rows;
         }
-        let from = self.schedule_day.and_hms_opt(0, 0, 0).unwrap_or_default();
-        let to = from + Duration::days(1);
+        // The board shows a day or a week and its mini-calendar needs counts
+        // around the anchor, so load a bounded window once and filter in the UI.
+        let (from, to) = self.board.appointment_range(self.schedule_day);
         match self.store.list_appointments(from, to) {
             Ok(rows) => self.appointments = rows,
             Err(e) => self.error = Some(e),
@@ -2915,6 +2921,7 @@ impl OdApp {
         self.patient_history_window(&ctx);
         self.registry_window(&ctx);
         self.appointment_window(&ctx);
+        schedule_board::hold_window(self, &ctx);
         self.appointment_history_window(&ctx);
         self.recall_window(&ctx);
         self.adjustment_window(&ctx);
@@ -3030,6 +3037,14 @@ impl OdApp {
     }
 
     fn schedule_ui(&mut self, ui: &mut Ui) {
+        if self.features.enabled(FeatureKey::AppointmentBoard) {
+            schedule_board::board_ui(self, ui);
+        } else {
+            self.schedule_grid_ui(ui);
+        }
+    }
+
+    fn schedule_grid_ui(&mut self, ui: &mut Ui) {
         ui.horizontal(|ui| {
             if ui.button("< Previous day").clicked() {
                 self.schedule_day -= Duration::days(1);
@@ -12494,6 +12509,44 @@ impl OdApp {
                         });
                 });
                 ui.horizontal(|ui| {
+                    ui.label("Provider");
+                    let current = self
+                        .providers
+                        .iter()
+                        .find(|p| p.provider_num == apt.provider_num)
+                        .map(|p| p.display_name())
+                        .unwrap_or_else(|| format!("#{}", apt.provider_num));
+                    egui::ComboBox::from_id_salt("apt_provider")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for provider in &self.providers {
+                                ui.selectable_value(
+                                    &mut apt.provider_num,
+                                    provider.provider_num,
+                                    provider.display_name(),
+                                );
+                            }
+                        });
+                    ui.label("Operatory");
+                    let current = self
+                        .operatories
+                        .iter()
+                        .find(|o| o.operatory_num == apt.operatory_num)
+                        .map(|o| o.description.clone())
+                        .unwrap_or_else(|| format!("#{}", apt.operatory_num));
+                    egui::ComboBox::from_id_salt("apt_operatory")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            for operatory in &self.operatories {
+                                ui.selectable_value(
+                                    &mut apt.operatory_num,
+                                    operatory.operatory_num,
+                                    operatory.description.clone(),
+                                );
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
                     ui.label("Notes ");
                     ui.text_edit_singleline(&mut apt.notes);
                 });
@@ -12617,6 +12670,9 @@ impl OdApp {
                         )
                     };
                     self.audit_if(FeatureKey::AuditAppointmentChanges, permission, apt.pat_num, note);
+                    if let Some(hold_id) = self.board.pending_hold_delete.take() {
+                        self.board.remove_hold(hold_id);
+                    }
                     self.notice = Some("Appointment saved".into());
                     self.error = None;
                     self.refresh();

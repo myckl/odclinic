@@ -18,6 +18,15 @@ try {
     }
     $secretPaths += Join-Path $env:USERPROFILE '.config\openchamber\secrets\659cea82ea5e5605b1553d1e214fc5a8'
     $secretPaths += Join-Path $env:USERPROFILE '.config\openchamber\secrets\1d43d56de0ddf1aaf0654378aca9bf45'
+    # secret.request uses a request-specific filename, so also try the newest
+    # files in that directory. Their contents are read locally only to build
+    # the connection URL; they are never printed or copied into the project.
+    $secretsDir = Join-Path $env:USERPROFILE '.config\openchamber\secrets'
+    if (Test-Path -LiteralPath $secretsDir) {
+        Get-ChildItem -LiteralPath $secretsDir -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            ForEach-Object { $secretPaths += $_.FullName }
+    }
 
     if ([string]::IsNullOrWhiteSpace($env:ODCLINIC_DB_URL)) {
         $password = $env:MYSQL_ROOT_PASSWORD

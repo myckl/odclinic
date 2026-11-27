@@ -97,6 +97,7 @@ pub enum FeatureKey {
     AppointmentDelete,
     AppointmentConflictWarnings,
     AppointmentStatusColors,
+    AppointmentBoard,
     RecallsEnabled,
     AsapListEnabled,
     WaitlistEnabled,
@@ -200,7 +201,7 @@ pub enum FeatureKey {
 }
 
 impl FeatureKey {
-    pub const ALL: [Self; 114] = [
+    pub const ALL: [Self; 115] = [
         Self::ModuleAppointments,
         Self::ModuleFamily,
         Self::ModuleAccount,
@@ -217,6 +218,7 @@ impl FeatureKey {
         Self::AppointmentDelete,
         Self::AppointmentConflictWarnings,
         Self::AppointmentStatusColors,
+        Self::AppointmentBoard,
         Self::RecallsEnabled,
         Self::AsapListEnabled,
         Self::WaitlistEnabled,
@@ -335,6 +337,7 @@ impl FeatureKey {
             Self::AppointmentDelete => "appointment_delete",
             Self::AppointmentConflictWarnings => "appointment_conflict_warnings",
             Self::AppointmentStatusColors => "appointment_status_colors",
+            Self::AppointmentBoard => "appointment_board",
             Self::RecallsEnabled => "recalls_enabled",
             Self::AsapListEnabled => "asap_list_enabled",
             Self::WaitlistEnabled => "waitlist_enabled",
@@ -454,6 +457,7 @@ impl FeatureKey {
             Self::AppointmentDelete => "Delete appointments",
             Self::AppointmentConflictWarnings => "Schedule conflict warnings",
             Self::AppointmentStatusColors => "Colour-coded appointment statuses",
+            Self::AppointmentBoard => "Scheduling board",
             Self::RecallsEnabled => "Recall list",
             Self::AsapListEnabled => "ASAP list",
             Self::WaitlistEnabled => "Waitlist",
@@ -575,6 +579,7 @@ impl FeatureKey {
             Self::AppointmentDelete => "Show the Delete button in the appointment editor.",
             Self::AppointmentConflictWarnings => "Warn when an appointment overlaps another booking.",
             Self::AppointmentStatusColors => "Colour appointment buttons by status.",
+            Self::AppointmentBoard => "Show the decluttered day/week scheduling board: coloured provider/operatory columns, a patient pin board from OD's unscheduled list, waiting-room and recall sidebar, free-text blockout holds, hover details and lifecycle actions. On by default; turn it off for the older compact schedule grid.",
             Self::RecallsEnabled => "Show the patient recall list with due and overdue reminders. Uses the OD recall table.",
             Self::AsapListEnabled => "Show the ASAP list. In OD this is derived from appointment.Priority = 1, not a separate table.",
             Self::WaitlistEnabled => "Show the Waitlist tab in Appointments. This is OD's unscheduled list (AptStatus = 3), so removing someone deletes only that unscheduled row — no cancellation or reconfirmation message is generated.",
@@ -694,6 +699,7 @@ impl FeatureKey {
             | Self::AppointmentDelete
             | Self::AppointmentConflictWarnings
             | Self::AppointmentStatusColors
+            | Self::AppointmentBoard
             | Self::RecallsEnabled
             | Self::AsapListEnabled
             | Self::WaitlistEnabled => "Appointments",

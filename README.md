@@ -331,8 +331,8 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
 ## Implemented in this foundation
 
 * Module navigation and top menu; MySQL/demo backend selection at startup.
-* **Settings screen:** 110 on/off switches covering modules, patient actions,
-  appointment actions (including recalls and the ASAP list), account/billing
+* **Settings screen:** 115 on/off switches covering modules, patient actions,
+  appointment actions (including the scheduling board, recalls and the ASAP list), account/billing
   display (including insurance, payment plans and automatic discount pricing),
   procedure completion, treatment-plan editing,
   reports, local eServices, login, permission enforcement and audit granularity. Choices save automatically to
@@ -349,6 +349,17 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
 * REA-verified status/gender/permission codes, with regression tests in `od-domain`.
 * Appointments: day schedule by operatory with status colours, create/edit/
   delete, conflict detection against the same operatory or provider.
+* **Scheduling board:** the `appointment_board` toggle (on by default) replaces
+  the compact day grid with a decluttered Day/Week board: provider/operatory
+  columns, colour-coded appointment blocks, 15-minute drag/resize, patient
+  search that jumps to an appointment, an OD-backed pin board from the
+  unscheduled list, a mini-calendar, a waiting-room panel with Arrived → In room
+  → Check out → Done quick actions, and an OD recall sidebar with
+  **Schedule patient**. Free-text blockout holds (create/edit, move, resize,
+  recolour, duplicate, delete or book as an appointment) and visit-stage markers
+  are port-local in `%APPDATA%\odclinic\schedule_board.txt`, never invented as OD
+  rows. The appointment editor now also has Provider and Operatory selectors.
+  Turning the toggle off restores the original compact schedule grid.
 * **Recalls and ASAP list:** three tabs in Appointments. Recalls read/write the
   OD `recall` table with the editable `DateDue`, OD's packed `Interval` integer
   (years/months/weeks/days), status key, note, disabled flag and priority, sorted
