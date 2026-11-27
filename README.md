@@ -423,7 +423,14 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   `Collections (61-90 days band · as of 2026-11-26 · 2 patient account(s) ·
   198.00 total)` (or `All bands` when unfiltered), so a filed CSV or HTML is
   self-describing. Zero and credit balances are hidden, as in OD's collection
-  lists.
+  lists. **Generate statements for visible patients** writes one dated,
+  patient-only statement PDF per visible row into an editable, per-user folder
+  (`collections-statements.<user>` in `reports.txt`). The same statement builder
+  and gates as the Account/single-row paths are used; no insurance columns,
+  family grouping or cross-patient allocation is involved. A CSV and HTML
+  manifest in that folder repeat the export header and list each patient,
+  balance, statement number and PDF filename, and a security-log entry records
+  the batch band, count and total.
 * **Statements:** generate a patient-only statement (charges, adjustments,
   payments and per-plan balances, with no insurance columns), write a dated OD
   `statement` row and open a print-ready HTML page in the browser. **Save PDF**
@@ -431,16 +438,36 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   editable path and opens it in the default viewer. No PDF crate is used — the
   writer lives in `od-core/src/pdf.rs`. The line total ties to the Account
   balance. Gated by **Statements in Account** and the Billing permission.
+* **Patient credit:** an overpaid patient can apply their own credit to their
+  own oldest open charges with **Apply credit to own charges** in Account. The
+  action writes one balanced zero-amount `payment` with a negative unallocated
+  split and a positive split per procedure, validated by the same OD paysplit
+  rules and audited like any other billing change. Credit never moves to a
+  family member, guarantor or another patient. Gated by **Apply patient credit
+  to charges**, **Record payments and adjustments** and the OD Payment Create
+  permission.
+* **Patient forms:** Family → **Open form** renders a print-ready intake and
+  medical-history form from that patient's own demographics, `patientnote`
+  problems and `disease` rows; it opens in the browser with a Print button.
+  **Form PDF** writes a self-describing PDF 1.4 file to an editable path and
+  opens it. Forms are read-only snapshots (the heading carries the patient
+  number and generation date), never write patient data back, and are audited.
+  Gated by **Patient forms** and the OD Patient Edit permission; on by default.
 * **eServices (local reminders):** Setup → eServices has Channels, Reminder
   rules and Outbox tabs. Rules mirror OD `apptreminderrule` (type, 100 ns
   `TSPrior` ticks, `DoNotSendWithin`, `SendOrder`, templates); dedupe uses OD
   `apptremindersent`. The engine renders OD-style `{FirstName}` / `{DateTime}`
-  tokens, resolves a channel (OD `CommType` → Telegram for text, SMTP for
-  email), honours patient opt-outs, and writes to a local outbox instead of
-  OD's HQ-side AutoComm records. **SMTP email** (`lettre`, STARTTLS optional)
-  and the **Telegram Bot API** (`ureq`) deliver live; WhatsApp Cloud API,
-  local GSM modem, Africa's Talking and SMS.to are selectable/planned options
-  whose settings are already persisted in `%APPDATA%\odclinic\eservices.txt`.
+  tokens, resolves a channel (OD `CommType` → Telegram for text, falling back
+  to Africa's Talking SMS; `Preferred` keeps Telegram → SMTP → SMS; email stays
+  on SMTP), honours patient opt-outs, and writes to a local outbox instead of
+  OD's HQ-side AutoComm records. **SMTP email** (`lettre`, STARTTLS optional),
+  the **Telegram Bot API** and **Africa's Talking SMS** (`ureq`, form-encoded
+  `username`/`to`/`message` with the `Api-Key` header) deliver live; WhatsApp
+  Cloud API, local GSM modem and SMS.to remain selectable/planned options whose
+  settings are already persisted in `%APPDATA%\odclinic\eservices.txt`.
+  Africa's Talking needs the persisted username and API key from the Channels
+  tab and a patient mobile/home number; receipts and errors never echo the
+  key.
   New rules can be edited in the GUI, "Generate reminders" evaluates today's
   schedule, and "Deliver pending" sends queued rows with per-row status,
   attempt count, receipt/error and `securitylog` audits. **Dry-run is on by
@@ -1070,8 +1097,8 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
 
 The original contains roughly 32,000 methods, so the following remain to be
 built once the foundation is validated: claim creation/submission and
-adjudication, the remaining eServices transports (WhatsApp Cloud API, GSM
-modem, Africa's Talking, SMS.to) and patient forms. Implemented reports are the
+adjudication, and the remaining eServices transports (WhatsApp Cloud API, GSM
+modem, SMS.to). Implemented reports are the
 local slices (recall/ASAP, payment-plan balances, treatment-plan summaries,
 patient list, production, Collections, schedule, charge applications and
 ledger/period-close reports) plus 44 upstream `FormRp*` ports across four

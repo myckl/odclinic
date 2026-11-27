@@ -77,30 +77,54 @@ pub fn render_template(
 }
 
 /// Which transport a rule resolves to for a patient. OD's `CommType::Text`
-/// maps to Telegram here because that is the implemented text channel; a GSM
-/// modem or WhatsApp transport can take over by changing this one function.
+/// prefers Telegram and falls back to Africa's Talking SMS; `Preferred` keeps
+/// the existing Telegram → SMTP order and adds SMS as a last resort. Email
+/// rules stay on SMTP. Other transports can take over by changing this one
+/// function.
 pub fn resolve_transport(
     comm_type: CommType,
     email: Option<&str>,
     telegram_chat_id: &str,
+    phone: Option<&str>,
     config: &EServicesConfig,
 ) -> Option<TransportKind> {
     let telegram_ready = config.is_enabled(TransportKind::Telegram)
         && !telegram_chat_id.trim().is_empty();
     let smtp_ready = config.is_enabled(TransportKind::Smtp)
         && email.is_some_and(|value| !value.trim().is_empty());
+    let africas_talking_ready = config.readiness(TransportKind::AfricasTalking)
+        == TransportReadiness::Ready
+        && phone.is_some_and(|value| !value.trim().is_empty());
 
     match comm_type {
-        CommType::Text => telegram_ready.then_some(TransportKind::Telegram),
+        CommType::Text => {
+            if telegram_ready {
+                Some(TransportKind::Telegram)
+            } else if africas_talking_ready {
+                Some(TransportKind::AfricasTalking)
+            } else {
+                None
+            }
+        }
         CommType::Email | CommType::SecureEmail => smtp_ready.then_some(TransportKind::Smtp),
         CommType::Preferred => {
             if telegram_ready {
                 Some(TransportKind::Telegram)
+            } else if smtp_ready {
+                Some(TransportKind::Smtp)
+            } else if africas_talking_ready {
+                Some(TransportKind::AfricasTalking)
             } else {
-                smtp_ready.then_some(TransportKind::Smtp)
+                None
             }
         }
     }
+}
+
+/// Telegram chat IDs and Africa's Talking numbers both use the one existing
+/// "opt out of text messages" flag.
+fn is_text_transport(transport: TransportKind) -> bool {
+    matches!(transport, TransportKind::Telegram | TransportKind::AfricasTalking)
 }
 
 fn fallback_body(rule: &ReminderRule) -> &'static str {
@@ -181,6 +205,7 @@ pub fn due_messages(
                 rule.comm_type,
                 Some(effective_email),
                 &contact.telegram_chat_id,
+                Some(&patient.home_phone),
                 ctx.config,
             ) else {
                 continue;
@@ -188,13 +213,15 @@ pub fn due_messages(
             if transport.is_email() && contact.opt_out_email {
                 continue;
             }
-            if transport == TransportKind::Telegram && contact.opt_out_telegram {
+            if is_text_transport(transport) && contact.opt_out_telegram {
                 continue;
             }
 
             let recipient = match transport {
                 TransportKind::Smtp => effective_email.to_string(),
-                _ => contact.telegram_chat_id.trim().to_string(),
+                TransportKind::Telegram => contact.telegram_chat_id.trim().to_string(),
+                TransportKind::AfricasTalking => patient.home_phone.trim().to_string(),
+                _ => String::new(),
             };
             if recipient.is_empty() {
                 continue;
@@ -279,8 +306,8 @@ pub fn manual_message(
     if contact.opt_out_email && transport.is_email() {
         return Err("This patient opted out of email".into());
     }
-    if contact.opt_out_telegram && transport == TransportKind::Telegram {
-        return Err("This patient opted out of Telegram".into());
+    if contact.opt_out_telegram && is_text_transport(transport) {
+        return Err("This patient opted out of text messages".into());
     }
     let recipient = match transport {
         TransportKind::Smtp => {
@@ -292,6 +319,7 @@ pub fn manual_message(
             email.trim().to_string()
         }
         TransportKind::Telegram => contact.telegram_chat_id.trim().to_string(),
+        TransportKind::AfricasTalking => patient.home_phone.trim().to_string(),
         _ => return Err(format!("{} is not implemented in this build", transport.label())),
     };
     if recipient.is_empty() {
@@ -519,6 +547,134 @@ mod tests {
         assert_eq!(rows[0].transport, TransportKind::Telegram);
         assert_eq!(rows[0].recipient, "123456789");
         assert_eq!(rows[0].status, OutboxStatus::DryRun);
+    }
+
+    #[test]
+    fn text_routes_fall_back_to_africas_talking_without_changing_precedence() {
+        let mut config = EServicesConfig::default();
+        config.set_enabled(TransportKind::AfricasTalking, true);
+        config.africas_talking_username = "clinic".into();
+        config.africas_talking_key = "test-key".into();
+        let phone = Some("+251911234567");
+
+        assert_eq!(
+            resolve_transport(CommType::Text, Some("marta@example.test"), "", phone, &config),
+            Some(TransportKind::AfricasTalking)
+        );
+        assert_eq!(
+            resolve_transport(CommType::Preferred, Some("marta@example.test"), "", phone, &config),
+            Some(TransportKind::AfricasTalking)
+        );
+        assert_eq!(
+            resolve_transport(CommType::Email, Some("marta@example.test"), "", phone, &config),
+            None,
+            "email rules must not resolve to an SMS channel"
+        );
+        assert_eq!(
+            resolve_transport(CommType::Text, None, "", None, &config),
+            None,
+            "a patient without a phone number cannot receive SMS"
+        );
+
+        config.set_enabled(TransportKind::Telegram, true);
+        assert_eq!(
+            resolve_transport(CommType::Text, None, "123456789", phone, &config),
+            Some(TransportKind::Telegram),
+            "Telegram keeps priority for text when its chat ID exists"
+        );
+
+        config.set_enabled(TransportKind::Smtp, true);
+        assert_eq!(
+            resolve_transport(CommType::Preferred, Some("marta@example.test"), "", phone, &config),
+            Some(TransportKind::Smtp),
+            "SMTP keeps priority over SMS for preferred contacts"
+        );
+    }
+
+    #[test]
+    fn due_messages_can_use_africas_talking_for_text_reminders() {
+        let now = test_timestamp();
+        let rule = ReminderRule {
+            rule_num: 1,
+            minutes_prior: 1440,
+            comm_type: CommType::Text,
+            sms_template: "Hi {FirstName}, appointment {DateTime}".into(),
+            ..Default::default()
+        };
+        let appointments = vec![appointment(1, 1, now + Duration::minutes(600))];
+        let patients = vec![Patient {
+            home_phone: "+251911234567".into(),
+            ..patient(1)
+        }];
+        let contacts = vec![PatientContact {
+            pat_num: 1,
+            ..Default::default()
+        }];
+        let mut config = EServicesConfig::default();
+        config.set_enabled(TransportKind::AfricasTalking, true);
+        config.africas_talking_username = "clinic".into();
+        config.africas_talking_key = "test-key".into();
+        let rules = [rule];
+        let ctx = context(
+            &rules,
+            &appointments,
+            &patients,
+            &contacts,
+            &config,
+            now,
+            true,
+            &[ReminderType::Reminder],
+        );
+        let rows = due_messages(&ctx, |_, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, TransportKind::AfricasTalking);
+        assert_eq!(rows[0].recipient, "+251911234567");
+        assert!(rows[0].body.starts_with("Hi Marta"));
+        assert_eq!(rows[0].status, OutboxStatus::DryRun);
+    }
+
+    #[test]
+    fn africas_talking_honours_text_opt_out_and_manual_send() {
+        let now = test_timestamp();
+        let patient = Patient {
+            home_phone: "+251911234567".into(),
+            ..patient(1)
+        };
+        let mut contact = PatientContact {
+            pat_num: 1,
+            ..Default::default()
+        };
+        let mut config = EServicesConfig::default();
+        config.set_enabled(TransportKind::AfricasTalking, true);
+
+        let message = manual_message(
+            &patient,
+            None,
+            &contact,
+            &config,
+            TransportKind::AfricasTalking,
+            "See you soon",
+            true,
+            now,
+        )
+        .expect("manual SMS should queue with a phone number");
+        assert_eq!(message.recipient, "+251911234567");
+        assert_eq!(message.transport, TransportKind::AfricasTalking);
+        assert_eq!(message.status, OutboxStatus::DryRun);
+
+        contact.opt_out_telegram = true;
+        assert!(manual_message(
+            &patient,
+            None,
+            &contact,
+            &config,
+            TransportKind::AfricasTalking,
+            "See you soon",
+            true,
+            now,
+        )
+        .unwrap_err()
+        .contains("opted out"));
     }
 
     #[test]

@@ -104,9 +104,9 @@ impl CommType {
     }
 }
 
-/// A delivery channel. The first two are implemented in this build; the rest
-/// are kept as first-class settings so they can be wired up later without
-/// changing the rule engine, database layer or GUI.
+/// A delivery channel. SMTP, Telegram and Africa's Talking are implemented in
+/// this build; the rest are kept as first-class settings so they can be wired
+/// up later without changing the rule engine, database layer or GUI.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 #[repr(i8)]
 pub enum TransportKind {
@@ -158,7 +158,7 @@ impl TransportKind {
 
     /// Only these transports can actually deliver in this build.
     pub fn implemented(self) -> bool {
-        matches!(self, Self::Smtp | Self::Telegram)
+        matches!(self, Self::Smtp | Self::Telegram | Self::AfricasTalking)
     }
 
     pub fn is_email(self) -> bool {
@@ -349,6 +349,9 @@ impl EServicesConfig {
             TransportKind::Telegram => {
                 !self.telegram_bot_token.is_empty() && !self.telegram_chat_id.is_empty()
             }
+            TransportKind::AfricasTalking => {
+                !self.africas_talking_username.is_empty() && !self.africas_talking_key.is_empty()
+            }
             _ => false,
         };
         if ready {
@@ -491,6 +494,32 @@ mod tests {
     }
 
     #[test]
+    fn transport_kind_tokens_round_trip_and_implemented_set() {
+        assert_eq!(TransportKind::AfricasTalking as i8, 4);
+        for kind in TransportKind::ALL {
+            assert_eq!(TransportKind::from_config_str(kind.as_str()), Some(kind));
+            assert_eq!(
+                TransportKind::from_config_str(&kind.as_str().to_ascii_uppercase()),
+                Some(kind)
+            );
+        }
+        for kind in [
+            TransportKind::Smtp,
+            TransportKind::Telegram,
+            TransportKind::AfricasTalking,
+        ] {
+            assert!(kind.implemented(), "{} should be implemented", kind.label());
+        }
+        for kind in [
+            TransportKind::WhatsApp,
+            TransportKind::GsmModem,
+            TransportKind::SmsTo,
+        ] {
+            assert!(!kind.implemented(), "{} should still be planned", kind.label());
+        }
+    }
+
+    #[test]
     fn config_round_trips_all_transport_options() {
         let mut config = EServicesConfig::default();
         for kind in TransportKind::ALL {
@@ -499,12 +528,45 @@ mod tests {
         config.smtp_host = "smtp.example.test".into();
         config.smtp_port = 2525;
         config.telegram_bot_token = "123:abc".into();
+        config.africas_talking_username = "clinic".into();
+        config.africas_talking_key = "test-key".into();
         let text = config.to_text();
         let loaded = EServicesConfig::from_text(&text);
         assert_eq!(loaded, config);
         assert_eq!(loaded.enabled_transports.len(), 6);
+        assert_eq!(loaded.africas_talking_username, "clinic");
+        assert_eq!(loaded.africas_talking_key, "test-key");
         assert_eq!(loaded.readiness(TransportKind::Smtp), TransportReadiness::NeedsConfig);
+        assert_eq!(
+            loaded.readiness(TransportKind::AfricasTalking),
+            TransportReadiness::Ready
+        );
         assert_eq!(loaded.readiness(TransportKind::WhatsApp), TransportReadiness::Planned);
+    }
+
+    #[test]
+    fn africas_talking_readiness_requires_both_credentials() {
+        let mut config = EServicesConfig::default();
+        config.set_enabled(TransportKind::AfricasTalking, true);
+        assert_eq!(
+            config.readiness(TransportKind::AfricasTalking),
+            TransportReadiness::NeedsConfig
+        );
+        config.africas_talking_username = "clinic".into();
+        assert_eq!(
+            config.readiness(TransportKind::AfricasTalking),
+            TransportReadiness::NeedsConfig
+        );
+        config.africas_talking_key = "test-key".into();
+        assert_eq!(
+            config.readiness(TransportKind::AfricasTalking),
+            TransportReadiness::Ready
+        );
+        config.set_enabled(TransportKind::AfricasTalking, false);
+        assert_eq!(
+            config.readiness(TransportKind::AfricasTalking),
+            TransportReadiness::Disabled
+        );
     }
 
     #[test]

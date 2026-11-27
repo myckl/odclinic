@@ -85,7 +85,7 @@ impl OdApp {
         let mut config = self.eservices_config.clone();
         let mut save = false;
 
-        ui.label("Tick a channel to enable it. Only SMTP and Telegram can deliver in this build; the others keep their settings so they can be added later without a settings-file migration.");
+        ui.label("Tick a channel to enable it. SMTP, Telegram and Africa's Talking can deliver in this build; the others keep their settings so they can be added later without a settings-file migration.");
         for kind in TransportKind::ALL {
             ui.horizontal(|ui| {
                 let mut enabled = config.is_enabled(kind);
@@ -131,6 +131,20 @@ impl OdApp {
                                 ui.text_edit_singleline(&mut config.telegram_chat_id);
                             });
                             ui.weak("Create a bot with @BotFather, then send it a message so the chat ID exists. A per-patient chat ID on the patient contact overrides this default.");
+                        });
+                    }
+                    TransportKind::AfricasTalking => {
+                        ui.collapsing("Africa's Talking settings", |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label("Username");
+                                ui.text_edit_singleline(&mut config.africas_talking_username);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("API key ");
+                                ui.add(egui::TextEdit::singleline(&mut config.africas_talking_key).password(true));
+                            });
+                            ui.weak("Use the username and API key from your Africa's Talking app. The key is hidden while editing and is never shown in the outbox.");
+                            ui.weak("SMS reminders go to the patient's home phone; include the country code (for example +251...).");
                         });
                     }
                     _ => {}

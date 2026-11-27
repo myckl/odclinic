@@ -90,6 +90,8 @@ pub enum FeatureKey {
     PatientSearch,
     PatientEdit,
     PatientDelete,
+    /// Printable patient intake/medical-history forms built from existing records.
+    PatientFormsEnabled,
     AppointmentCreate,
     AppointmentEdit,
     AppointmentDelete,
@@ -107,6 +109,8 @@ pub enum FeatureKey {
     InsuranceEnabled,
     AccountShowStatements,
     AccountBillingEdits,
+    /// Apply a patient's own credit balance to that patient's oldest open charges.
+    PatientCreditApplication,
     /// Explicitly post a completed-procedure charge, patient payment or account adjustment into the double-entry journal.
     LedgerJournalPosting,
     PaymentPlansEnabled,
@@ -196,7 +200,7 @@ pub enum FeatureKey {
 }
 
 impl FeatureKey {
-    pub const ALL: [Self; 112] = [
+    pub const ALL: [Self; 114] = [
         Self::ModuleAppointments,
         Self::ModuleFamily,
         Self::ModuleAccount,
@@ -207,6 +211,7 @@ impl FeatureKey {
         Self::PatientSearch,
         Self::PatientEdit,
         Self::PatientDelete,
+        Self::PatientFormsEnabled,
         Self::AppointmentCreate,
         Self::AppointmentEdit,
         Self::AppointmentDelete,
@@ -224,6 +229,7 @@ impl FeatureKey {
         Self::InsuranceEnabled,
         Self::AccountShowStatements,
         Self::AccountBillingEdits,
+        Self::PatientCreditApplication,
         Self::LedgerJournalPosting,
         Self::PaymentPlansEnabled,
         Self::DiscountPlans,
@@ -323,6 +329,7 @@ impl FeatureKey {
             Self::PatientSearch => "patient_search",
             Self::PatientEdit => "patient_edit",
             Self::PatientDelete => "patient_delete",
+            Self::PatientFormsEnabled => "patient_forms_enabled",
             Self::AppointmentCreate => "appointment_create",
             Self::AppointmentEdit => "appointment_edit",
             Self::AppointmentDelete => "appointment_delete",
@@ -340,6 +347,7 @@ impl FeatureKey {
             Self::InsuranceEnabled => "insurance_enabled",
             Self::AccountShowStatements => "account_show_statements",
             Self::AccountBillingEdits => "account_billing_edits",
+            Self::PatientCreditApplication => "patient_credit_application",
             Self::LedgerJournalPosting => "ledger_journal_posting",
             Self::PaymentPlansEnabled => "payment_plans",
             Self::DiscountPlans => "discount_plans",
@@ -440,6 +448,7 @@ impl FeatureKey {
             Self::PatientSearch => "Patient search box",
             Self::PatientEdit => "Edit patients",
             Self::PatientDelete => "Delete patients",
+            Self::PatientFormsEnabled => "Patient forms",
             Self::AppointmentCreate => "New appointments",
             Self::AppointmentEdit => "Edit appointments",
             Self::AppointmentDelete => "Delete appointments",
@@ -457,6 +466,7 @@ impl FeatureKey {
             Self::InsuranceEnabled => "Insurance & claims",
             Self::AccountShowStatements => "Statements in Account",
             Self::AccountBillingEdits => "Record payments and adjustments",
+            Self::PatientCreditApplication => "Apply patient credit to charges",
             Self::LedgerJournalPosting => "Post charges, payments and adjustments to the ledger",
             Self::PaymentPlansEnabled => "Payment plans",
             Self::DiscountPlans => "Discount plans in Setup",
@@ -559,6 +569,7 @@ impl FeatureKey {
             Self::PatientSearch => "Show the search box. When off, the full patient list is shown.",
             Self::PatientEdit => "Allow editing patient details.",
             Self::PatientDelete => "Show the Delete patient button.",
+            Self::PatientFormsEnabled => "Show printable patient intake/medical-history forms in Family. Forms are generated from existing patient, patientnote and disease rows, can be printed as HTML or saved as PDF, and are audited. On by default.",
             Self::AppointmentCreate => "Show the New appointment button.",
             Self::AppointmentEdit => "Allow appointments to be opened for editing.",
             Self::AppointmentDelete => "Show the Delete button in the appointment editor.",
@@ -576,6 +587,7 @@ impl FeatureKey {
             Self::InsuranceEnabled => "Enable insurance claims, insurance payments/write-offs and estimates. Off by default for practices that use only patient payments and payment plans (e.g. Ethiopia). Turning it off hides insurance in Account and skips the claim queries entirely.",
             Self::AccountShowStatements => "Show statements in Account.",
             Self::AccountBillingEdits => "Allow recording a payment (one paysplit per allocation, for one individual patient) or an adjustment. Also requires the matching Open Dental permission when permission enforcement is on.",
+            Self::PatientCreditApplication => "Allow applying a patient's own overpayment/credit to that patient's oldest open charges, using a balanced zero-amount payment with one negative unallocated split and one positive split per charge. Never moves credit between patients. Also requires the OD Payment Create permission when enforcement is on. On by default.",
             Self::LedgerJournalPosting => "Allow posting completed-procedure charges, patient payments and account adjustments into OD's double-entry journal, so the Balance Sheet, General Ledger and Profit & Loss reports include them. Writes one balanced debit/credit pair with a shared transaction number; the accounting reports offer Post all unposted sources to post every charge, payment and adjustment in the report range as one reviewed, atomic batch. The Journal posting audit report shows which source records are still unposted, and the Ledger tie-out report reconciles charges with production, cash with collections, and A/R with charges minus payments and adjustments before a period close. Once reconciled, a month can be closed with a reason (Adjustment Create permission); closed months persist in the preference table and refuse any backdated posting until explicitly reopened, with both actions written to the security log. Also requires the OD Adjustment Create permission when enforcement is on. On by default.",
             Self::PaymentPlansEnabled => "Show payment plans in Account, allow creating plans and charges, and allow applying payments to a plan. On by default because Ethiopian practices collect balances this way.",
             Self::DiscountPlans => "Show the discount-plan editor in Setup: define plans (fee schedule, adjustment type, annual maximum, frequency limits and note) and subscribe patients with effective/term dates. Discount plans are the patient-facing alternative to insurance. On by default.",
@@ -673,7 +685,10 @@ impl FeatureKey {
             | Self::ModuleChart
             | Self::ModuleReports
             | Self::ModuleSetup => "Modules",
-            Self::PatientSearch | Self::PatientEdit | Self::PatientDelete => "Family",
+            Self::PatientSearch
+            | Self::PatientEdit
+            | Self::PatientDelete
+            | Self::PatientFormsEnabled => "Family",
             Self::AppointmentCreate
             | Self::AppointmentEdit
             | Self::AppointmentDelete
@@ -689,6 +704,7 @@ impl FeatureKey {
             | Self::InsuranceEnabled
             | Self::AccountShowStatements
             | Self::AccountBillingEdits
+            | Self::PatientCreditApplication
             | Self::LedgerJournalPosting
             | Self::PaymentPlansEnabled => "Account",
             Self::TreatmentPlanLines
@@ -2744,6 +2760,33 @@ mod tests {
             FeatureKey::from_config_key("insurance_enabled"),
             Some(FeatureKey::InsuranceEnabled)
         );
+    }
+
+    #[test]
+    fn patient_credit_toggle_defaults_on_and_persists() {
+        assert!(FeatureKey::PatientCreditApplication.default_enabled());
+        assert_eq!(
+            FeatureKey::from_config_key("patient_credit_application"),
+            Some(FeatureKey::PatientCreditApplication)
+        );
+        let mut settings = FeatureSettings::default();
+        assert!(settings.enabled(FeatureKey::PatientCreditApplication));
+        settings.set(FeatureKey::PatientCreditApplication, false);
+        let parsed = FeatureSettings::from_text(&settings.to_text());
+        assert!(!parsed.enabled(FeatureKey::PatientCreditApplication));
+    }
+
+    #[test]
+    fn patient_forms_toggle_defaults_on_and_persists() {
+        assert!(FeatureKey::PatientFormsEnabled.default_enabled());
+        assert_eq!(
+            FeatureKey::from_config_key("patient_forms_enabled"),
+            Some(FeatureKey::PatientFormsEnabled)
+        );
+        let mut settings = FeatureSettings::default();
+        settings.set(FeatureKey::PatientFormsEnabled, false);
+        assert!(!FeatureSettings::from_text(&settings.to_text())
+            .enabled(FeatureKey::PatientFormsEnabled));
     }
 
     #[test]

@@ -1118,6 +1118,7 @@ impl Default for BrokenAppointmentReportOptions {
 /// `.PatNum` so two accounts keep separate filing locations in the same run.
 pub const EXPORT_KEY_ACCOUNT_AUDIT: &str = "account-audit";
 pub const EXPORT_KEY_ACCOUNT_LEDGER: &str = "account-ledger";
+pub const EXPORT_KEY_COLLECTIONS_STATEMENTS: &str = "collections-statements";
 pub const EXPORT_KEY_PAY_PLAN_AUDIT: &str = "pay-plan-audit";
 pub const EXPORT_KEY_SECURITY_LOG: &str = "security-log";
 

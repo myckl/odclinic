@@ -1312,6 +1312,85 @@ fn mysql_eservices_rules_outbox_and_dedupe_round_trip() {
     println!("cleanup: removed 4 temporary eServices rows");
 }
 
+/// The Africa's Talking transport token (4) must survive a local outbox write
+/// and read-back. No SMS is sent and no provider credential is used here.
+#[test]
+#[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes one temporary outbox row"]
+fn mysql_eservices_outbox_round_trips_africas_talking_transport() {
+    let url = std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check");
+    let store = MySqlStore::new(&url).expect("could not connect to the demo database");
+    let pat_num = store
+        .list_patients()
+        .expect("list_patients failed")
+        .into_iter()
+        .next()
+        .expect("need one patient")
+        .pat_num;
+
+    assert_eq!(
+        TransportKind::AfricasTalking as i8,
+        4,
+        "the stored Africa's Talking transport token changed"
+    );
+    let message = OutboxMessage {
+        pat_num,
+        apt_num: 999_998,
+        rule_num: 999_998,
+        reminder_type: ReminderType::Reminder,
+        transport: TransportKind::AfricasTalking,
+        recipient: "+251911000000".into(),
+        subject: "ODCLINIC_LIVE_TEST_AT".into(),
+        body: "ODCLINIC_LIVE_TEST_AT_BODY".into(),
+        status: OutboxStatus::Pending,
+        attempts: 0,
+        created_at: NaiveDate::from_ymd_opt(2026, 11, 22)
+            .unwrap()
+            .and_hms_opt(10, 0, 0)
+            .unwrap(),
+        ..Default::default()
+    };
+    let message_num = store.insert_outbox(&message).expect("insert outbox failed");
+    assert!(message_num > 0);
+
+    let decoded = store
+        .list_outbox(10)
+        .expect("list_outbox failed")
+        .into_iter()
+        .find(|m| m.message_num == message_num)
+        .expect("temporary Africa's Talking outbox row was not readable");
+
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
+    let pool = mysql::Pool::new(opts).expect("bad pool");
+    let mut conn = pool.get_conn().expect("bad connection");
+    let raw_token: Option<i8> = conn
+        .query_first(format!(
+            "SELECT Transport FROM odclinic_message_outbox WHERE MessageNum = {message_num}"
+        ))
+        .expect("could not read outbox transport token");
+    let cleanup = conn.query_drop(format!(
+        "DELETE FROM odclinic_message_outbox WHERE MessageNum = {message_num}"
+    ));
+
+    let decoded_ok = decoded.transport == TransportKind::AfricasTalking
+        && decoded.recipient == "+251911000000"
+        && decoded.status == OutboxStatus::Pending;
+    println!(
+        "Africa's Talking outbox readback: {}, raw token: {:?}, cleaned up: {:?}",
+        decoded_ok,
+        raw_token,
+        cleanup.is_ok()
+    );
+    assert!(decoded_ok, "Africa's Talking outbox row did not round-trip");
+    assert_eq!(raw_token, Some(4), "raw transport token did not round-trip");
+    cleanup.expect("temporary outbox cleanup failed");
+}
+
 #[test]
 #[ignore = "requires a real demo ODCLINIC_DB_URL; writes and deletes temporary treatment plan rows"]
 fn mysql_treatment_plans_round_trip() {

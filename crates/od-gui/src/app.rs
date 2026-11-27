@@ -21,7 +21,8 @@ use od_core::{
     collections_bucket_totals, collections_worklist, filter_collections_rows,
     CollectionsAgingBucket, CollectionsRow,
     build_adjustment_journal, build_invoice_document, build_journal_batches,
-    build_payment_journal, build_posting_batch_plan_with_closed,
+    build_patient_credit_application, build_patient_form_document, build_payment_journal,
+    build_posting_batch_plan_with_closed,
     build_refund_transfer_receipt, build_statement_document,
     compact_display_field_orders, confirmation_report, custom_aging_report,
     carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
@@ -42,8 +43,9 @@ use od_core::{
     procedure_sheet_report, profit_loss_report, production_goal_report, production_by_provider,
     provider_payroll_report, recall_due_date, recall_due_state, recall_fields_report, recall_report,
     receivables_breakdown_report, referral_analysis_report, referrals_report, render_invoice_pdf,
-    render_refund_transfer_receipt_html, render_refund_transfer_receipt_pdf,
-    render_report_csv, render_report_html, render_statement_html, render_statement_pdf,
+    render_patient_form_html, render_patient_form_pdf, render_refund_transfer_receipt_html,
+    render_refund_transfer_receipt_pdf, render_report_csv, render_report_html,
+    render_statement_html, render_statement_pdf,
     restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
     interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
     payment_journal_memo_with_note, suggest_ledger_accounts, suggest_payment_ledger_accounts,
@@ -68,7 +70,8 @@ use od_domain::reports::{
     PlanTypeFilter,
     ProcedureSheetMode, ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition,
     ReportPreferences, ReportSortState, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
-    EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG, CONFIRMATION_OTHER_FIELDS,
+    EXPORT_KEY_COLLECTIONS_STATEMENTS, EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG,
+    CONFIRMATION_OTHER_FIELDS,
     CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
     REFERRAL_REPORT_FIELDS,
 };
@@ -557,6 +560,16 @@ fn gather_public_health_screens(
 fn open_statement_in_browser(html: &str, pat_num: Id) -> Result<String, String> {
     let path = std::env::temp_dir().join(format!("odclinic-statement-{pat_num}.html"));
     std::fs::write(&path, html).map_err(|e| format!("Could not write statement file: {e}"))?;
+    let target = path.to_string_lossy().into_owned();
+    open_in_browser(&target)?;
+    Ok(target)
+}
+
+/// Write a print-ready patient form to a temp file and open it in the system's
+/// default browser, where its Print button starts the print dialog.
+fn open_patient_form_in_browser(html: &str, pat_num: Id) -> Result<String, String> {
+    let path = std::env::temp_dir().join(format!("odclinic-patient-form-{pat_num}.html"));
+    std::fs::write(&path, html).map_err(|e| format!("Could not write patient form: {e}"))?;
     let target = path.to_string_lossy().into_owned();
     open_in_browser(&target)?;
     Ok(target)
@@ -1203,6 +1216,38 @@ fn default_statement_pdf_path(pat_num: Id) -> String {
         .into_owned()
 }
 
+/// A sensible default location for a patient form PDF.
+fn default_patient_form_pdf_path(pat_num: Id) -> String {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Documents")
+        .join(format!("odclinic-patient-form-{pat_num}.pdf"))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Default folder for the Collections statement batch. One patient-only PDF
+/// and a self-describing manifest are written here for the visible aging band.
+fn default_collections_statements_dir() -> String {
+    std::env::var_os("USERPROFILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Documents")
+        .join("odclinic-collections-statements")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Stable filename for one patient in a statement batch. The as-of date keeps
+/// repeated runs in the same folder from silently overwriting each other.
+fn batch_statement_filename(pat_num: Id, as_of: NaiveDate) -> String {
+    format!(
+        "odclinic-statement-{pat_num}-{}.pdf",
+        as_of.format("%Y-%m-%d")
+    )
+}
+
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1320.0, 860.0]),
@@ -1760,6 +1805,13 @@ struct OdApp {
     /// Where "Save PDF" writes the current patient's statement.
     statement_pdf_path: String,
     statement_pdf_patient: Id,
+    /// Where "Form PDF" writes the current patient's intake form.
+    patient_form_pdf_path: String,
+    patient_form_pdf_patient: Id,
+    /// Output folder for the Collections statement batch, persisted per user.
+    collections_statements_dir: String,
+    /// User key the folder was loaded for, so a login switch reloads it.
+    collections_statements_user: String,
     account_show_refunds_transfers_only: bool,
     /// Stale-resolved plan charge rows stay visible by default for audit.
     account_show_resolved_plan_charges: bool,
@@ -2068,6 +2120,10 @@ impl OdApp {
             payment_rows: Vec::new(),
             statement_pdf_path: String::new(),
             statement_pdf_patient: 0,
+            patient_form_pdf_path: String::new(),
+            patient_form_pdf_patient: 0,
+            collections_statements_dir: default_collections_statements_dir(),
+            collections_statements_user: String::new(),
             account_show_refunds_transfers_only: false,
             account_show_resolved_plan_charges: true,
             account_transfer_plan_filter: 0,
@@ -2387,7 +2443,15 @@ impl OdApp {
         self.account_ledger_export_patient = 0;
         self.account_audit_export_patient = 0;
         self.statement_pdf_patient = 0;
+        self.patient_form_pdf_path.clear();
+        self.patient_form_pdf_patient = 0;
         self.security_log_export_patient = None;
+        self.collections_statements_dir = self
+            .report_prefs
+            .effective_export_path(&key, EXPORT_KEY_COLLECTIONS_STATEMENTS)
+            .map(str::to_string)
+            .unwrap_or_else(default_collections_statements_dir);
+        self.collections_statements_user = key;
     }
 
     /// Restore the saved column sort for one report. Called on startup, after a
@@ -3521,6 +3585,9 @@ impl OdApp {
                     {
                         self.open_registry(patient.pat_num);
                     }
+                    if self.patient_forms_allowed() && ui.button("Open form").clicked() {
+                        self.open_patient_form(patient.pat_num);
+                    }
                     if can_delete_patients && ui.button("Delete patient").clicked() {
                         let pat_num = patient.pat_num;
                         match self.store.delete_patient(pat_num) {
@@ -3550,6 +3617,24 @@ impl OdApp {
                 });
                 ui.label(&patient.address);
                 ui.label(format!("{}, {} {}", patient.city, patient.state, patient.zip));
+                if self.patient_forms_allowed() {
+                    if self.patient_form_pdf_patient != patient.pat_num {
+                        self.patient_form_pdf_patient = patient.pat_num;
+                        self.patient_form_pdf_path =
+                            default_patient_form_pdf_path(patient.pat_num);
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Form PDF:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.patient_form_pdf_path)
+                                .desired_width(320.0),
+                        );
+                        if ui.button("Save PDF").clicked() {
+                            let path = self.patient_form_pdf_path.clone();
+                            self.save_patient_form_pdf(patient.pat_num, &path);
+                        }
+                    });
+                }
             }
         }
     }
@@ -4456,6 +4541,20 @@ impl OdApp {
                         amount_text: String::new(),
                     }];
                     self.payment_edit_open = true;
+                }
+            }
+            if self.features.enabled(FeatureKey::PatientCreditApplication)
+                && billing_edits
+                && self.can(Permission::PAYMENT_CREATE)
+            {
+                if ui
+                    .button("Apply credit to own charges")
+                    .on_hover_text(
+                        "Use this patient's overpayment to pay their own oldest open charges. Never moves credit to another patient.",
+                    )
+                    .clicked()
+                {
+                    self.apply_patient_credit(num, &procedures, &adjustments, &splits);
                 }
             }
         });
@@ -6075,10 +6174,180 @@ impl OdApp {
         true
     }
 
-    /// Shared by the Account view and the Collections worklist so both paths
-    /// create an identical patient-only statement and audit it the same way.
-    fn generate_statement_for(&mut self, num: Id) {
+    /// Build a form snapshot from this patient's own records. Forms never
+    /// write patient data back, and insurance is deliberately not included.
+    fn patient_form_document(&self, pat_num: Id) -> Result<od_core::PatientFormDocument, String> {
+        let patient = self
+            .store
+            .get_patient(pat_num)?
+            .ok_or_else(|| format!("Patient #{pat_num} not found"))?;
+        let note = self.store.get_patient_note(pat_num)?;
+        let diseases = self.store.list_diseases(pat_num).unwrap_or_default();
+        Ok(build_patient_form_document(
+            &patient,
+            note.as_ref(),
+            &diseases,
+            &self.report_prefs.practice_name,
+            Local::now().date_naive(),
+        ))
+    }
+
+    fn patient_forms_allowed(&self) -> bool {
+        self.features.enabled(FeatureKey::PatientFormsEnabled)
+            && self.can(Permission::PATIENT_EDIT)
+    }
+
+    fn open_patient_form(&mut self, pat_num: Id) {
+        if !self.patient_forms_allowed() {
+            self.error = Some("Patient forms permission/feature required".into());
+            return;
+        }
+        let doc = match self.patient_form_document(pat_num) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        match open_patient_form_in_browser(&render_patient_form_html(&doc), pat_num) {
+            Ok(path) => {
+                self.audit_if(
+                    FeatureKey::AuditPatientChanges,
+                    Permission::PATIENT_EDIT,
+                    pat_num,
+                    format!(
+                        "Patient form generated for {} (#{}): {} problem(s), opened {}",
+                        doc.patient_name,
+                        doc.pat_num,
+                        doc.problems.len(),
+                        path
+                    ),
+                );
+                self.notice = Some(format!("Opened printable form for {}", doc.patient_name));
+                self.error = None;
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    fn save_patient_form_pdf(&mut self, pat_num: Id, path: &str) {
+        if !self.patient_forms_allowed() {
+            self.error = Some("Patient forms permission/feature required".into());
+            return;
+        }
+        let path = path.trim();
+        if path.is_empty() {
+            self.error = Some("Choose a path for the patient form PDF".into());
+            return;
+        }
+        let doc = match self.patient_form_document(pat_num) {
+            Ok(doc) => doc,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        let bytes = render_patient_form_pdf(&doc);
+        match std::fs::write(path, &bytes) {
+            Ok(()) => {
+                let opened = open_in_browser(path);
+                self.audit_if(
+                    FeatureKey::AuditPatientChanges,
+                    Permission::PATIENT_EDIT,
+                    pat_num,
+                    format!(
+                        "Patient form PDF saved for {} (#{}): {} byte(s), path {}{}",
+                        doc.patient_name,
+                        doc.pat_num,
+                        bytes.len(),
+                        path,
+                        match opened {
+                            Ok(()) => String::new(),
+                            Err(ref err) => format!(" (open failed: {err})"),
+                        }
+                    ),
+                );
+                self.notice = Some(format!("Patient form PDF saved to {path}"));
+                self.error = None;
+            }
+            Err(err) => self.error = Some(format!("Could not save patient form PDF: {err}")),
+        }
+    }
+
+    /// Apply the current patient's own overpayment to their own oldest open
+    /// charges. Writes one balanced zero-amount payment and audits it like any
+    /// other billing change. The feature toggle and OD permission are checked
+    /// here as well as at the button so no other caller can bypass them.
+    fn apply_patient_credit(
+        &mut self,
+        pat_num: Id,
+        procedures: &[Procedure],
+        adjustments: &[Adjustment],
+        splits: &[PaySplit],
+    ) {
+        if !self.features.enabled(FeatureKey::PatientCreditApplication) {
+            self.error = Some("Patient credit application is turned off in Settings".into());
+            return;
+        }
+        if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+            && self.can(Permission::PAYMENT_CREATE))
+        {
+            self.error = Some("Billing permission/feature required to apply patient credit".into());
+            return;
+        }
         let today = Local::now().date_naive();
+        let (payment, allocations) = match build_patient_credit_application(
+            pat_num,
+            procedures,
+            adjustments,
+            splits,
+            today,
+        ) {
+            Ok(built) => built,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        let applied: f64 = allocations
+            .iter()
+            .filter(|a| a.amount > 0.0)
+            .map(|a| a.amount)
+            .sum();
+        match self.store.record_payment_splits(&payment, &allocations) {
+            Ok(pay_num) => {
+                self.audit_if(
+                    FeatureKey::AuditBillingChanges,
+                    Permission::PAYMENT_CREATE,
+                    pat_num,
+                    format!(
+                        "Payment {pay_num} applied {} of this patient's own credit to their oldest open charges: {}",
+                        money_text(applied),
+                        payment.note
+                    ),
+                );
+                self.notice = Some(format!(
+                    "Applied {} of patient credit to {} own open charge(s)",
+                    money_text(applied),
+                    allocations.len() - 1
+                ));
+                self.error = None;
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    /// Build one patient-only statement document and its display name. Kept
+    /// side-effect free so the Account button, the single-row worklist action
+    /// and the filtered batch share exactly the same statement definition.
+    /// The `as_of` date drives plan balances, so a Collections batch ties to
+    /// the report's as-of date rather than to the wall clock.
+    fn statement_document_for(
+        &self,
+        num: Id,
+        as_of: NaiveDate,
+        note: &str,
+    ) -> (od_core::StatementDocument, String) {
         let procedures = self.store.list_procedures(num).unwrap_or_default();
         let adjustments = self.store.list_adjustments(num).unwrap_or_default();
         let splits = self.store.list_pay_splits(num).unwrap_or_default();
@@ -6092,7 +6361,6 @@ impl OdApp {
             .flatten()
             .map(|p| p.display_name())
             .unwrap_or_else(|| format!("Patient #{num}"));
-        let note = format!("Statement generated {}", today);
         let doc = build_statement_document(
             num,
             &patient_name,
@@ -6102,9 +6370,18 @@ impl OdApp {
             &plans,
             &plan_charges,
             &summary,
-            today,
-            &note,
+            as_of,
+            note,
         );
+        (doc, patient_name)
+    }
+
+    /// Shared by the Account view and the Collections worklist so both paths
+    /// create an identical patient-only statement and audit it the same way.
+    fn generate_statement_for(&mut self, num: Id) {
+        let today = Local::now().date_naive();
+        let note = format!("Statement generated {}", today);
+        let (doc, patient_name) = self.statement_document_for(num, today, &note);
         let html = render_statement_html(&doc);
         let statement = Statement {
             pat_num: num,
@@ -6135,6 +6412,121 @@ impl OdApp {
             },
             Err(e) => self.error = Some(e),
         }
+    }
+
+    /// Generate one dated statement and PDF per visible Collections row. Every
+    /// row is a single patient account; nothing is grouped or allocated across
+    /// patients. The manifest carries the same self-describing header as the
+    /// worklist export so a filed batch still says which band it came from.
+    fn generate_collections_statement_batch(&mut self, rows: &[CollectionsRow]) {
+        if !self.features.enabled(FeatureKey::AccountShowStatements) {
+            self.error = Some("Statements are turned off in Settings".into());
+            return;
+        }
+        if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+            && self.can(Permission::BILLING))
+        {
+            self.error = Some("Billing permission/feature required for statements".into());
+            return;
+        }
+        if rows.is_empty() {
+            self.notice = Some("No visible patient accounts to generate statements for".into());
+            return;
+        }
+
+        let as_of = self.report_to;
+        let title = collections_export_title(self.collections_bucket_filter, as_of, rows);
+        let dir = std::path::PathBuf::from(self.collections_statements_dir.trim());
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            self.error = Some(format!("Could not create statement folder: {err}"));
+            return;
+        }
+
+        let practice = self.report_prefs.practice_name.clone();
+        let mut manifest = ReportTable::new(&[
+            "Patient #",
+            "Patient",
+            "Balance",
+            "Statement #",
+            "PDF",
+        ]);
+        let mut statements = 0usize;
+        let mut total: f64 = 0.0;
+        for row in rows {
+            let note = format!("Statement generated {} ({title})", Local::now().date_naive());
+            let (doc, patient_name) = self.statement_document_for(row.pat_num, as_of, &note);
+            let statement = Statement {
+                pat_num: row.pat_num,
+                date_sent: Some(as_of),
+                note: note.clone(),
+                is_invoice: false,
+                ..Default::default()
+            };
+            let statement_num = match self.store.insert_statement(&statement) {
+                Ok(num) => num,
+                Err(err) => {
+                    self.error = Some(format!(
+                        "Could not record statement for patient {}: {err}",
+                        row.pat_num
+                    ));
+                    return;
+                }
+            };
+            let filename = batch_statement_filename(row.pat_num, as_of);
+            let path = dir.join(&filename);
+            let bytes = render_statement_pdf(&doc);
+            if let Err(err) = std::fs::write(&path, &bytes) {
+                self.error = Some(format!("Could not write statement PDF: {err}"));
+                return;
+            }
+            self.audit_if(
+                FeatureKey::AuditBillingChanges,
+                Permission::BILLING,
+                row.pat_num,
+                format!(
+                    "Statement {statement_num} generated in Collections batch for {patient_name}: balance {:.2}, {} line(s), saved {}",
+                    doc.balance,
+                    doc.lines.len(),
+                    path.to_string_lossy()
+                ),
+            );
+            manifest.push(&[
+                &row.pat_num.to_string(),
+                &patient_name,
+                &money_text(row.balance),
+                &statement_num.to_string(),
+                &filename,
+            ]);
+            statements += 1;
+            total += row.balance;
+        }
+
+        let manifest_csv = render_report_csv(&title, &practice, &manifest);
+        let manifest_html = render_report_html(&title, &practice, &manifest);
+        for (extension, content) in [("csv", &manifest_csv), ("html", &manifest_html)] {
+            let path = dir.join(format!("collections-statements.{extension}"));
+            if let Err(err) = std::fs::write(&path, content) {
+                self.error = Some(format!("Could not write statement manifest: {err}"));
+                return;
+            }
+        }
+        self.audit_if(
+            FeatureKey::AuditBillingChanges,
+            Permission::BILLING,
+            0,
+            format!(
+                "Collections statement batch generated {statements} patient-only statement(s) totalling {} from {title} into {}",
+                money_text(total),
+                dir.to_string_lossy()
+            ),
+        );
+        let dir_text = self.collections_statements_dir.clone();
+        self.remember_export_path(EXPORT_KEY_COLLECTIONS_STATEMENTS, &dir_text);
+        self.notice = Some(format!(
+            "Generated {statements} patient statement(s) totalling {} in {}",
+            money_text(total),
+            dir.to_string_lossy()
+        ));
     }
 
     fn apply_collections_action(&mut self, pat_num: Id, action: CollectionsAction) {
@@ -9140,6 +9532,38 @@ impl OdApp {
                 scope,
                 self.report_to
             ));
+
+            let user_key = self.period_close_history_user_key();
+            if self.collections_statements_user != user_key {
+                self.collections_statements_dir = self
+                    .report_prefs
+                    .effective_export_path(&user_key, EXPORT_KEY_COLLECTIONS_STATEMENTS)
+                    .map(str::to_string)
+                    .unwrap_or_else(default_collections_statements_dir);
+                self.collections_statements_user = user_key;
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Statement batch folder:");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.collections_statements_dir)
+                        .desired_width(320.0),
+                );
+                if response.changed() {
+                    let path = self.collections_statements_dir.clone();
+                    self.remember_export_path(EXPORT_KEY_COLLECTIONS_STATEMENTS, &path);
+                }
+            });
+            let mut generate_batch = false;
+            ui.horizontal(|ui| {
+                generate_batch = ui
+                    .button("Generate statements for visible patients")
+                    .clicked();
+                ui.small("One patient-only statement per visible account; no insurance columns, no cross-patient grouping. CSV/HTML manifests record the band, as-of date, count and total.");
+            });
+            if generate_batch {
+                self.generate_collections_statement_batch(&visible_collections_rows);
+            }
         }
 
         // Collect clicks first so the grid can borrow the worklist immutably
@@ -13587,6 +14011,227 @@ mod tests {
             plan_due_now: 0.0,
             phone: String::new(),
         }
+    }
+
+    /// A Collections batch writes one dated statement and PDF per visible
+    /// patient, plus a self-describing manifest and audits. Accounts stay
+    /// separate; there are no insurance columns or cross-patient allocations.
+    #[test]
+    fn collections_statement_batch_writes_one_statement_per_visible_patient() {
+        let mut app = OdApp::new();
+        app.refresh();
+        app.features.set(FeatureKey::AccountBillingEdits, true);
+        app.features.set(FeatureKey::AccountShowStatements, true);
+        app.session = Some(Session::local());
+        app.report_prefs = ReportPreferences::default();
+        let patients: Vec<_> = app.patients.iter().take(2).cloned().collect();
+        assert_eq!(patients.len(), 2, "demo patients");
+        let rows: Vec<CollectionsRow> = patients
+            .iter()
+            .map(|p| collections_test_row(p.pat_num, &p.display_name(), 45, 100.0))
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "odclinic-collections-batch-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.collections_statements_dir = dir.to_string_lossy().into_owned();
+        app.collections_bucket_filter = None;
+        app.report_to = NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+
+        app.generate_collections_statement_batch(&rows);
+
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let notice = app.notice.clone().unwrap_or_default();
+        assert!(notice.contains("2 patient statement(s)"), "{notice}");
+        assert!(notice.contains("200.00"), "{notice}");
+        let expected =
+            "Collections (All bands · as of 2026-11-26 · 2 patient account(s) · 200.00 total)";
+        let csv = std::fs::read_to_string(dir.join("collections-statements.csv")).unwrap();
+        let html = std::fs::read_to_string(dir.join("collections-statements.html")).unwrap();
+        assert!(csv.contains(expected), "{csv}");
+        assert!(html.contains(expected), "{html}");
+        for row in &rows {
+            let pdf = dir.join(batch_statement_filename(row.pat_num, app.report_to));
+            let bytes = std::fs::read(&pdf).unwrap();
+            assert!(bytes.starts_with(b"%PDF-1.4"), "not a PDF: {}", pdf.display());
+            let statements = app.store.list_statements(row.pat_num).unwrap();
+            assert!(
+                statements.iter().any(|s| s.note.contains(expected)),
+                "no dated statement recorded for patient {}",
+                row.pat_num
+            );
+        }
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Collections statement batch generated 2")));
+        let key = app.period_close_history_user_key();
+        assert_eq!(
+            app.report_prefs
+                .user_export_path(&key, EXPORT_KEY_COLLECTIONS_STATEMENTS),
+            Some(app.collections_statements_dir.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collections_statement_batch_respects_statement_gates() {
+        let mut app = OdApp::new();
+        app.refresh();
+        app.features.set(FeatureKey::AccountShowStatements, false);
+        app.session = Some(Session::local());
+        let dir = std::env::temp_dir().join(format!(
+            "odclinic-collections-batch-gates-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        app.collections_statements_dir = dir.to_string_lossy().into_owned();
+        let row = collections_test_row(app.patients[0].pat_num, "Test Patient", 45, 100.0);
+
+        app.generate_collections_statement_batch(&[row]);
+
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Statements are turned off"));
+        assert!(!dir.exists(), "a gated batch must not create a folder");
+    }
+
+    /// Applying credit is a patient-only, audited billing action. It writes a
+    /// balanced zero-amount payment with a negative unallocated split and a
+    /// positive split on the patient's own procedure.
+    #[test]
+    fn patient_credit_application_stays_on_one_patient_and_is_audited() {
+        use od_domain::{Procedure, ProcedureStatus};
+        let mut app = OdApp::new();
+        app.refresh();
+        app.features.set(FeatureKey::PatientCreditApplication, true);
+        app.features.set(FeatureKey::AccountBillingEdits, true);
+        app.session = Some(Session::local());
+        let pat_num = app.patients[0].pat_num;
+        let other_pat = app.patients[1].pat_num;
+        let today = Local::now().date_naive();
+        let mut procedure = Procedure {
+            pat_num,
+            proc_status: ProcedureStatus::Complete,
+            proc_date: today,
+            fee: 50.0,
+            ..Default::default()
+        };
+        let proc_num = app.store.insert_procedure(&procedure).unwrap();
+        procedure.proc_num = proc_num;
+        let overpay = Payment {
+            pat_num,
+            pay_date: today,
+            pay_amount: 80.0,
+            note: "Overpayment".into(),
+            ..Default::default()
+        };
+        let allocation = PaymentAllocation {
+            target: PaymentTarget::Unallocated,
+            amount: 80.0,
+            ..Default::default()
+        };
+        let credit_split = overpay.splits(&[allocation]).unwrap()[0].clone();
+        app.store
+            .record_payment_splits(&overpay, &[allocation])
+            .unwrap();
+
+        app.apply_patient_credit(pat_num, &[procedure], &[], &[credit_split]);
+
+        assert!(app.error.is_none(), "{:?}", app.error);
+        assert!(app
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("30.00"));
+        let splits = app.store.list_pay_splits(pat_num).unwrap();
+        assert!(splits.iter().any(|s| s.proc_num == 0 && s.split_amount < 0.0));
+        assert!(splits.iter().any(|s| s.proc_num == proc_num && s.split_amount > 0.0));
+        assert!(splits.iter().all(|s| s.pat_num == pat_num));
+        assert!(app
+            .store
+            .list_pay_splits(other_pat)
+            .unwrap()
+            .iter()
+            .all(|s| s.pat_num == other_pat));
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("applied 30.00 of this patient's own credit")));
+    }
+
+    #[test]
+    fn patient_credit_application_respects_its_feature_toggle() {
+        use od_domain::Procedure;
+        let mut app = OdApp::new();
+        app.refresh();
+        app.features.set(FeatureKey::PatientCreditApplication, false);
+        app.session = Some(Session::local());
+        let pat_num = app.patients[0].pat_num;
+        app.apply_patient_credit(
+            pat_num,
+            &[Procedure::default()],
+            &[],
+            &[PaySplit::default()],
+        );
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("turned off"));
+    }
+
+    /// Patient forms are a read-only, feature-toggled print/export of existing
+    /// records. Saving the PDF writes a self-describing file and an audit row.
+    #[test]
+    fn patient_form_pdf_save_is_feature_gated_and_audited() {
+        let mut app = OdApp::new();
+        app.refresh();
+        app.features.set(FeatureKey::PatientFormsEnabled, true);
+        app.features.set(FeatureKey::AuditPatientChanges, true);
+        app.session = Some(Session::local());
+        app.report_prefs.practice_name = "Highland Dental".into();
+        let pat_num = app.patients[0].pat_num;
+        let dir = std::env::temp_dir().join(format!(
+            "odclinic-patient-form-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("form.pdf").to_string_lossy().into_owned();
+
+        app.save_patient_form_pdf(pat_num, &path);
+
+        assert!(app.error.is_none(), "{:?}", app.error);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"%PDF-1.4"));
+        let html = render_patient_form_html(&app.patient_form_document(pat_num).unwrap());
+        assert!(html.contains("Highland Dental"));
+        assert!(html.contains(&app.patients[0].display_name()));
+        assert!(app
+            .store
+            .list_security_log(50)
+            .unwrap()
+            .iter()
+            .any(|e| e.log_text.contains("Patient form PDF saved")));
+
+        let blocked = dir.join("blocked.pdf").to_string_lossy().into_owned();
+        app.features.set(FeatureKey::PatientFormsEnabled, false);
+        app.save_patient_form_pdf(pat_num, &blocked);
+        assert!(app
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("permission/feature"));
+        assert!(!std::path::Path::new(&blocked).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

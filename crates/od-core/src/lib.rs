@@ -6,6 +6,7 @@ pub mod definitions;
 pub mod discount;
 pub mod dynamic_payment_plan;
 pub mod journal;
+pub mod patient_form;
 pub mod payment_plan;
 pub mod period_close;
 pub mod pdf;
@@ -63,7 +64,10 @@ pub use period_close::{
     period_close_events, period_close_history_report, period_close_history_report_filtered,
     reopen_audit_text, tie_out_ready,
 };
-pub use pdf::{render_invoice_pdf, render_statement_pdf};
+pub use patient_form::{
+    build_patient_form_document, render_patient_form_html, PatientFormDocument, PatientFormProblem,
+};
+pub use pdf::{render_invoice_pdf, render_patient_form_pdf, render_statement_pdf};
 pub use registry::{build_invoice_document, validate_clinic_card_issue};
 pub use od_domain::reports::{
     ActivePatientReportOptions, AdjustmentSheetReportOptions, AgingAgeFilter, AgingOptions,
@@ -535,6 +539,115 @@ pub fn build_unapplied_plan_credit_transfer(
             ..Default::default()
         },
     ];
+    payment.validate_allocations(&allocations)?;
+    Ok((payment, allocations))
+}
+
+/// Build a balanced zero-amount transfer that applies one patient's own credit
+/// balance to that patient's oldest open charges. The negative unallocated
+/// split consumes the overpayment and the positive splits pay individual
+/// procedures; every split inherits `pat_num`, so credit can never move to a
+/// family member, guarantor or another patient.
+///
+/// `procedures`, `adjustments` and `splits` may contain other patients' rows;
+/// only rows belonging to `pat_num` are considered.
+pub fn build_patient_credit_application(
+    pat_num: Id,
+    procedures: &[Procedure],
+    adjustments: &[Adjustment],
+    splits: &[PaySplit],
+    as_of: chrono::NaiveDate,
+) -> Result<(Payment, Vec<PaymentAllocation>), String> {
+    let own_procedures: Vec<&Procedure> = procedures
+        .iter()
+        .filter(|p| p.pat_num == pat_num && p.proc_status.is_completed() && p.proc_date <= as_of)
+        .collect();
+    let own_adjustments: Vec<&Adjustment> = adjustments
+        .iter()
+        .filter(|a| a.pat_num == pat_num && a.adj_date <= as_of)
+        .collect();
+    let own_splits: Vec<&PaySplit> = splits
+        .iter()
+        .filter(|s| s.pat_num == pat_num && s.date_pay <= as_of)
+        .collect();
+
+    // The account summary is the authority on whether this patient has credit:
+    // a negative balance means they overpaid their own completed charges.
+    let charges: f64 = own_procedures.iter().map(|p| p.fee).sum();
+    let adjustments_total: f64 = own_adjustments.iter().map(|a| a.adj_amount).sum();
+    let paid: f64 = own_splits.iter().map(|s| s.split_amount).sum();
+    let credit = paid - charges - adjustments_total;
+    if credit <= 0.005 {
+        return Err("No patient credit to apply".into());
+    }
+
+    // Remaining charge per procedure, oldest service date first. Adjustments
+    // attached to a procedure reduce that procedure; general adjustments and
+    // unallocated splits were already counted in the credit total above.
+    let mut open_charges: Vec<(chrono::NaiveDate, Id, f64)> = own_procedures
+        .iter()
+        .map(|p| {
+            let linked_adjustments: f64 = own_adjustments
+                .iter()
+                .filter(|a| a.proc_num == p.proc_num)
+                .map(|a| a.adj_amount)
+                .sum();
+            let linked_splits: f64 = own_splits
+                .iter()
+                .filter(|s| s.proc_num == p.proc_num)
+                .map(|s| s.split_amount)
+                .sum();
+            (p.proc_date, p.proc_num, p.fee + linked_adjustments - linked_splits)
+        })
+        .filter(|(_, _, remaining)| *remaining > 0.005)
+        .collect();
+    open_charges.sort_by_key(|(date, proc_num, _)| (*date, *proc_num));
+    if open_charges.is_empty() {
+        return Err("No open patient charges for this credit".into());
+    }
+
+    let mut allocations = Vec::new();
+    let mut applied = 0.0;
+    for (_, proc_num, remaining) in &open_charges {
+        if credit - applied <= 0.005 {
+            break;
+        }
+        let amount = (*remaining).min(credit - applied);
+        if amount <= 0.005 {
+            continue;
+        }
+        allocations.push(PaymentAllocation {
+            target: PaymentTarget::Procedure(*proc_num),
+            amount,
+            ..Default::default()
+        });
+        applied += amount;
+    }
+    if applied <= 0.005 {
+        return Err("No open patient charges for this credit".into());
+    }
+    allocations.insert(
+        0,
+        PaymentAllocation {
+            target: PaymentTarget::Unallocated,
+            amount: -applied,
+            ..Default::default()
+        },
+    );
+
+    let payment = Payment {
+        pay_num: 0,
+        pat_num,
+        pay_date: as_of,
+        pay_amount: 0.0,
+        pay_type: 0,
+        check_num: String::new(),
+        note: format!(
+            "Apply patient credit {:.2} to own open charges on {}",
+            applied,
+            as_of.format("%Y-%m-%d")
+        ),
+    };
     payment.validate_allocations(&allocations)?;
     Ok((payment, allocations))
 }
@@ -1407,6 +1520,100 @@ mod tests {
         assert_eq!(allocs[0].amount, -25.0);
         assert_eq!(allocs[1].amount, 25.0);
         pay.validate_allocations(&allocs).unwrap();
+    }
+
+    #[test]
+    fn patient_credit_applies_only_to_own_oldest_charges() {
+        let as_of = chrono::NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
+        let old = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        let recent = chrono::NaiveDate::from_ymd_opt(2026, 11, 1).unwrap();
+        let procedures = vec![
+            Procedure {
+                pat_num: 1,
+                proc_num: 11,
+                proc_date: recent,
+                fee: 40.0,
+                proc_status: ProcedureStatus::Complete,
+                ..Default::default()
+            },
+            Procedure {
+                pat_num: 1,
+                proc_num: 10,
+                proc_date: old,
+                fee: 60.0,
+                proc_status: ProcedureStatus::Complete,
+                ..Default::default()
+            },
+            Procedure {
+                pat_num: 2,
+                proc_num: 20,
+                proc_date: old,
+                fee: 500.0,
+                proc_status: ProcedureStatus::Complete,
+                ..Default::default()
+            },
+        ];
+        // 120 paid against 100 of own charges = 20 credit. Another patient's
+        // charges and splits must be ignored entirely.
+        let splits = vec![
+            PaySplit {
+                pat_num: 1,
+                split_amount: 120.0,
+                date_pay: old,
+                ..Default::default()
+            },
+            PaySplit {
+                pat_num: 2,
+                split_amount: -500.0,
+                date_pay: old,
+                ..Default::default()
+            },
+        ];
+        let (pay, allocs) =
+            build_patient_credit_application(1, &procedures, &[], &splits, as_of).unwrap();
+        assert_eq!(pay.pat_num, 1);
+        assert_eq!(pay.pay_amount, 0.0);
+        assert!(pay.note.contains("20.00"));
+        assert_eq!(allocs.len(), 2);
+        assert_eq!(allocs[0].target, PaymentTarget::Unallocated);
+        assert_eq!(allocs[0].amount, -20.0);
+        assert_eq!(allocs[1].target, PaymentTarget::Procedure(10));
+        assert_eq!(allocs[1].amount, 20.0);
+        assert!(allocs.iter().all(|a| a.pat_num == 0));
+        pay.validate_allocations(&allocs).unwrap();
+        let built = pay.splits(&allocs).unwrap();
+        assert!(built.iter().all(|s| s.pat_num == 1));
+
+        assert!(build_patient_credit_application(1, &procedures, &[], &[], as_of).is_err());
+        let covered = vec![PaySplit {
+            pat_num: 1,
+            split_amount: 100.0,
+            date_pay: old,
+            ..Default::default()
+        }];
+        assert!(
+            build_patient_credit_application(1, &procedures, &[], &covered, as_of).is_err(),
+            "balanced account has no credit"
+        );
+        // The amount applied is capped at the actual credit, even when the
+        // oldest charge is larger than the credit.
+        let big_credit = vec![PaySplit {
+            pat_num: 1,
+            split_amount: 150.0,
+            date_pay: old,
+            ..Default::default()
+        }];
+        let (_, allocs) =
+            build_patient_credit_application(1, &procedures, &[], &big_credit, as_of).unwrap();
+        let procedure_amounts: Vec<_> = allocs
+            .iter()
+            .filter(|a| matches!(a.target, PaymentTarget::Procedure(_)))
+            .map(|a| (a.target, a.amount))
+            .collect();
+        assert_eq!(
+            procedure_amounts,
+            vec![(PaymentTarget::Procedure(10), 50.0)]
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! multiple pages, A4 for statements and A5 for invoices, and a correct
 //! cross-reference table.
 
-use crate::{RefundTransferReceipt, StatementDocument};
+use crate::{PatientFormDocument, RefundTransferReceipt, StatementDocument};
 use od_domain::{Id, InvoiceDocument};
 
 /// Page geometry in PDF points (72 per inch). A5 is 148 x 210 mm.
@@ -233,6 +233,79 @@ pub fn render_statement_pdf(doc: &StatementDocument) -> Vec<u8> {
     }
 
     assemble_pdf(&writer.finish(), doc.pat_num, page, "Statement")
+}
+
+/// Render a patient intake/medical-history form as A4 PDF bytes. The title and
+/// footer carry the patient number and generation date, so a filed copy is
+/// self-describing even outside the application.
+pub fn render_patient_form_pdf(doc: &PatientFormDocument) -> Vec<u8> {
+    let title = format!("Patient form - {}", doc.patient_name);
+    let mut writer = Writer::new(&title);
+    let page = writer.page;
+    writer.line(
+        "F1",
+        9.0,
+        &format!(
+            "{}  |  Patient #{}  |  Generated {}",
+            doc.practice, doc.pat_num, doc.generated_on
+        ),
+        18.0,
+    );
+    writer.line("F2", 11.0, "Demographics", 18.0);
+    for (label, value) in [
+        ("Birth date", doc.birth_date.map(|d| d.to_string()).unwrap_or_default()),
+        ("Gender", doc.gender.clone()),
+        ("Home phone", doc.home_phone.clone()),
+        ("Mobile phone", doc.mobile_phone.clone()),
+        ("Email", doc.email.clone()),
+        ("Chart number", doc.chart_number.clone()),
+        ("Address", format!("{} {}, {} {}", doc.address, doc.city, doc.state, doc.zip)),
+    ] {
+        let value: String = value.chars().take(70).collect();
+        writer.line("F1", 9.0, &format!("{label}: {value}"), 14.0);
+    }
+
+    writer.y -= 4.0;
+    writer.line("F2", 11.0, "Medical history", 18.0);
+    if doc.problems.is_empty() {
+        writer.line("F1", 9.0, "No problems recorded.", 14.0);
+    }
+    for problem in &doc.problems {
+        let line = format!(
+            "{} - {} ({}{}) {}",
+            problem.name.chars().take(40).collect::<String>(),
+            problem.status,
+            problem.date_start,
+            problem
+                .date_stop
+                .map(|d| format!(" to {d}"))
+                .unwrap_or_default(),
+            problem.note.chars().take(30).collect::<String>()
+        );
+        writer.line("F1", 9.0, &line.chars().take(100).collect::<String>(), 14.0);
+    }
+
+    writer.y -= 4.0;
+    writer.line("F2", 11.0, "Notes", 18.0);
+    for (label, value) in [
+        ("Medical", doc.medical.as_str()),
+        ("Treatment", doc.treatment.as_str()),
+        ("Service", doc.service.as_str()),
+    ] {
+        for (index, text) in value.lines().take(4).enumerate() {
+            let prefix = if index == 0 { label } else { "" };
+            writer.line(
+                "F1",
+                9.0,
+                &format!("{prefix}: {}", text.chars().take(90).collect::<String>()),
+                13.0,
+            );
+        }
+    }
+
+    writer.y -= 8.0;
+    writer.line("F1", 9.0, "Patient / guardian: ____________________  Date: __________", 16.0);
+    assemble_pdf(&writer.finish(), doc.pat_num, page, "PatientForm")
 }
 
 /// Render a refund/transfer receipt as A4 PDF bytes.
@@ -524,6 +597,45 @@ mod tests {
         assert!(text.contains("Balance due: 75.00"));
         // Parentheses are escaped in PDF literal strings.
         assert!(text.contains("Please pay \\(at reception\\)"));
+    }
+
+    #[test]
+    fn patient_form_pdf_is_structurally_valid() {
+        use chrono::NaiveDate;
+        use od_domain::{Gender, ProblemStatus};
+        let doc = PatientFormDocument {
+            pat_num: 7,
+            patient_name: "Ada Lovelace".into(),
+            generated_on: NaiveDate::from_ymd_opt(2026, 11, 26).unwrap(),
+            practice: "Highland Dental".into(),
+            birth_date: None,
+            gender: Gender::Female.label().into(),
+            home_phone: "+251 11 000 000".into(),
+            mobile_phone: String::new(),
+            email: String::new(),
+            address: String::new(),
+            city: String::new(),
+            state: String::new(),
+            zip: String::new(),
+            chart_number: String::new(),
+            medical: "No known allergies".into(),
+            treatment: String::new(),
+            service: String::new(),
+            problems: vec![crate::PatientFormProblem {
+                name: "Caries".into(),
+                status: ProblemStatus::Active.label().into(),
+                date_start: NaiveDate::from_ymd_opt(2024, 5, 1).unwrap(),
+                date_stop: None,
+                note: String::new(),
+            }],
+        };
+        let bytes = render_patient_form_pdf(&doc);
+        assert_valid_pdf(&bytes);
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("Patient form - Ada Lovelace"));
+        assert!(text.contains("Patient #7"));
+        assert!(text.contains("Highland Dental"));
+        assert!(text.contains("No known allergies"));
     }
 
     #[test]
