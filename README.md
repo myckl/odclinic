@@ -185,19 +185,30 @@ Schema notes that came from the source map:
 ## Running it
 
 ```bash
-# Demo data, no database required
+# Demo data, no database required (only when ODCLINIC_DB_URL is unset)
 cargo run --release
 
-# Against the local Open Dental demo database (MariaDB on localhost)
+# Against an untouched local Open Dental 24_3 database
 $env:ODCLINIC_DB_URL = "mysql://root:<password>@localhost:3306/demo"
 cargo run --release
 ```
 
-The URL accepts the shorthand `root:<password>@localhost:3306/demo` too. If
-`ODCLINIC_DB_URL` is absent or the connection fails, the app falls back to the
-seeded demo data and shows the reason in the status bar. The **Prefer demo
-data** toggle in Settings overrides the database until it is turned off and the
-app is restarted.
+The URL accepts the shorthand `root:<password>@localhost:3306/demo` too. With
+no `ODCLINIC_DB_URL`, the app uses seeded demo data. When `ODCLINIC_DB_URL`
+**is** configured, startup fails closed on any connection or schema-verification
+error; it never silently substitutes demo rows. The **Prefer demo data** toggle
+in Settings is an explicit override and takes effect after restart.
+
+Startup defaults to `SchemaMode::Strict`: it verifies the OD `24_3` objects the
+port reads and issues **no DDL against OD-owned tables**. Set
+`ODCLINIC_ALLOW_SCHEMA_BOOTSTRAP=1` only when an otherwise compatible demo
+database needs the port-local `odclinic_*` side tables; that mode creates only
+those tables, idempotently, and never creates or alters an OD table.
+
+OD-owned writes are denied by default (`WritePolicy::DenyOdWrites`) because the
+port cannot reproduce OD's salted `CDT.dll` `SecurityHash`. Set
+`ODCLINIC_ALLOW_OD_WRITES=1` only if you accept that OD may flag port-created
+rows as tampered. Port-local `odclinic_*` writes are never gated.
 
 ### Automated build sequence
 
@@ -246,59 +257,47 @@ mysql -u root -p < crates/od-db/schema.sql
 ⚠️ Use a copy of a database, not a live practice database: writes go straight
 to the OD tables with their original column names.
 
-### Live database verification
+### Live database verification (Wave 0 gate)
 
-Thirty-seven ignored integration tests check the backend against a real OD schema:
+Forty-two ignored integration tests check the backend against a real OD `24_3`
+schema. The supported entry point is the wrapper, which discovers the stored
+local credential automatically, sets `ODCLINIC_ALLOW_OD_WRITES=1` for the harness
+only, and serializes the suite with `--ignored --nocapture --test-threads=1`:
 
-```bash
-# Read every table/column the port uses
-$env:ODCLINIC_DB_URL = "mysql://root:<password>@localhost:3306/demo"
-cargo test -p od-db --test mysql_live -- --ignored --nocapture
+```powershell
+./scripts/run_mysql_live.ps1
 ```
 
-This runs `mysql_backend_reads_compatible_od_tables`,
-`mysql_backend_writes_compatible_od_tables`,
-`mysql_backend_supports_security_tables` and
-`mysql_backend_supports_billing_tables`. The write tests create one temporary
-patient, one temporary appointment and one temporary `securitylog` row, plus one
-temporary `adjustment` and a `payment`/`paysplit` pair, read them back, then
-delete them before asserting. More tests cover payment plans, multi-split
-payments and statement rows; `mysql_backend_collections_worklist_tracks_patient_payment`
-checks that a temporary overdue charge appears in the per-patient worklist and
-that a recorded payment reduces that same balance.
-`mysql_backend_supports_recall_and_asap` writes a
-temporary `recall` and ASAP-flagged `appointment`, reads both back through the
-`Store` API and deletes them. `mysql_eservices_rules_outbox_and_dedupe_round_trip`
-adds a temporary `apptreminderrule` rule, a port-local patient contact, a dedupe
-key and an outbox row, reads each back and deletes all four.
-`mysql_treatment_plans_round_trip` creates an Inactive plan and line, promotes
-the plan to Active, verifies the `treatplanattach` link, saves a `proctp`
-snapshot with the procedure's real fee, restores the patient's original plans
-and deletes all temporary rows. `mysql_definitions_and_display_fields_round_trip`
-writes a temporary `definition` row with an ARGB colour and hidden flag, reads it
-back and deletes it, then replaces and restores the display fields of an
-unpopulated OD category, verifying the "default list means no rows" save rule.
-`mysql_waitlist_history_and_patient_corrections_round_trip` writes a temporary
-`AptStatus = 3` waitlist row with a `RecallUnschedStatus` definition, snapshots it
-to `histappointment`, deletes and restores it through `restore_appointment`, then
-writes and reads a port-local patient correction before cleaning up all three
-rows. `mysql_registry_and_clinic_card_round_trip` reads OD `disease`/`diseasedef`,
-`patientnote` and `procedurelog`, then issues a temporary clinic card with a unique
-authorisation marker, checks that no `statement` row was created, writes and reads
-an `IsInvoice` statement, deactivates (rather than deletes) the card and cleans
-both rows up. `mysql_local_reports_build_from_live_data` runs the recall/ASAP,
-payment-plan and treatment-plan report builders over the real tables, and
-`mysql_upstream_reports_build_from_live_data` runs the aging, payment-plan
-detail, birthday, new-patient, appointments, active-patient, all four
-production/income modes and the daily-payments builder; both check the CSV/HTML
-exports.
-`MySqlStore::new()` adds the `recall` table,
-`appointment.Priority` and `appointment.UnschedStatus` columns, the
-`histappointment` and port-local `odclinic_patient_correction` tables, four
-eServices tables, full OD `treatplan`, `proctp` and `treatplanattach` columns,
-`definition.ItemColor` plus the full `displayfield` table, the port-local
-`odclinic_clinic_card` table and the `disease.PatNote`/`disease.ProbStatus`
-columns idempotently so older demo databases work. URL-encode the password in
+The credential is never printed, echoed or copied into the project. You can also
+run the suite directly with `ODCLINIC_DB_URL` already set:
+
+```bash
+cargo test -p od-db --test mysql_live -- --ignored --nocapture --test-threads=1
+```
+
+Wave 0 assertions include:
+
+* `mysql_wave0_strict_startup_does_not_mutate_od_schema` snapshots the entire
+  `information_schema` before and after `MySqlStore::new()` and requires zero
+  changes, while still reading real patients.
+* `mysql_wave0_default_deny_blocks_od_writes` proves the default policy rejects
+  an OD patient write and leaves no row.
+* `mysql_wave0_od_writes_leave_no_traces` and
+  `mysql_wave0_store_writes_od_shaped_fixtures` verify OD-shaped patient,
+  appointment and soft-delete semantics through both direct SQL and the port's
+  write paths. All fixtures are explicitly deleted; the demo tables are MyISAM,
+  so rollback-based cleanup is not reliable.
+* `mysql_eservices_rules_outbox_and_dedupe_round_trip` preserves OD's raw
+  comma-delimited `apptreminderrule.SendOrder` and proves dedupe writes only to
+  `odclinic_reminder_sent`, never to OD HQ-owned `apptremindersent`.
+
+The remaining tests cover table/column reads, security and billing tables,
+patient/appointment/statement/payment-plan/treatment-plan round trips,
+multi-split payments, collections, recall/ASAP, waitlist/history/corrections,
+clinic cards, discount plans, journal posting, period close and all report
+builders. Fixtures are cleaned up explicitly. Strict mode never creates tables;
+bootstrap new side tables once with `ODCLINIC_ALLOW_SCHEMA_BOOTSTRAP=1` before
+running the suite against a fresh database. URL-encode the password in
 `ODCLINIC_DB_URL` if it contains `@`, `#`, `:` or other reserved characters.
 
 Verified 2026-11-21 against the installed MariaDB 10.11 `demo` database:
@@ -466,7 +465,9 @@ permissions `PaymentCreate=15`, `PaymentEdit=16`, `AdjustmentCreate=17`,
   Gated by **Patient forms** and the OD Patient Edit permission; on by default.
 * **eServices (local reminders):** Setup → eServices has Channels, Reminder
   rules and Outbox tabs. Rules mirror OD `apptreminderrule` (type, 100 ns
-  `TSPrior` ticks, `DoNotSendWithin`, `SendOrder`, templates); dedupe uses OD
+  `TSPrior` ticks, `DoNotSendWithin`, `SendOrder`, templates); the raw OD
+  comma-delimited `SendOrder` survives read-modify-write, and dedupe uses the
+  port-local `odclinic_reminder_sent` table, never OD HQ-owned
   `apptremindersent`. The engine renders OD-style `{FirstName}` / `{DateTime}`
   tokens, resolves a channel (OD `CommType` → Telegram for text, falling back
   to Africa's Talking SMS; `Preferred` keeps Telegram → SMTP → SMS; email stays

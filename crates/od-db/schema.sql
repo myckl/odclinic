@@ -664,6 +664,18 @@ CREATE TABLE IF NOT EXISTS odclinic_patient_contact (
   OptOutTelegram tinyint NOT NULL DEFAULT 0
 );
 
+-- Port-local reminder dedupe. OD's apptremindersent is HQ-owned state where
+-- SendStatus=1 means DoNotSend; writing generic dedupe rows there would silence
+-- real OD reminders. Keep this port's delivery history out of OD's table.
+CREATE TABLE IF NOT EXISTS odclinic_reminder_sent (
+  SentNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  ApptReminderRuleNum bigint NOT NULL DEFAULT 0,
+  ApptNum bigint NOT NULL DEFAULT 0,
+  PatNum bigint NOT NULL DEFAULT 0,
+  SentAt datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY (ApptReminderRuleNum, ApptNum), KEY (PatNum)
+);
+
 -- Port-local patient correction snapshots. OD has no patient-history table.
 CREATE TABLE IF NOT EXISTS odclinic_patient_correction (
   CorrectionNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,

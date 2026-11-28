@@ -60,7 +60,7 @@ use od_core::{
     LabelAddress, PostingAccountDefaults, PostingSourceKind, PaySheetGroupBy, ProdIncMode,
     PublicHealthRow, RecallDueState, ReportRow, ReportTable,
 };
-use od_db::{Backend, DemoStore, MySqlStore, Store};
+use od_db::{Backend, DemoStore, MySqlStore, SchemaMode, Store};
 use od_domain::definitions::{
     default_display_fields, Definition, DefinitionCategory, DisplayField, DisplayFieldCategory,
 };
@@ -2008,6 +2008,10 @@ struct OdApp {
 
 impl OdApp {
     fn new() -> Self {
+        Self::try_new().unwrap_or_else(|err| panic!("odclinic startup failed: {err}"))
+    }
+
+    pub fn try_new() -> Result<Self, String> {
         let features = FeatureSettings::load();
         let startup_user_key = od_domain::period_close_history_user_key(None);
         let (store, db_label) = if features.enabled(FeatureKey::PreferDemoData) {
@@ -2017,16 +2021,26 @@ impl OdApp {
             )
         } else {
             match std::env::var("ODCLINIC_DB_URL") {
-                Ok(url) => match MySqlStore::new(&url) {
-                    Ok(store) => (
-                        Arc::new(Backend::MySql(store)) as Arc<dyn Store>,
-                        "MySQL (ODCLINIC_DB_URL)".to_string(),
-                    ),
-                    Err(err) => (
-                        Arc::new(Backend::Demo(DemoStore::seeded())) as Arc<dyn Store>,
-                        format!("Demo data — MySQL failed: {err}"),
-                    ),
-                },
+                Ok(url) => {
+                    let mode = if std::env::var("ODCLINIC_ALLOW_SCHEMA_BOOTSTRAP").as_deref()
+                        == Ok("1")
+                    {
+                        SchemaMode::BootstrapPortLocal
+                    } else {
+                        SchemaMode::Strict
+                    };
+                    match MySqlStore::with_mode(&url, mode) {
+                        Ok(store) => (
+                            Arc::new(Backend::MySql(store)) as Arc<dyn Store>,
+                            format!("MySQL (ODCLINIC_DB_URL, {mode:?})"),
+                        ),
+                        Err(err) => {
+                            return Err(format!(
+                                "MySQL startup failed: {err}. Correct ODCLINIC_DB_URL or enable 'Prefer demo data' in Settings."
+                            ));
+                        }
+                    }
+                }
                 Err(_) => (
                     Arc::new(Backend::Demo(DemoStore::seeded())) as Arc<dyn Store>,
                     "Demo data (set ODCLINIC_DB_URL for MySQL)".to_string(),

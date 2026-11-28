@@ -8,8 +8,10 @@
 //! to the same demo database, so parallel runs let one test's temp split leak
 //! into another test's report totals.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use chrono::{NaiveDate, NaiveDateTime};
-use mysql::prelude::Queryable;
+use mysql::{Value, prelude::Queryable};
 use od_core::{
     account_summary_without_insurance, active_patient_report, adj_sheet_report, aging_report,
     appointments_report, asap_report, balance_sheet_report, birthday_report,
@@ -32,7 +34,7 @@ use od_core::{
     statement_report, treat_plan_presentation_statistics_report, treatment_finder_report,
     treatment_plan_report, unearned_income_report, PublicHealthRow,
 };
-use od_db::{MySqlStore, Store};
+use od_db::{MySqlStore, SchemaMode, Store, WritePolicy};
 use od_domain::definitions::{Definition, DefinitionCategory, DisplayField, DisplayFieldCategory};
 use od_domain::eservices::*;
 use od_domain::reports_ext::{
@@ -57,6 +59,371 @@ use od_domain::{
     Procedure, ProcedureStatus, Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine,
     TreatPlanStatus,
 };
+
+fn live_db_pool(url: &str) -> mysql::Pool {
+    let normalized = if url.contains("://") {
+        url.trim().to_string()
+    } else {
+        format!("mysql://{}", url.trim())
+    };
+    let opts = mysql::Opts::from_url(&normalized).expect("invalid ODCLINIC_DB_URL");
+    mysql::Pool::new(opts).expect("could not create MySQL pool")
+}
+
+fn live_url() -> String {
+    std::env::var("ODCLINIC_DB_URL")
+        .expect("ODCLINIC_DB_URL must be set to run the live MySQL check")
+}
+
+/// A compact fingerprint of every table/column in the connected schema. It is
+/// used to prove that strict startup performs no DDL against OD-owned tables.
+fn schema_snapshot(conn: &mut mysql::PooledConn) -> Vec<(String, String, String)> {
+    conn.query(
+        "SELECT TABLE_NAME,COLUMN_NAME,COLUMN_TYPE FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION",
+    )
+    .expect("could not read information_schema")
+}
+
+fn high_fixture_num(offset: u32) -> u32 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos()
+        % 1_000_000_000;
+    2_100_000_000u32 + nanos as u32 + offset
+}
+
+/// Wave 0 gate: starting the app against an untouched OD 24_3 schema must be
+/// read-only. Any CREATE/ALTER/MODIFY performed by startup changes this snapshot.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; read-only schema check"]
+fn mysql_wave0_strict_startup_does_not_mutate_od_schema() {
+    let url = live_url();
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+    let before = schema_snapshot(&mut conn);
+    assert!(
+        !before.is_empty(),
+        "ODCLINIC_DB_URL points at a schema with no columns"
+    );
+
+    let store = MySqlStore::with_mode(&url, SchemaMode::Strict)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let after = schema_snapshot(&mut conn);
+
+    assert_eq!(
+        before, after,
+        "strict startup changed the OD schema; odclinic must never create or alter OD tables"
+    );
+
+    let patients = store.list_patients().expect("patient read failed after startup");
+    println!(
+        "strict startup: {} schema entries unchanged, {} patients readable",
+        before.len(),
+        patients.len()
+    );
+}
+
+/// Wave 0 gate: OD-shaped patient/appointment writes succeed against the
+/// untouched schema, including OD's audit columns, and the fixtures are removed
+/// afterwards. The demo DB uses MyISAM, so a transaction cannot roll these rows
+/// back; explicit cleanup is the only reliable way to leave no traces.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes temporary fixtures"]
+fn mysql_wave0_od_writes_leave_no_traces() {
+    let url = live_url();
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let billing_type: i64 = conn
+        .query_first("SELECT MIN(DefNum) FROM definition WHERE Category = 4 AND IsHidden = 0")
+        .expect("could not read billing type definitions")
+        .expect("no visible billing type definition");
+    let confirmed: i64 = conn
+        .query_first("SELECT MIN(DefNum) FROM definition WHERE Category = 2 AND IsHidden = 0")
+        .expect("could not read appointment confirmation definitions")
+        .unwrap_or(0);
+    let user_num: i64 = conn
+        .query_first("SELECT MIN(UserNum) FROM userod WHERE IsHidden = 0")
+        .expect("could not read OD users")
+        .unwrap_or(0);
+    let operatory_num: i64 = conn
+        .query_first("SELECT MIN(OperatoryNum) FROM operatory WHERE IsHidden = 0")
+        .expect("could not read operatories")
+        .unwrap_or(0);
+    let provider_num: i64 = conn
+        .query_first("SELECT MIN(ProvNum) FROM provider WHERE IsHidden = 0")
+        .expect("could not read providers")
+        .unwrap_or(0);
+
+    let pat_num = high_fixture_num(0);
+    let apt_num = high_fixture_num(1);
+
+    // Remove fixtures from an earlier aborted run before starting.
+    conn.query_drop("DELETE FROM appointment WHERE Note = 'ODCLINIC_WAVE0'")
+        .expect("could not clean old appointment fixtures");
+    conn.query_drop("DELETE FROM patient WHERE LName = 'ODCLINIC_WAVE0' AND FName = 'TEMP'")
+        .expect("could not clean old patient fixtures");
+
+    conn.exec_drop(
+        "INSERT INTO patient \
+         (PatNum,LName,FName,Birthdate,Gender,HmPhone,WirelessPhone,Email,Address,Address2,\
+          City,State,Zip,WkPhone,BillingType,ChartNumber,SSN,MedicaidID,PatStatus,County,\
+          SiteNum,GradeLevel,Urgency,PlannedIsDone,Guarantor,ClinicNum,PriProv) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        vec![
+            Value::from(pat_num),
+            Value::from("ODCLINIC_WAVE0"),
+            Value::from("TEMP"),
+            Value::from("0001-01-01"),
+            Value::from(0i8),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(""),
+            Value::from(billing_type),
+            Value::from("ODCLINIC-WAVE0"),
+            Value::from(""),
+            Value::from(""),
+            Value::from(0i32),
+            Value::from(""),
+            Value::from(0i64),
+            Value::from(0i32),
+            Value::from(0i8),
+            Value::from(0i8),
+            Value::from(pat_num),
+            Value::from(0i64),
+            Value::from(provider_num),
+        ],
+    )
+    .expect("OD patient insert failed");
+
+    // Read the values before cleanup: every assertion must still be meaningful
+    // after the fixtures have been removed.
+    let patient_read: Option<(i64, i64, String)> = conn
+        .exec_first(
+            "SELECT BillingType,Guarantor,ChartNumber FROM patient WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .expect("patient readback failed");
+
+    conn.exec_drop(
+        "UPDATE patient SET PatStatus = 4, Guarantor = PatNum WHERE PatNum = ?",
+        (pat_num,),
+    )
+    .expect("OD patient soft-delete failed");
+    let soft_delete_read: Option<(i32, i64)> = conn
+        .exec_first(
+            "SELECT PatStatus,Guarantor FROM patient WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .expect("soft-delete readback failed");
+
+    conn.exec_drop(
+        "INSERT INTO appointment \
+         (AptNum,PatNum,AptDateTime,AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,TimeLocked,\
+          Priority,UnschedStatus,Confirmed,SecUserNumEntry,SecDateTEntry,SecurityHash) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NOW(),?)",
+        vec![
+            Value::from(apt_num),
+            Value::from(pat_num),
+            Value::from("2099-01-01 09:00:00"),
+            Value::from(1i8),
+            Value::from(operatory_num),
+            Value::from(provider_num),
+            Value::from(0i64),
+            Value::from("ODCLINIC_WAVE0"),
+            Value::from("XX"),
+            Value::from(0i8),
+            Value::from(0i8),
+            Value::from(0i64),
+            Value::from(confirmed),
+            Value::from(user_num),
+            Value::from(""),
+        ],
+    )
+    .expect("OD appointment insert failed; a required OD audit column is missing");
+    let appointment_read: Option<(i64, i64)> = conn
+        .exec_first(
+            "SELECT Confirmed,SecUserNumEntry FROM appointment WHERE AptNum = ?",
+            (apt_num,),
+        )
+        .expect("appointment readback failed");
+
+    // MyISAM ignores ROLLBACK, so delete by the exact fixture keys.
+    conn.exec_drop("DELETE FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("could not remove appointment fixture");
+    conn.exec_drop("DELETE FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("could not remove patient fixture");
+    let patient_rows: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("could not verify patient cleanup");
+    let appointment_rows: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("could not verify appointment cleanup");
+    assert_eq!(patient_rows.unwrap_or(0), 0, "patient fixture leaked");
+    assert_eq!(appointment_rows.unwrap_or(0), 0, "appointment fixture leaked");
+
+    let (read_billing, read_guarantor, read_chart) =
+        patient_read.expect("inserted patient missing on readback");
+    assert_eq!(read_billing as u32, billing_type as u32);
+    assert_eq!(read_guarantor as u32, pat_num);
+    assert_eq!(read_chart, "ODCLINIC-WAVE0");
+    let (pat_status, guarantor_after) = soft_delete_read.expect("soft-deleted patient missing");
+    assert_eq!(pat_status, 4, "OD deletes patients with PatStatus=4");
+    assert_eq!(guarantor_after as u32, pat_num);
+    let (read_confirmed, read_user) = appointment_read.expect("inserted appointment missing");
+    assert_eq!(read_confirmed, confirmed);
+    assert_eq!(read_user, user_num, "OD audit user was not persisted");
+    println!("OD-shaped write smoke passed and fixtures were removed");
+}
+
+/// Wave 0 gate: the application default is `DenyOdWrites`. Even against a real
+/// schema, a store constructed with that policy must refuse an OD-owned write
+/// before issuing any SQL. This is independent of `ODCLINIC_ALLOW_OD_WRITES`.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; verifies the default write gate"]
+fn mysql_wave0_default_deny_blocks_od_writes() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::DenyOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+
+    let pat_num = high_fixture_num(10);
+    let mut patient = Patient::default();
+    patient.pat_num = pat_num;
+    patient.l_name = "ODCLINIC_WAVE0_DENY".into();
+    patient.f_name = "TEMP".into();
+
+    let result = store.upsert_patient(&patient);
+    let message = result.expect_err("OD write succeeded while DenyOdWrites was active");
+    assert!(
+        message.contains("OD writes are disabled"),
+        "unexpected gate error: {message}"
+    );
+
+    // Fail closed means no row was left behind either.
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+    let count: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("could not verify denied write left no row");
+    assert_eq!(count.unwrap_or(0), 0, "denied OD write still inserted a row");
+    println!("default-deny gate refused the OD write and left no row");
+}
+
+/// Wave 0 gate: the *store* write paths (not just direct SQL fixtures) must
+/// produce OD-shaped rows on a genuine 24_3 schema when writes are explicitly
+/// allowed. This covers the audit columns, self-guarantor convention and
+/// appointment confirmation definition FK that the port now writes.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes temporary fixtures"]
+fn mysql_wave0_store_writes_od_shaped_fixtures() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let billing_type: i64 = conn
+        .query_first("SELECT MIN(DefNum) FROM definition WHERE Category = 4 AND IsHidden = 0")
+        .expect("could not read billing type definitions")
+        .expect("no visible billing type definition");
+    let user_num: i64 = conn
+        .query_first("SELECT MIN(UserNum) FROM userod WHERE IsHidden = 0")
+        .expect("could not read OD users")
+        .unwrap_or(0);
+
+    let pat_num = high_fixture_num(20);
+    let apt_num = high_fixture_num(21);
+
+    // Remove fixtures from an earlier aborted run before starting.
+    conn.query_drop("DELETE FROM appointment WHERE Note = 'ODCLINIC_WAVE0_STORE'")
+        .expect("could not clean old appointment fixtures");
+    conn.query_drop("DELETE FROM patient WHERE LName = 'ODCLINIC_WAVE0_STORE'")
+        .expect("could not clean old patient fixtures");
+
+    let mut patient = Patient::default();
+    patient.pat_num = pat_num;
+    patient.l_name = "ODCLINIC_WAVE0_STORE".into();
+    patient.f_name = "TEMP".into();
+    patient.billing_type = billing_type as u32;
+    patient.chart_number = "ODCLINIC-WAVE0-STORE".into();
+    store
+        .upsert_patient(&patient)
+        .expect("store upsert_patient failed under AllowOdWrites");
+
+    let patient_read: Option<(i64, i64, String, i64, String)> = conn
+        .exec_first(
+            "SELECT BillingType,Guarantor,ChartNumber,SecUserNumEntry,SecurityHash \
+             FROM patient WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .expect("patient readback failed");
+
+    store
+        .delete_patient(pat_num)
+        .expect("store delete_patient failed under AllowOdWrites");
+    let soft_delete: Option<i32> = conn
+        .exec_first("SELECT PatStatus FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("soft-delete readback failed");
+
+    let mut appointment = Appointment::default();
+    appointment.apt_num = apt_num;
+    appointment.pat_num = pat_num;
+    appointment.apt_datetime = chrono::NaiveDate::from_ymd_opt(2099, 1, 1)
+        .unwrap()
+        .and_hms_opt(9, 0, 0)
+        .unwrap();
+    appointment.apt_status = AppointmentStatus::Scheduled;
+    appointment.notes = "ODCLINIC_WAVE0_STORE".into();
+    appointment.pattern = "XX".into();
+    store
+        .upsert_appointment(&appointment)
+        .expect("store upsert_appointment failed under AllowOdWrites");
+
+    let appointment_read: Option<(i64, i64, String)> = conn
+        .exec_first(
+            "SELECT Confirmed,SecUserNumEntry,SecurityHash FROM appointment WHERE AptNum = ?",
+            (apt_num,),
+        )
+        .expect("appointment readback failed");
+
+    // MyISAM ignores ROLLBACK, so delete by the exact fixture keys.
+    conn.exec_drop("DELETE FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("could not remove appointment fixture");
+    conn.exec_drop("DELETE FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("could not remove patient fixture");
+    let patient_rows: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM patient WHERE PatNum = ?", (pat_num,))
+        .expect("could not verify patient cleanup");
+    let appointment_rows: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("could not verify appointment cleanup");
+    assert_eq!(patient_rows.unwrap_or(0), 0, "patient fixture leaked");
+    assert_eq!(appointment_rows.unwrap_or(0), 0, "appointment fixture leaked");
+
+    let (read_billing, read_guarantor, read_chart, read_user, read_hash) =
+        patient_read.expect("inserted patient missing on readback");
+    assert_eq!(read_billing as u32, billing_type as u32);
+    assert_eq!(read_guarantor as u32, pat_num, "patient must be its own guarantor");
+    assert_eq!(read_chart, "ODCLINIC-WAVE0-STORE");
+    assert_eq!(read_user, user_num, "OD audit user was not persisted");
+    assert_eq!(read_hash, "", "unreproducible SecurityHash must not be fabricated");
+    assert_eq!(soft_delete, Some(4), "OD deletes patients with PatStatus=4");
+
+    let (read_confirmed, read_apt_user, read_apt_hash) =
+        appointment_read.expect("inserted appointment missing on readback");
+    assert!(read_confirmed >= 0, "Confirmed must be a definition FK");
+    assert_eq!(read_apt_user, user_num, "OD audit user was not persisted");
+    assert_eq!(read_apt_hash, "", "unreproducible SecurityHash must not be fabricated");
+    println!("store-path OD-shaped write passed and fixtures were removed");
+}
 
 #[test]
 #[ignore = "requires a real demo ODCLINIC_DB_URL"]
@@ -1252,6 +1619,8 @@ fn mysql_eservices_rules_outbox_and_dedupe_round_trip() {
     assert!(read_contact.opt_out_telegram);
 
     store.mark_reminder_sent(rule_num, 999_999, pat_num).unwrap();
+    // Idempotent: a second call must not create a duplicate dedupe row.
+    store.mark_reminder_sent(rule_num, 999_999, pat_num).unwrap();
     assert!(store
         .list_reminder_sent()
         .unwrap()
@@ -1300,9 +1669,23 @@ fn mysql_eservices_rules_outbox_and_dedupe_round_trip() {
     let opts = mysql::Opts::from_url(&normalized).expect("bad URL");
     let pool = mysql::Pool::new(opts).expect("bad pool");
     let mut conn = pool.get_conn().expect("bad connection");
+    // Wave 0: the port's dedupe must never touch OD-owned HQ state.
+    let od_sent: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM apptremindersent \
+             WHERE ApptReminderRuleNum = ? AND ApptNum = 999999",
+            (rule_num,),
+        )
+        .expect("could not check OD reminder state");
+    assert_eq!(
+        od_sent.unwrap_or(0),
+        0,
+        "port wrote to OD apptremindersent; SendStatus there means DoNotSend"
+    );
+
     let cleanups = [
         format!("DELETE FROM odclinic_message_outbox WHERE MessageNum = {message_num}"),
-        format!("DELETE FROM apptremindersent WHERE ApptReminderRuleNum = {rule_num} AND ApptNum = 999999"),
+        format!("DELETE FROM odclinic_reminder_sent WHERE ApptReminderRuleNum = {rule_num} AND ApptNum = 999999"),
         format!("DELETE FROM apptreminderrule WHERE ApptReminderRuleNum = {rule_num}"),
         format!("DELETE FROM odclinic_patient_contact WHERE PatNum = {pat_num}"),
     ];

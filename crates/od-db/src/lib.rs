@@ -8,7 +8,7 @@ mod demo;
 mod mysql_store;
 
 pub use demo::DemoStore;
-pub use mysql_store::MySqlStore;
+pub use mysql_store::{MySqlStore, SchemaMode, WritePolicy};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use od_domain::definitions::{Definition, DisplayField, DisplayFieldCategory};
@@ -19,6 +19,13 @@ use od_domain::*;
 
 /// Synchronous store interface used by the GUI.
 pub trait Store: Send + Sync {
+    /// OD audit columns need the acting user. Demo data has no OD user, so the
+    /// default is a no-op; MySQL overrides it.
+    fn set_current_user(&self, _user_num: Id) {}
+    fn current_user(&self) -> Id {
+        0
+    }
+
     fn list_patients(&self) -> Result<Vec<Patient>, String>;
     fn find_patients(&self, query: &str) -> Result<Vec<Patient>, String>;
     fn get_patient(&self, pat_num: Id) -> Result<Option<Patient>, String>;
@@ -283,6 +290,20 @@ pub enum Backend {
 }
 
 impl Store for Backend {
+    fn set_current_user(&self, user_num: Id) {
+        match self {
+            Backend::Demo(s) => s.set_current_user(user_num),
+            Backend::MySql(s) => s.set_current_user(user_num),
+        }
+    }
+
+    fn current_user(&self) -> Id {
+        match self {
+            Backend::Demo(s) => s.current_user(),
+            Backend::MySql(s) => s.current_user(),
+        }
+    }
+
     fn list_patients(&self) -> Result<Vec<Patient>, String> {
         match self {
             Backend::Demo(s) => s.list_patients(),

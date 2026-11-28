@@ -3,6 +3,8 @@
 //! Connect with an ODBC-style URL in `ODCLINIC_DB_URL`, for example:
 //! `mysql://od_user:secret@localhost:3306/opendental`
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::{Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime};
 use mysql::{Opts, Pool, PooledConn, Value, from_row, prelude::Queryable};
 use od_domain::definitions::{
@@ -13,12 +15,72 @@ use od_domain::*;
 
 use crate::Store;
 
+/// How startup treats schema differences.
+///
+/// `Strict` is the plug-and-play default: it verifies the Open Dental 24_3
+/// objects this port needs and never issues DDL. `BootstrapPortLocal` is an
+/// explicit opt-in for demo databases that still need the four `odclinic_*`
+/// side tables; it never creates or alters an OD-owned table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchemaMode {
+    Strict,
+    BootstrapPortLocal,
+}
+
+/// Whether writes to OD-owned tables are permitted.
+///
+/// OD verifies `patient`, `appointment`, `paysplit`, `payplan` and other rows
+/// with a salted `SecurityHash` produced by the obfuscated `CDT.dll`. That
+/// algorithm cannot be reproduced or independently verified from the open
+/// source tree, so writing those tables without it would create rows OD itself
+/// flags as tampered. The default is `DenyOdWrites`; `ODCLINIC_ALLOW_OD_WRITES=1`
+/// is an explicit operator opt-in that accepts that risk for an otherwise
+/// compatible schema. Port-local `odclinic_*` tables are never gated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WritePolicy {
+    DenyOdWrites,
+    AllowOdWrites,
+}
+
+impl WritePolicy {
+    fn from_env() -> Self {
+        match std::env::var("ODCLINIC_ALLOW_OD_WRITES")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "1" | "true" | "yes" | "on" => Self::AllowOdWrites,
+            _ => Self::DenyOdWrites,
+        }
+    }
+}
+
 pub struct MySqlStore {
     pool: Pool,
+    current_user: AtomicU64,
+    write_policy: WritePolicy,
 }
 
 impl MySqlStore {
+    /// Connect to an Open Dental database without changing its schema.
+    /// OD-owned writes are denied unless explicitly enabled in the environment.
     pub fn new(url: &str) -> Result<Self, String> {
+        Self::with_policy(url, SchemaMode::Strict, WritePolicy::from_env())
+    }
+
+    pub fn with_mode(url: &str, mode: SchemaMode) -> Result<Self, String> {
+        Self::with_policy(url, mode, WritePolicy::from_env())
+    }
+
+    /// Explicit policy constructor. The compatibility harness uses `AllowOdWrites`
+    /// for temporary fixtures; the application uses the environment-derived
+    /// default, which fails closed.
+    pub fn with_policy(
+        url: &str,
+        mode: SchemaMode,
+        write_policy: WritePolicy,
+    ) -> Result<Self, String> {
         // Accept the common shorthand without a scheme, e.g.
         // `user:pass@localhost:3306/opendental`.
         let normalized = if url.contains("://") {
@@ -32,102 +94,181 @@ impl MySqlStore {
         let mut conn = pool.get_conn().map_err(|e| format!("MySQL connect failed: {e}"))?;
         conn.query_drop("SELECT 1")
             .map_err(|e| format!("MySQL ping failed: {e}"))?;
-        ensure_recall_schema(&mut conn)?;
-        ensure_eservices_schema(&mut conn)?;
-        ensure_treat_plan_schema(&mut conn)?;
-        ensure_pay_plan_schema(&mut conn)?;
-        ensure_definitions_schema(&mut conn)?;
-        ensure_clinical_schema(&mut conn)?;
-        ensure_registry_schema(&mut conn)?;
-        Ok(Self { pool })
+        if mode == SchemaMode::BootstrapPortLocal {
+            ensure_port_local_tables(&mut conn)?;
+        }
+        verify_schema(&mut conn)?;
+        Ok(Self {
+            pool,
+            current_user: AtomicU64::new(0),
+            write_policy,
+        })
     }
 
     fn conn(&self) -> Result<PooledConn, String> {
         self.pool.get_conn().map_err(|e| format!("MySQL connect failed: {e}"))
     }
-}
 
-/// The demo database may predate the recall slice. Add the two objects this
-/// module needs without touching any other OD table. Safe to run on every
-/// connection: both statements are idempotent.
-fn ensure_recall_schema(conn: &mut PooledConn) -> Result<(), String> {
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS recall (\
-         RecallNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         PatNum bigint NOT NULL DEFAULT 0,\
-         DateDueCalc date NOT NULL DEFAULT '0001-01-01',\
-         DateDue date NOT NULL DEFAULT '0001-01-01',\
-         DatePrevious date NOT NULL DEFAULT '0001-01-01',\
-         RecallInterval int NOT NULL DEFAULT 0,\
-         RecallStatus bigint NOT NULL DEFAULT 0,\
-         Note text NOT NULL,\
-         IsDisabled tinyint NOT NULL DEFAULT 0,\
-         DateTStamp timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\
-         RecallTypeNum bigint NOT NULL DEFAULT 0,\
-         DisableUntilBalance double NOT NULL DEFAULT 0,\
-         DisableUntilDate datetime NOT NULL DEFAULT '0001-01-01',\
-         DateScheduled datetime NOT NULL DEFAULT '0001-01-01',\
-         Priority tinyint NOT NULL DEFAULT 0,\
-         TimePatternOverride varchar(255) NOT NULL DEFAULT '',\
-         KEY (PatNum), KEY (DateDue))",
-    )
-    .map_err(|e| format!("could not create OD recall table: {e}"))?;
-
-    let has_priority: Option<i64> = conn
-        .query_first(
-            "SELECT COUNT(*) FROM information_schema.COLUMNS \
-             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'appointment' AND COLUMN_NAME = 'Priority'",
-        )
-        .map_err(|e| format!("could not inspect appointment table: {e}"))?;
-    if has_priority.unwrap_or(0) == 0 {
-        conn.query_drop("ALTER TABLE appointment ADD COLUMN Priority tinyint NOT NULL DEFAULT 0")
-            .map_err(|e| format!("could not add appointment.Priority: {e}"))?;
+    fn ensure_od_writes_allowed(&self) -> Result<(), String> {
+        if self.write_policy == WritePolicy::DenyOdWrites {
+            return Err("OD writes are disabled: this build cannot reproduce Open Dental's SecurityHash. Set ODCLINIC_ALLOW_OD_WRITES=1 only when you accept rows OD may flag as tampered.".into());
+        }
+        Ok(())
     }
-    Ok(())
 }
 
-/// eServices objects. The first two use real OD table/column names, so an
-/// existing Open Dental database needs no schema change from this slice. The
-/// contact and outbox tables are port-local: OD sends through HQ and has no
-/// equivalent local queue.
-fn ensure_eservices_schema(conn: &mut PooledConn) -> Result<(), String> {
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS apptreminderrule (\
-         ApptReminderRuleNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         TypeCur tinyint NOT NULL DEFAULT 0,\
-         TSPrior bigint NOT NULL DEFAULT 0,\
-         SendOrder varchar(255) NOT NULL DEFAULT '0,1,2',\
-         IsSendAll tinyint NOT NULL DEFAULT 0,\
-         TemplateSMS text NOT NULL,\
-         TemplateEmailSubject text NOT NULL,\
-         TemplateEmail text NOT NULL,\
-         ClinicNum bigint NOT NULL DEFAULT 0,\
-         DoNotSendWithin bigint NOT NULL DEFAULT 0,\
-         IsEnabled tinyint NOT NULL DEFAULT 1,\
-         Language varchar(255) NOT NULL DEFAULT '',\
-         DateTStamp timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP)",
-    )
-    .map_err(|e| format!("could not create OD apptreminderrule table: {e}"))?;
+/// OD 24_3 objects that this port reads or writes unconditionally.
+/// A genuine Open Dental schema has all of them; a partial demo schema does not.
+const OD_TABLES: &[&str] = &[
+    "account", "adjustment", "appointment", "apptreminderrule", "apptremindersent", "carrier",
+    "claim", "claimproc", "claimsnapshot", "clinic", "county", "definition", "disease",
+    "diseasedef", "displayfield", "discountplan", "discountplansub", "fee", "feesched",
+    "grouppermission", "histappointment", "operatory", "patient", "patientnote", "patientrace",
+    "payment", "payplan", "payplancharge", "payplanlink", "paysplit", "preference",
+    "procedurecode", "procedurelog", "procnote", "proctp", "provider", "recall", "referral",
+    "refattach", "rxpat", "schedule", "scheduleop", "screen", "screengroup", "securitylog",
+    "site", "statement", "treatplan", "treatplanattach", "userod", "usergroupattach",
+];
 
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS apptremindersent (\
-         ApptReminderSentNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         PatNum bigint NOT NULL DEFAULT 0,\
-         ClinicNum bigint NOT NULL DEFAULT 0,\
-         SendStatus tinyint NOT NULL DEFAULT 0,\
-         MessageType tinyint NOT NULL DEFAULT 0,\
-         MessageFk bigint NOT NULL DEFAULT 0,\
-         DateTimeEntry datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,\
-         DateTimeSent datetime NOT NULL DEFAULT '0001-01-01',\
-         ResponseDescript text NOT NULL,\
-         ApptReminderRuleNum bigint NOT NULL DEFAULT 0,\
-         ApptNum bigint NOT NULL DEFAULT 0,\
-         ApptDateTime datetime NOT NULL DEFAULT '0001-01-01',\
-         TSPrior bigint NOT NULL DEFAULT 0,\
-         KEY (ApptReminderRuleNum,ApptNum), KEY (PatNum))",
-    )
-    .map_err(|e| format!("could not create OD apptremindersent table: {e}"))?;
+/// Columns whose absence would make a current query fail outright. Optional
+/// OD-semantic columns added by later writes are handled at write time instead.
+const OD_COLUMNS: &[(&str, &str)] = &[
+    ("patient", "BillingType"),
+    ("patient", "ChartNumber"),
+    ("patient", "SSN"),
+    ("patient", "MedicaidID"),
+    ("patient", "PatStatus"),
+    ("patient", "Guarantor"),
+    ("patient", "County"),
+    ("patient", "SiteNum"),
+    ("patient", "GradeLevel"),
+    ("patient", "Urgency"),
+    ("patient", "PlannedIsDone"),
+    ("patient", "WkPhone"),
+    ("patient", "Address2"),
+    ("appointment", "Priority"),
+    ("appointment", "UnschedStatus"),
+    ("histappointment", "HistUserNum"),
+    ("histappointment", "HistDateTStamp"),
+    ("histappointment", "HistApptAction"),
+    ("histappointment", "UnschedStatus"),
+    ("histappointment", "Priority"),
+    ("disease", "PatNote"),
+    ("disease", "ProbStatus"),
+    ("definition", "ItemColor"),
+    ("payplan", "PlanNum"),
+    ("payplan", "DateInterestStart"),
+    ("payplan", "DynamicPayPlanTPOption"),
+    ("payplancharge", "FKey"),
+    ("payplancharge", "LinkType"),
+    ("paysplit", "PayPlanChargeNum"),
+    ("paysplit", "PayPlanDebitType"),
+    ("paysplit", "ProcDate"),
+    ("recall", "RecallTypeNum"),
+    ("recall", "DisableUntilBalance"),
+    ("recall", "DisableUntilDate"),
+    ("recall", "Priority"),
+    ("recall", "TimePatternOverride"),
+    ("apptreminderrule", "SendOrder"),
+    ("treatplan", "DateTP"),
+    ("treatplan", "Heading"),
+    ("treatplan", "Note"),
+    ("treatplan", "Signature"),
+    ("treatplan", "SigIsTopaz"),
+    ("treatplan", "ResponsParty"),
+    ("treatplan", "DocNum"),
+    ("treatplan", "TPStatus"),
+    ("treatplan", "SecUserNumEntry"),
+    ("treatplan", "SecDateEntry"),
+    ("treatplan", "UserNumPresenter"),
+    ("treatplan", "TPType"),
+    ("treatplan", "SignaturePractice"),
+    ("treatplan", "DateTSigned"),
+    ("treatplan", "DateTPracticeSigned"),
+    ("treatplan", "SignatureText"),
+    ("treatplan", "SignaturePracticeText"),
+    ("treatplan", "MobileAppDeviceNum"),
+    ("proctp", "ProcNumOrig"),
+    ("proctp", "ItemOrder"),
+    ("proctp", "Priority"),
+    ("proctp", "ToothNumTP"),
+    ("proctp", "Surf"),
+    ("proctp", "ProcCode"),
+    ("proctp", "Descript"),
+    ("proctp", "PriInsAmt"),
+    ("proctp", "SecInsAmt"),
+    ("proctp", "PatAmt"),
+    ("proctp", "Discount"),
+    ("proctp", "Prognosis"),
+    ("proctp", "Dx"),
+    ("proctp", "ProcAbbr"),
+    ("proctp", "SecUserNumEntry"),
+    ("proctp", "SecDateEntry"),
+    ("proctp", "FeeAllowed"),
+    ("proctp", "TaxAmt"),
+    ("proctp", "ProvNum"),
+    ("proctp", "DateTP"),
+    ("proctp", "ClinicNum"),
+    ("proctp", "CatPercUCR"),
+    ("treatplanattach", "TreatPlanNum"),
+    ("treatplanattach", "ProcNum"),
+    ("treatplanattach", "Priority"),
+];
 
+/// True when an OD column exists. Used by write paths that can safely omit
+/// optional OD-semantic columns on the older demo schema.
+pub(crate) fn column_exists(
+    conn: &mut PooledConn,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let found: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+            (table, column),
+        )
+        .map_err(|e| format!("could not inspect {table}.{column}: {e}"))?;
+    Ok(found.unwrap_or(0) > 0)
+}
+
+fn verify_schema(conn: &mut PooledConn) -> Result<(), String> {
+    let mut missing_tables = Vec::new();
+    for table in OD_TABLES {
+        let found: Option<i64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM information_schema.TABLES \
+                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+                (table,),
+            )
+            .map_err(|e| format!("could not inspect table {table}: {e}"))?;
+        if found.unwrap_or(0) == 0 {
+            missing_tables.push((*table).to_string());
+        }
+    }
+    let mut missing_columns = Vec::new();
+    for (table, column) in OD_COLUMNS {
+        if !column_exists(conn, table, column)? {
+            missing_columns.push(format!("{table}.{column}"));
+        }
+    }
+    if missing_tables.is_empty() && missing_columns.is_empty() {
+        return Ok(());
+    }
+    let mut message = String::from("OD 24_3 schema is incompatible; odclinic will not start against a guessed schema.");
+    if !missing_tables.is_empty() {
+        message.push_str(&format!(" Missing tables: {}.", missing_tables.join(", ")));
+    }
+    if !missing_columns.is_empty() {
+        message.push_str(&format!(" Missing columns: {}.", missing_columns.join(", ")));
+    }
+    message.push_str(" OD-owned tables must come from the Open Dental schema; odclinic never creates or alters them.");
+    Err(message)
+}
+
+/// Create only port-local side tables, and only after explicit opt-in. OD-owned
+/// tables are never created or altered here.
+fn ensure_port_local_tables(conn: &mut PooledConn) -> Result<(), String> {
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS odclinic_patient_contact (\
          PatNum bigint NOT NULL PRIMARY KEY,\
@@ -137,7 +278,6 @@ fn ensure_eservices_schema(conn: &mut PooledConn) -> Result<(), String> {
          OptOutTelegram tinyint NOT NULL DEFAULT 0)",
     )
     .map_err(|e| format!("could not create patient contact table: {e}"))?;
-
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS odclinic_message_outbox (\
          MessageNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
@@ -157,261 +297,16 @@ fn ensure_eservices_schema(conn: &mut PooledConn) -> Result<(), String> {
          KEY (Status), KEY (PatNum), KEY (AptNum))",
     )
     .map_err(|e| format!("could not create local message outbox: {e}"))?;
-    Ok(())
-}
-
-/// Treatment-plan storage. OD keeps Saved plans as immutable `proctp` copies
-/// and Active/Inactive plans as `treatplanattach` links to `procedurelog`.
-/// Everything here is an OD table name; the extra columns are the NOT NULL
-/// bookkeeping fields the 24.3 CRUD layer writes on every insert.
-fn ensure_treat_plan_schema(conn: &mut PooledConn) -> Result<(), String> {
     conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS treatplan (\
-         TreatPlanNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
+        "CREATE TABLE IF NOT EXISTS odclinic_reminder_sent (\
+         SentNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
+         ApptReminderRuleNum bigint NOT NULL DEFAULT 0,\
+         ApptNum bigint NOT NULL DEFAULT 0,\
          PatNum bigint NOT NULL DEFAULT 0,\
-         DateTP date NOT NULL DEFAULT '0001-01-01',\
-         Heading varchar(255) NOT NULL DEFAULT '',\
-         Note text NOT NULL,\
-         Signature text NOT NULL,\
-         SigIsTopaz tinyint NOT NULL DEFAULT 0,\
-         ResponsParty bigint NOT NULL DEFAULT 0,\
-         DocNum bigint NOT NULL DEFAULT 0,\
-         TPStatus tinyint NOT NULL DEFAULT 0,\
-         SecUserNumEntry bigint NOT NULL DEFAULT 0,\
-         SecDateEntry date NOT NULL DEFAULT '0001-01-01',\
-         SecDateTEdit timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\
-         UserNumPresenter bigint NOT NULL DEFAULT 0,\
-         TPType tinyint NOT NULL DEFAULT 0,\
-         SignaturePractice text NOT NULL,\
-         DateTSigned datetime NOT NULL DEFAULT '0001-01-01 00:00:00',\
-         DateTPracticeSigned datetime NOT NULL DEFAULT '0001-01-01 00:00:00',\
-         SignatureText varchar(255) NOT NULL DEFAULT '',\
-         SignaturePracticeText varchar(255) NOT NULL DEFAULT '',\
-         MobileAppDeviceNum bigint NOT NULL DEFAULT 0,\
-         KEY (PatNum))",
+         SentAt datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,\
+         UNIQUE KEY (ApptReminderRuleNum, ApptNum), KEY (PatNum))",
     )
-    .map_err(|e| format!("could not create OD treatplan table: {e}"))?;
-
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS proctp (\
-         ProcTPNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         TreatPlanNum bigint NOT NULL DEFAULT 0,\
-         PatNum bigint NOT NULL DEFAULT 0,\
-         ProcNumOrig bigint NOT NULL DEFAULT 0,\
-         ItemOrder int NOT NULL DEFAULT 0,\
-         Priority bigint NOT NULL DEFAULT 0,\
-         ToothNumTP varchar(255) NOT NULL DEFAULT '',\
-         Surf varchar(255) NOT NULL DEFAULT '',\
-         ProcCode varchar(15) DEFAULT NULL,\
-         Descript varchar(255) NOT NULL DEFAULT '',\
-         FeeAmt double NOT NULL DEFAULT 0,\
-         PriInsAmt double NOT NULL DEFAULT 0,\
-         SecInsAmt double NOT NULL DEFAULT 0,\
-         PatAmt double NOT NULL DEFAULT 0,\
-         Discount double NOT NULL DEFAULT 0,\
-         Prognosis text NOT NULL,\
-         Dx text NOT NULL,\
-         ProcAbbr varchar(255) NOT NULL DEFAULT '',\
-         SecUserNumEntry bigint NOT NULL DEFAULT 0,\
-         SecDateEntry date NOT NULL DEFAULT '0001-01-01',\
-         SecDateTEdit timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,\
-         FeeAllowed double NOT NULL DEFAULT 0,\
-         TaxAmt double NOT NULL DEFAULT 0,\
-         ProvNum bigint NOT NULL DEFAULT 0,\
-         DateTP date NOT NULL DEFAULT '0001-01-01',\
-         ClinicNum bigint NOT NULL DEFAULT 0,\
-         CatPercUCR double NOT NULL DEFAULT 0,\
-         KEY (TreatPlanNum))",
-    )
-    .map_err(|e| format!("could not create OD proctp table: {e}"))?;
-
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS treatplanattach (\
-         TreatPlanAttachNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         TreatPlanNum bigint NOT NULL DEFAULT 0,\
-         ProcNum bigint NOT NULL DEFAULT 0,\
-         Priority bigint NOT NULL DEFAULT 0,\
-         KEY (TreatPlanNum), KEY (ProcNum))",
-    )
-    .map_err(|e| format!("could not create OD treatplanattach table: {e}"))?;
-
-    // The old port-local schema.sql created smaller versions of these tables.
-    // Add any missing OD columns so an existing demo database still works.
-    ensure_columns(
-        conn,
-        "treatplan",
-        &[
-            ("DateTP", "date NOT NULL DEFAULT '0001-01-01'"),
-            ("Heading", "varchar(255) NOT NULL DEFAULT ''"),
-            ("Note", "text NOT NULL"),
-            ("Signature", "text NOT NULL"),
-            ("SigIsTopaz", "tinyint NOT NULL DEFAULT 0"),
-            ("ResponsParty", "bigint NOT NULL DEFAULT 0"),
-            ("DocNum", "bigint NOT NULL DEFAULT 0"),
-            ("TPStatus", "tinyint NOT NULL DEFAULT 0"),
-            ("SecUserNumEntry", "bigint NOT NULL DEFAULT 0"),
-            ("SecDateEntry", "date NOT NULL DEFAULT '0001-01-01'"),
-            ("UserNumPresenter", "bigint NOT NULL DEFAULT 0"),
-            ("TPType", "tinyint NOT NULL DEFAULT 0"),
-            ("SignaturePractice", "text NOT NULL"),
-            ("DateTSigned", "datetime NOT NULL DEFAULT '0001-01-01 00:00:00'"),
-            ("DateTPracticeSigned", "datetime NOT NULL DEFAULT '0001-01-01 00:00:00'"),
-            ("SignatureText", "varchar(255) NOT NULL DEFAULT ''"),
-            ("SignaturePracticeText", "varchar(255) NOT NULL DEFAULT ''"),
-            ("MobileAppDeviceNum", "bigint NOT NULL DEFAULT 0"),
-        ],
-    )?;
-    ensure_columns(
-        conn,
-        "proctp",
-        &[
-            ("ProcNumOrig", "bigint NOT NULL DEFAULT 0"),
-            ("ItemOrder", "int NOT NULL DEFAULT 0"),
-            ("Priority", "bigint NOT NULL DEFAULT 0"),
-            ("ToothNumTP", "varchar(255) NOT NULL DEFAULT ''"),
-            ("Surf", "varchar(255) NOT NULL DEFAULT ''"),
-            ("ProcCode", "varchar(15) DEFAULT NULL"),
-            ("Descript", "varchar(255) NOT NULL DEFAULT ''"),
-            ("PriInsAmt", "double NOT NULL DEFAULT 0"),
-            ("SecInsAmt", "double NOT NULL DEFAULT 0"),
-            ("PatAmt", "double NOT NULL DEFAULT 0"),
-            ("Discount", "double NOT NULL DEFAULT 0"),
-            ("Prognosis", "text NOT NULL"),
-            ("Dx", "text NOT NULL"),
-            ("ProcAbbr", "varchar(255) NOT NULL DEFAULT ''"),
-            ("SecUserNumEntry", "bigint NOT NULL DEFAULT 0"),
-            ("SecDateEntry", "date NOT NULL DEFAULT '0001-01-01'"),
-            ("FeeAllowed", "double NOT NULL DEFAULT 0"),
-            ("TaxAmt", "double NOT NULL DEFAULT 0"),
-            ("ProvNum", "bigint NOT NULL DEFAULT 0"),
-            ("DateTP", "date NOT NULL DEFAULT '0001-01-01'"),
-            ("ClinicNum", "bigint NOT NULL DEFAULT 0"),
-            ("CatPercUCR", "double NOT NULL DEFAULT 0"),
-        ],
-    )?;
-    ensure_columns(
-        conn,
-        "treatplanattach",
-        &[
-            ("TreatPlanNum", "bigint NOT NULL DEFAULT 0"),
-            ("ProcNum", "bigint NOT NULL DEFAULT 0"),
-            ("Priority", "bigint NOT NULL DEFAULT 0"),
-        ],
-    )?;
-    Ok(())
-}
-
-/// The payment-plan report filters patient plans from insurance plans using
-/// OD's `payplan.PlanNum`; amortised charge generation reads
-/// `DateInterestStart` and dynamic plans read `DynamicPayPlanTPOption`. Older
-/// demo databases may not have those columns yet. `payplancharge.FKey` and
-/// `.LinkType` carry the dynamic link onto each issued charge.
-fn ensure_pay_plan_schema(conn: &mut PooledConn) -> Result<(), String> {
-    ensure_columns(
-        conn,
-        "payplan",
-        &[
-            ("PlanNum", "bigint NOT NULL DEFAULT 0"),
-            ("DateInterestStart", "date DEFAULT NULL"),
-            ("DynamicPayPlanTPOption", "tinyint NOT NULL DEFAULT 0"),
-        ],
-    )?;
-    ensure_columns(
-        conn,
-        "payplancharge",
-        &[
-            ("FKey", "bigint NOT NULL DEFAULT 0"),
-            ("LinkType", "tinyint NOT NULL DEFAULT 0"),
-        ],
-    )?;
-    ensure_columns(
-        conn,
-        "paysplit",
-        &[
-            ("PayPlanChargeNum", "bigint NOT NULL DEFAULT 0"),
-            ("PayPlanDebitType", "int NOT NULL DEFAULT 0"),
-            // record_payment_splits writes OD's paysplit.ProcDate alongside
-            // DatePay. Fresh schemas include it, but older demo databases do
-            // not, which would make every payment write fail.
-            ("ProcDate", "date NOT NULL DEFAULT '2000-01-01'"),
-        ],
-    )
-}
-
-/// Definitions and display fields use OD's own table names and columns. The
-/// demo database may predate `ItemColor` or have no `displayfield` table at all,
-/// so both are brought up to the 24.3 shape without touching existing rows.
-fn ensure_definitions_schema(conn: &mut PooledConn) -> Result<(), String> {
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS definition (\
-         DefNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         Category int NOT NULL DEFAULT 0,\
-         ItemOrder int NOT NULL DEFAULT 0,\
-         ItemName varchar(255) NOT NULL DEFAULT '',\
-         ItemValue varchar(255) NOT NULL DEFAULT '',\
-         ItemColor int NOT NULL DEFAULT 0,\
-         IsHidden tinyint NOT NULL DEFAULT 0,\
-         KEY (Category), KEY (Category,ItemOrder))",
-    )
-    .map_err(|e| format!("could not create OD definition table: {e}"))?;
-    ensure_columns(conn, "definition", &[("ItemColor", "int NOT NULL DEFAULT 0")])?;
-
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS displayfield (\
-         DisplayFieldNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         InternalName varchar(255) NOT NULL DEFAULT '',\
-         ItemOrder int NOT NULL DEFAULT 0,\
-         Description varchar(255) NOT NULL DEFAULT '',\
-         ColumnWidth int NOT NULL DEFAULT 0,\
-         Category int NOT NULL DEFAULT 0,\
-         ChartViewNum bigint NOT NULL DEFAULT 0,\
-         PickList text NOT NULL,\
-         DescriptionOverride varchar(255) NOT NULL DEFAULT '',\
-         KEY (Category), KEY (ChartViewNum))",
-    )
-    .map_err(|e| format!("could not create OD displayfield table: {e}"))?;
-    Ok(())
-}
-
-/// Waitlist and correction history. `appointment.UnschedStatus` and
-/// `histappointment` are real OD columns/tables; the patient correction table
-/// is port-local because Open Dental has no patient history table.
-fn ensure_clinical_schema(conn: &mut PooledConn) -> Result<(), String> {
-    ensure_columns(conn, "appointment", &[("UnschedStatus", "bigint NOT NULL DEFAULT 0")])?;
-
-    conn.query_drop(
-        "CREATE TABLE IF NOT EXISTS histappointment (\
-         HistApptNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
-         HistUserNum bigint NOT NULL DEFAULT 0,\
-         HistDateTStamp datetime NOT NULL,\
-         HistApptAction int NOT NULL DEFAULT 0,\
-         AptNum bigint NOT NULL DEFAULT 0,\
-         PatNum bigint NOT NULL DEFAULT 0,\
-         AptStatus tinyint NOT NULL DEFAULT 0,\
-         Pattern varchar(255) NOT NULL DEFAULT '',\
-         TimeLocked tinyint NOT NULL DEFAULT 0,\
-         Op bigint NOT NULL DEFAULT 0,\
-         Note varchar(255) NOT NULL DEFAULT '',\
-         ProvNum bigint NOT NULL DEFAULT 0,\
-         ClinicNum bigint NOT NULL DEFAULT 0,\
-         AptDateTime datetime NOT NULL DEFAULT '0001-01-01',\
-         UnschedStatus bigint NOT NULL DEFAULT 0,\
-         Priority tinyint NOT NULL DEFAULT 0,\
-         KEY (AptNum), KEY (HistDateTStamp))",
-    )
-    .map_err(|e| format!("could not create OD histappointment table: {e}"))?;
-    ensure_columns(
-        conn,
-        "histappointment",
-        &[
-            ("HistUserNum", "bigint NOT NULL DEFAULT 0"),
-            ("HistDateTStamp", "datetime NOT NULL DEFAULT '0001-01-01'"),
-            ("HistApptAction", "int NOT NULL DEFAULT 0"),
-            ("UnschedStatus", "bigint NOT NULL DEFAULT 0"),
-            ("Priority", "tinyint NOT NULL DEFAULT 0"),
-        ],
-    )?;
-
+    .map_err(|e| format!("could not create reminder dedupe table: {e}"))?;
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS odclinic_patient_correction (\
          CorrectionNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
@@ -423,13 +318,6 @@ fn ensure_clinical_schema(conn: &mut PooledConn) -> Result<(), String> {
          KEY (PatNum))",
     )
     .map_err(|e| format!("could not create patient correction table: {e}"))?;
-    Ok(())
-}
-
-/// The patient registry reads OD's real `disease`, `diseasedef`, `patientnote`
-/// and `procedurelog` tables. Only the clinic-card table belongs to this port;
-/// creating it idempotently is safe because OD has no equivalent table.
-fn ensure_registry_schema(conn: &mut PooledConn) -> Result<(), String> {
     conn.query_drop(
         "CREATE TABLE IF NOT EXISTS odclinic_clinic_card (\
          CardNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
@@ -444,49 +332,194 @@ fn ensure_registry_schema(conn: &mut PooledConn) -> Result<(), String> {
          KEY (PatNum))",
     )
     .map_err(|e| format!("could not create clinic card table: {e}"))?;
-    // Older demo databases may predate these OD clinical columns. They are
-    // additive, so upgrading the demo database in place is safe.
-    ensure_columns(
-        conn,
-        "disease",
-        &[
-            ("PatNote", "text"),
-            ("ProbStatus", "tinyint NOT NULL DEFAULT 0"),
-        ],
-    )
+    Ok(())
 }
 
-/// Add an OD column that an older demo database may not have yet. Table and
-/// column names are internal constants, so interpolating the definition is safe.
-fn ensure_columns(
-    conn: &mut PooledConn,
-    table: &str,
-    columns: &[(&str, &str)],
-) -> Result<(), String> {
-    for (name, definition) in columns {
-        let found: Option<i64> = conn
+/// OD requires `patient.BillingType` to reference a visible billing-type
+/// definition (DefCat 4). Keep an existing valid value, then fall back to the
+/// first visible definition rather than inventing a new definition row.
+fn first_visible_definition(conn: &mut PooledConn, category: i32) -> Result<Id, String> {
+    let def_num: Option<i64> = conn
+        .exec_first(
+            "SELECT MIN(DefNum) FROM definition WHERE Category = ? AND IsHidden = 0",
+            (category,),
+        )
+        .map_err(|e| format!("could not read definition category {category}: {e}"))?;
+    Ok(def_num.filter(|n| *n > 0).unwrap_or(0) as Id)
+}
+
+fn effective_billing_type(conn: &mut PooledConn, patient: &Patient) -> Result<Id, String> {
+    if patient.billing_type != 0 {
+        return Ok(patient.billing_type);
+    }
+    if patient.pat_num != 0 {
+        let existing: Option<i64> = conn
             .exec_first(
-                "SELECT COUNT(*) FROM information_schema.COLUMNS \
-                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
-                (table, *name),
+                "SELECT BillingType FROM patient WHERE PatNum = ?",
+                (patient.pat_num,),
             )
-            .map_err(|e| format!("could not inspect {table}.{name}: {e}"))?;
-        if found.unwrap_or(0) == 0 {
-            let sql = format!("ALTER TABLE {table} ADD COLUMN {name} {definition}");
-            if let Err(err) = conn.query_drop(&sql) {
-                // Two connections can both observe COUNT=0 and race to ADD
-                // COLUMN (parallel app startup or concurrent tests). MySQL and
-                // MariaDB report a duplicate column as error 1060 / SQLSTATE
-                // 42S21; that means the column now exists, which is what we
-                // wanted. Any other error is still fatal.
-                let duplicate = matches!(&err, mysql::Error::MySqlError(e) if e.code == 1060);
-                if !duplicate {
-                    return Err(format!("could not add {table}.{name}: {err}"));
-                }
+            .map_err(|e| format!("could not read existing BillingType: {e}"))?;
+        if let Some(value) = existing {
+            if value > 0 {
+                return Ok(value as Id);
             }
         }
     }
+    first_visible_definition(conn, 4)
+}
+
+/// Use the patient's OD clinic for writes instead of hardcoding clinic 0. A
+/// missing patient resolves to 0, which is OD's Unassigned clinic.
+fn patient_clinic_num(conn: &mut PooledConn, pat_num: Id) -> Result<Id, String> {
+    if pat_num == 0 {
+        return Ok(0);
+    }
+    let clinic_num: Option<i64> = conn
+        .exec_first(
+            "SELECT ClinicNum FROM patient WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .map_err(|e| format!("could not read patient clinic: {e}"))?;
+    Ok(clinic_num.unwrap_or(0) as Id)
+}
+
+fn procedure_clinic_num(conn: &mut PooledConn, proc_num: Id) -> Result<Id, String> {
+    if proc_num == 0 {
+        return Ok(0);
+    }
+    let clinic_num: Option<i64> = conn
+        .exec_first(
+            "SELECT ClinicNum FROM procedurelog WHERE ProcNum = ?",
+            (proc_num,),
+        )
+        .map_err(|e| format!("could not read procedure clinic: {e}"))?;
+    Ok(clinic_num.unwrap_or(0) as Id)
+}
+
+/// OD `POut.Date` writes its zero date for an absent date. Keeping this helper
+/// separate from `od_date_param` makes the write intent explicit.
+fn od_write_date(value: Option<NaiveDate>) -> String {
+    od_date_param(value)
+}
+
+fn od_write_datetime(value: Option<NaiveDateTime>) -> String {
+    value
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "0001-01-01 00:00:00".to_string())
+}
+
+/// OD's insert paths set `SecUserNumEntry` from the acting user. Before login,
+/// use the first visible OD user rather than leaving a zero audit trail.
+fn audit_user_num(conn: &mut PooledConn, current: Id) -> Result<Id, String> {
+    if current != 0 {
+        return Ok(current);
+    }
+    let first: Option<i64> = conn
+        .exec_first("SELECT MIN(UserNum) FROM userod WHERE IsHidden = 0", ())
+        .map_err(|e| format!("could not read OD audit user: {e}"))?;
+    Ok(first.filter(|n| *n > 0).unwrap_or(0) as Id)
+}
+
+/// Append an OD column only when the connected schema actually has it. This
+/// keeps strict plug-and-play schemas working while still writing full OD audit
+/// data on a genuine 24_3 schema.
+fn append_optional_column(
+    conn: &mut PooledConn,
+    table: &str,
+    column: &str,
+    columns: &mut String,
+    placeholders: &mut String,
+    values: &mut Vec<Value>,
+    value: Value,
+) -> Result<(), String> {
+    if column_exists(conn, table, column)? {
+        columns.push(',');
+        columns.push_str(column);
+        placeholders.push_str(",?");
+        values.push(value);
+    }
     Ok(())
+}
+
+/// Resolve the clinic for an OD write. An explicit clinic always wins; a zero
+/// falls back to the patient's clinic, which is OD's own convention for rows
+/// created from a patient context.
+fn write_clinic_num(conn: &mut PooledConn, requested: Id, pat_num: Id) -> Result<Id, String> {
+    if requested != 0 {
+        return Ok(requested);
+    }
+    patient_clinic_num(conn, pat_num)
+}
+
+/// OD 24_3 journal entries carry reconciliation and audit columns that the
+/// reduced demo schema omits. Resolve them once before opening a transaction
+/// (a `Transaction` cannot run information_schema checks) and build the INSERT
+/// accordingly, so both schemas are written correctly.
+struct JournalInsert {
+    sql: String,
+    has_reconcile: bool,
+    has_sec_user_entry: bool,
+    has_sec_date_entry: bool,
+    has_sec_user_edit: bool,
+}
+
+impl JournalInsert {
+    fn new(conn: &mut PooledConn) -> Result<Self, String> {
+        let mut columns =
+            "AccountNum,DateDisplayed,DebitAmt,CreditAmt,Memo,Splits,CheckNumber,TransactionNum"
+                .to_string();
+        let mut placeholders = "?,?,?,?,?,?,?,?".to_string();
+        let mut has_reconcile = false;
+        let mut has_sec_user_entry = false;
+        let mut has_sec_date_entry = false;
+        let mut has_sec_user_edit = false;
+        for (name, flag) in [
+            ("ReconcileNum", &mut has_reconcile),
+            ("SecUserNumEntry", &mut has_sec_user_entry),
+            ("SecDateTEntry", &mut has_sec_date_entry),
+            ("SecUserNumEdit", &mut has_sec_user_edit),
+        ] {
+            if column_exists(conn, "journalentry", name)? {
+                columns.push(',');
+                columns.push_str(name);
+                placeholders.push_str(",?");
+                *flag = true;
+            }
+        }
+        Ok(Self {
+            sql: format!("INSERT INTO journalentry ({columns}) VALUES ({placeholders})"),
+            has_reconcile,
+            has_sec_user_entry,
+            has_sec_date_entry,
+            has_sec_user_edit,
+        })
+    }
+
+    fn params(&self, entry: &JournalEntry, audit_user: Id, now: &str) -> Vec<Value> {
+        let mut params: Vec<Value> = vec![
+            Value::from(entry.account_num),
+            Value::from(od_write_date(Some(entry.date_displayed))),
+            Value::from(entry.debit_amt),
+            Value::from(entry.credit_amt),
+            Value::from(entry.memo.clone()),
+            Value::from(entry.splits.clone()),
+            Value::from(entry.check_number.clone()),
+            Value::from(entry.transaction_num),
+        ];
+        if self.has_reconcile {
+            params.push(Value::from(0u64));
+        }
+        if self.has_sec_user_entry {
+            params.push(Value::from(audit_user));
+        }
+        if self.has_sec_date_entry {
+            params.push(Value::from(now.to_string()));
+        }
+        if self.has_sec_user_edit {
+            params.push(Value::from(audit_user));
+        }
+        params
+    }
 }
 
 fn treat_plan_status(
@@ -804,6 +837,27 @@ fn comm_from_send_order(order: &str) -> CommType {
         .unwrap_or_default()
 }
 
+/// Build OD's ordered `SendOrder` list for a write. The port's `comm_type` is
+/// the primary channel (what the GUI edits), so it replaces the first element;
+/// the remaining channels stay in OD's original fallback order. A rule read
+/// from OD therefore keeps its full comma-delimited chain on save, while a
+/// channel edit actually takes effect.
+fn send_order_for_write(rule: &ReminderRule) -> String {
+    let primary = rule.comm_type.as_od().to_string();
+    let rest: Vec<&str> = rule
+        .send_order
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .skip(1)
+        .collect();
+    if rest.is_empty() {
+        primary
+    } else {
+        format!("{},{}", primary, rest.join(","))
+    }
+}
+
 fn map_reminder_rule(row: mysql::Row) -> ReminderRule {
     ReminderRule {
         rule_num: cell_u32(&row, 0),
@@ -1091,6 +1145,14 @@ fn display_signature(rows: &[DisplayField]) -> Vec<(String, String, i32, String,
 }
 
 impl Store for MySqlStore {
+    fn set_current_user(&self, user_num: Id) {
+        self.current_user.store(user_num as u64, Ordering::Relaxed);
+    }
+
+    fn current_user(&self) -> Id {
+        self.current_user.load(Ordering::Relaxed) as Id
+    }
+
     fn list_patients(&self) -> Result<Vec<Patient>, String> {
         let mut conn = self.conn()?;
         let sql = format!("SELECT {PATIENT_COLUMNS} FROM patient ORDER BY LName,FName");
@@ -1129,10 +1191,19 @@ impl Store for MySqlStore {
     }
 
     fn upsert_patient(&self, patient: &Patient) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
-        let sql = "INSERT INTO patient (PatNum,LName,FName,MiddleI,Title,Birthdate,Gender,HmPhone,WirelessPhone,Email,Address,City,State,Zip,ClinicNum,PriProv) \
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
-                   ON DUPLICATE KEY UPDATE LName=VALUES(LName),FName=VALUES(FName),MiddleI=VALUES(MiddleI),Title=VALUES(Title),Birthdate=VALUES(Birthdate),Gender=VALUES(Gender),HmPhone=VALUES(HmPhone),WirelessPhone=VALUES(WirelessPhone),Email=VALUES(Email),Address=VALUES(Address),City=VALUES(City),State=VALUES(State),Zip=VALUES(Zip),ClinicNum=VALUES(ClinicNum),PriProv=VALUES(PriProv)";
+        // Every field read by PATIENT_COLUMNS is persisted. OD's DateTStamp is
+        // left to MySQL/OD so this write never fights the upstream timestamp.
+        // Audit/hash columns are appended only when the connected schema has
+        // them; OD's SecurityHash is left blank because this port cannot
+        // reproduce CDT.dll. The write policy gate is what makes that safe.
+        let mut columns = "PatNum,LName,FName,MiddleI,Title,Birthdate,Gender,HmPhone,WirelessPhone,Email,\
+                           Address,Address2,City,State,Zip,WkPhone,BillingType,ChartNumber,SSN,MedicaidID,\
+                           PatStatus,County,SiteNum,GradeLevel,Urgency,PlannedIsDone,Guarantor,ClinicNum,PriProv"
+            .to_string();
+        let mut placeholders =
+            "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?".to_string();
         let num = if patient.pat_num == 0 {
             // Let MySQL assign the auto-increment key.
             0
@@ -1141,11 +1212,10 @@ impl Store for MySqlStore {
         };
         // OD's patient.Birthdate is NOT NULL; use its conventional zero date
         // when the caller did not provide one.
-        let birth = patient
-            .birth_date
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "0001-01-01".to_string());
-        let params: Vec<Value> = vec![
+        let birth = od_write_date(patient.birth_date);
+        let billing_type = effective_billing_type(&mut conn, patient)?;
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let mut params: Vec<Value> = vec![
             Value::from(num),
             Value::from(patient.l_name.clone()),
             Value::from(patient.f_name.clone()),
@@ -1157,25 +1227,94 @@ impl Store for MySqlStore {
             Value::from(patient.wireless_phone.clone()),
             Value::from(patient.email.clone()),
             Value::from(patient.address.clone()),
+            Value::from(patient.address2.clone()),
             Value::from(patient.city.clone()),
             Value::from(patient.state.clone()),
             Value::from(patient.zip.clone()),
+            Value::from(patient.wk_phone.clone()),
+            Value::from(billing_type),
+            Value::from(patient.chart_number.clone()),
+            Value::from(patient.ssn.clone()),
+            Value::from(patient.medicaid_id.clone()),
+            Value::from(patient.pat_status as u32),
+            Value::from(patient.county.clone()),
+            Value::from(patient.site_num),
+            Value::from(patient.grade_level as i32),
+            Value::from(patient.urgency as i32),
+            Value::from(patient.planned_is_done as u8),
+            Value::from(patient.guarantor),
             Value::from(patient.clinic_num),
             Value::from(patient.primary_provider_num),
         ];
+        append_optional_column(
+            &mut conn,
+            "patient",
+            "SecUserNumEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(audit_user),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "patient",
+            "SecDateEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(Local::now().date_naive().format("%Y-%m-%d").to_string()),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "patient",
+            "SecurityHash",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(""),
+        )?;
+        let sql = format!(
+            "INSERT INTO patient ({columns}) VALUES ({placeholders}) \
+             ON DUPLICATE KEY UPDATE \
+             LName=VALUES(LName),FName=VALUES(FName),MiddleI=VALUES(MiddleI),Title=VALUES(Title),\
+             Birthdate=VALUES(Birthdate),Gender=VALUES(Gender),HmPhone=VALUES(HmPhone),\
+             WirelessPhone=VALUES(WirelessPhone),Email=VALUES(Email),Address=VALUES(Address),\
+             Address2=VALUES(Address2),City=VALUES(City),State=VALUES(State),Zip=VALUES(Zip),\
+             WkPhone=VALUES(WkPhone),BillingType=VALUES(BillingType),ChartNumber=VALUES(ChartNumber),\
+             SSN=VALUES(SSN),MedicaidID=VALUES(MedicaidID),PatStatus=VALUES(PatStatus),\
+             County=VALUES(County),SiteNum=VALUES(SiteNum),GradeLevel=VALUES(GradeLevel),\
+             Urgency=VALUES(Urgency),PlannedIsDone=VALUES(PlannedIsDone),Guarantor=VALUES(Guarantor),\
+             ClinicNum=VALUES(ClinicNum),PriProv=VALUES(PriProv)"
+        );
         conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
-        if patient.pat_num == 0 {
-            let last: u64 = conn.last_insert_id();
-            Ok(last as Id)
+        let saved_num = if patient.pat_num == 0 {
+            conn.last_insert_id() as Id
         } else {
-            Ok(patient.pat_num)
+            patient.pat_num
+        };
+        // OD treats each patient as their own guarantor unless an explicit one
+        // was supplied. A zero here would make OD show the patient as belonging
+        // to guarantor 0, which breaks balances and statements.
+        if patient.guarantor == 0 {
+            conn.exec_drop(
+                "UPDATE patient SET Guarantor = PatNum WHERE PatNum = ?",
+                (Value::from(saved_num),),
+            )
+            .map_err(|e| e.to_string())?;
         }
+        Ok(saved_num)
     }
 
     fn delete_patient(&self, pat_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
-        conn.exec_drop("DELETE FROM patient WHERE PatNum = ?", (Value::from(pat_num),))
-            .map_err(|e| e.to_string())
+        // OD never hard-deletes a patient: deleted patients stay in the table
+        // with PatStatus=4 so historical procedures and claims still resolve.
+        conn.exec_drop(
+            "UPDATE patient SET PatStatus = 4, Guarantor = PatNum WHERE PatNum = ?",
+            (Value::from(pat_num),),
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn list_appointments(
@@ -1209,30 +1348,88 @@ impl Store for MySqlStore {
     }
 
     fn upsert_appointment(&self, apt: &Appointment) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
-        let sql = "INSERT INTO appointment (AptNum,PatNum,AptDateTime,AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,TimeLocked,Priority,UnschedStatus) \
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?) \
-                   ON DUPLICATE KEY UPDATE PatNum=VALUES(PatNum),AptDateTime=VALUES(AptDateTime),AptStatus=VALUES(AptStatus),Op=VALUES(Op),ProvNum=VALUES(ProvNum),ClinicNum=VALUES(ClinicNum),Note=VALUES(Note),Pattern=VALUES(Pattern),TimeLocked=VALUES(TimeLocked),Priority=VALUES(Priority),UnschedStatus=VALUES(UnschedStatus)";
+        // OD appointment writes carry the confirmation definition FK (DefCat 2,
+        // never the recall-status category), the acting user and a hash. The
+        // hash is blank here; the write gate documents that limitation.
+        let mut columns = "AptNum,PatNum,AptDateTime,AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,\
+                           TimeLocked,Priority,UnschedStatus"
+            .to_string();
+        let mut placeholders = "?,?,?,?,?,?,?,?,?,?,?,?".to_string();
+        let mut update = "PatNum=VALUES(PatNum),AptDateTime=VALUES(AptDateTime),\
+                          AptStatus=VALUES(AptStatus),Op=VALUES(Op),ProvNum=VALUES(ProvNum),\
+                          ClinicNum=VALUES(ClinicNum),Note=VALUES(Note),Pattern=VALUES(Pattern),\
+                          TimeLocked=VALUES(TimeLocked),Priority=VALUES(Priority),\
+                          UnschedStatus=VALUES(UnschedStatus)"
+            .to_string();
         let num = if apt.apt_num == 0 { 0 } else { apt.apt_num };
         let pattern = if apt.pattern.is_empty() {
             "X".repeat((apt.apt_length / 5).max(1) as usize)
         } else {
             apt.pattern.clone()
         };
-        let params: Vec<Value> = vec![
+        let clinic_num = write_clinic_num(&mut conn, apt.clinic_num, apt.pat_num)?;
+        let confirmed = first_visible_definition(&mut conn, 2)?;
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let mut params: Vec<Value> = vec![
             Value::from(num),
             Value::from(apt.pat_num),
             Value::from(apt.apt_datetime.format("%Y-%m-%d %H:%M:%S").to_string()),
             Value::from(apt.apt_status.as_od()),
             Value::from(apt.operatory_num),
             Value::from(apt.provider_num),
-            Value::from(apt.clinic_num),
+            Value::from(clinic_num),
             Value::from(apt.notes.clone()),
             Value::from(pattern),
             Value::from(i8::from(apt.is_time_locked)),
             Value::from(apt.priority.as_od()),
             Value::from(apt.waitlist_status),
         ];
+        let has_confirmed = column_exists(&mut conn, "appointment", "Confirmed")?;
+        append_optional_column(
+            &mut conn,
+            "appointment",
+            "Confirmed",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(confirmed),
+        )?;
+        if has_confirmed {
+            update.push_str(",Confirmed=VALUES(Confirmed)");
+        }
+        append_optional_column(
+            &mut conn,
+            "appointment",
+            "SecUserNumEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(audit_user),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "appointment",
+            "SecDateTEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(od_write_datetime(Some(Local::now().naive_local()))),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "appointment",
+            "SecurityHash",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(""),
+        )?;
+        let sql = format!(
+            "INSERT INTO appointment ({columns}) VALUES ({placeholders}) \
+             ON DUPLICATE KEY UPDATE {update}"
+        );
         conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
         if apt.apt_num == 0 {
             Ok(conn.last_insert_id() as Id)
@@ -1242,6 +1439,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_appointment(&self, apt_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         conn.exec_drop("DELETE FROM appointment WHERE AptNum = ?", (Value::from(apt_num),))
             .map_err(|e| e.to_string())
@@ -1272,6 +1470,7 @@ impl Store for MySqlStore {
     }
 
     fn append_appointment_change(&self, change: &AppointmentChange) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let sql = "INSERT INTO histappointment \
                    (HistApptNum,HistUserNum,HistDateTStamp,HistApptAction,AptNum,PatNum,\
@@ -1292,9 +1491,10 @@ impl Store for MySqlStore {
             change.changed_at
         };
         let snapshot = &change.snapshot;
+        let audit_user = audit_user_num(&mut conn, change.user_num)?;
         let params: Vec<Value> = vec![
             Value::from(num),
-            Value::from(change.user_num),
+            Value::from(audit_user),
             Value::from(changed_at.format("%Y-%m-%d %H:%M:%S").to_string()),
             Value::from(change.action.as_od()),
             Value::from(snapshot.apt_num),
@@ -1374,29 +1574,42 @@ impl Store for MySqlStore {
     }
 
     fn upsert_recall(&self, recall: &Recall) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
+        // OD's recall table also carries these bookkeeping columns. The port
+        // has no separate recall-type editor, so RecallTypeNum stays at OD's
+        // zero value; the other three use OD's empty-value conventions.
         let sql = "INSERT INTO recall \
                    (RecallNum,PatNum,DateDueCalc,DateDue,DatePrevious,RecallInterval,RecallStatus,\
-                    Note,IsDisabled,DateScheduled,Priority) \
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?) \
+                    Note,IsDisabled,DateScheduled,Priority,RecallTypeNum,TimePatternOverride,\
+                    DisableUntilBalance,DisableUntilDate) \
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
                    ON DUPLICATE KEY UPDATE PatNum=VALUES(PatNum),DateDueCalc=VALUES(DateDueCalc),\
                     DateDue=VALUES(DateDue),DatePrevious=VALUES(DatePrevious),\
                     RecallInterval=VALUES(RecallInterval),RecallStatus=VALUES(RecallStatus),\
                     Note=VALUES(Note),IsDisabled=VALUES(IsDisabled),\
-                    DateScheduled=VALUES(DateScheduled),Priority=VALUES(Priority)";
+                    DateScheduled=VALUES(DateScheduled),Priority=VALUES(Priority),\
+                    RecallTypeNum=VALUES(RecallTypeNum),\
+                    TimePatternOverride=VALUES(TimePatternOverride),\
+                    DisableUntilBalance=VALUES(DisableUntilBalance),\
+                    DisableUntilDate=VALUES(DisableUntilDate)";
         let num = if recall.recall_num == 0 { 0 } else { recall.recall_num };
         let params: Vec<Value> = vec![
             Value::from(num),
             Value::from(recall.pat_num),
-            Value::from(od_date_param(recall.date_due_calc)),
-            Value::from(od_date_param(recall.date_due)),
-            Value::from(od_date_param(recall.date_previous)),
+            Value::from(od_write_date(recall.date_due_calc)),
+            Value::from(od_write_date(recall.date_due)),
+            Value::from(od_write_date(recall.date_previous)),
             Value::from(recall.recall_interval),
             Value::from(recall.recall_status),
             Value::from(recall.note.clone()),
             Value::from(i8::from(recall.is_disabled)),
-            Value::from(od_date_param(recall.date_scheduled)),
+            Value::from(od_write_date(recall.date_scheduled)),
             Value::from(recall.priority.as_od()),
+            Value::from(0u64),
+            Value::from(""),
+            Value::from(0.0f64),
+            Value::from(od_write_datetime(None)),
         ];
         conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
         if recall.recall_num == 0 {
@@ -1517,10 +1730,13 @@ impl Store for MySqlStore {
     }
 
     fn insert_procedure(&self, procedure: &Procedure) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // Mirrors the OD columns set by Procedures.Insert for a new planned
         // procedure. OD assigns the key and stores DateTime.MinValue
         // (0001-01-01) in DateComplete until the procedure moves to Complete.
+        // ClinicNum comes from the patient, never a hardcoded zero.
+        let clinic_num = patient_clinic_num(&mut conn, procedure.pat_num)?;
         conn.exec_drop(
             "INSERT INTO procedurelog \
              (PatNum,AptNum,ProvNum,CodeNum,ClinicNum,ProcDate,ProcFee,ProcStatus, \
@@ -1532,7 +1748,7 @@ impl Store for MySqlStore {
                 Value::from(procedure.apt_num),
                 Value::from(procedure.provider_num),
                 Value::from(procedure.code_num),
-                Value::from(0u32),
+                Value::from(clinic_num),
                 Value::from(procedure.proc_date.format("%Y-%m-%d").to_string()),
                 Value::from(procedure.fee),
                 Value::from(ProcedureStatus::TreatmentPlanned.as_od()),
@@ -1550,6 +1766,7 @@ impl Store for MySqlStore {
     }
 
     fn set_procedure_complete(&self, proc_num: Id, discount_amount: f64) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // OD Procedures.Insert/Update set DateComplete and DiscountPlanAmt
         // alongside ProcStatus when a procedure becomes complete. The service
@@ -1570,19 +1787,22 @@ impl Store for MySqlStore {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn
             .exec(
-                "SELECT CodeNum,ProcCode,Descript,AbbrDesc,CAST(0 AS DOUBLE),ProcCat FROM procedurecode ORDER BY ProcCode",
+                // OD's `procedurecode` has no fee column: fees live only in
+                // `fee`. Do not pretend a zero fee came from the schema; the
+                // Procedure Codes report resolves amounts from `fee` and
+                // renders a blank cell when no fee row exists.
+                "SELECT CodeNum,ProcCode,Descript,AbbrDesc,ProcCat FROM procedurecode ORDER BY ProcCode",
                 (),
             )
             .map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
             .map(|row| {
-                let (code_num, code, code_name, abbreviation, fee, category_num): (
+                let (code_num, code, code_name, abbreviation, category_num): (
                     u32,
                     String,
                     String,
                     String,
-                    f64,
                     u32,
                 ) = from_row(row);
                 ProcedureCode {
@@ -1590,7 +1810,9 @@ impl Store for MySqlStore {
                     code,
                     code_name,
                     abbreviation,
-                    fee,
+                    // No fee is stored on procedurecode; the report uses the
+                    // `fee` rows passed to it instead.
+                    fee: 0.0,
                     category_num,
                 }
             })
@@ -1845,6 +2067,7 @@ impl Store for MySqlStore {
     }
 
     fn post_journal_transaction(&self, entries: &[JournalEntry]) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         if entries.is_empty() {
             return Err("No journal lines to post".into());
         }
@@ -1856,34 +2079,24 @@ impl Store for MySqlStore {
             return Err("All journal lines must share one transaction number".into());
         }
         let mut conn = self.conn()?;
+        let insert = JournalInsert::new(&mut conn)?;
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let now = od_write_datetime(Some(Local::now().naive_local()));
         // A journal transaction is only meaningful as a whole: inserting one
         // side of the pair would make Balance Sheet and P&L disagree.
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| e.to_string())?;
         for entry in entries {
-            tx.exec_drop(
-                "INSERT INTO journalentry \
-                 (AccountNum,DateDisplayed,DebitAmt,CreditAmt,Memo,Splits,CheckNumber,TransactionNum) \
-                 VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    entry.account_num,
-                    entry.date_displayed.format("%Y-%m-%d").to_string(),
-                    entry.debit_amt,
-                    entry.credit_amt,
-                    &entry.memo,
-                    &entry.splits,
-                    &entry.check_number,
-                    entry.transaction_num,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
+            tx.exec_drop(&insert.sql, insert.params(entry, audit_user, &now))
+                .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(transaction_num)
     }
 
     fn post_journal_batch(&self, batches: &[Vec<JournalEntry>]) -> Result<Vec<Id>, String> {
+        self.ensure_od_writes_allowed()?;
         if batches.is_empty() {
             return Err("No journal transactions to post".into());
         }
@@ -1902,6 +2115,9 @@ impl Store for MySqlStore {
             transaction_nums.push(transaction_num);
         }
         let mut conn = self.conn()?;
+        let insert = JournalInsert::new(&mut conn)?;
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let now = od_write_datetime(Some(Local::now().naive_local()));
         // One DB transaction for the whole batch: a failed charge can never
         // leave the ledger with only part of the posting run booked.
         let mut tx = conn
@@ -1909,22 +2125,8 @@ impl Store for MySqlStore {
             .map_err(|e| e.to_string())?;
         for entries in batches {
             for entry in entries {
-                tx.exec_drop(
-                    "INSERT INTO journalentry \
-                     (AccountNum,DateDisplayed,DebitAmt,CreditAmt,Memo,Splits,CheckNumber,TransactionNum) \
-                     VALUES (?,?,?,?,?,?,?,?)",
-                    (
-                        entry.account_num,
-                        entry.date_displayed.format("%Y-%m-%d").to_string(),
-                        entry.debit_amt,
-                        entry.credit_amt,
-                        &entry.memo,
-                        &entry.splits,
-                        &entry.check_number,
-                        entry.transaction_num,
-                    ),
-                )
-                .map_err(|e| e.to_string())?;
+                tx.exec_drop(&insert.sql, insert.params(entry, audit_user, &now))
+                    .map_err(|e| e.to_string())?;
             }
         }
         tx.commit().map_err(|e| e.to_string())?;
@@ -2031,6 +2233,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_pay_plan_link(&self, link: &PayPlanLink) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         if link.pay_plan_link_num == 0 {
             conn.exec_drop(
@@ -2061,6 +2264,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_pay_plan_link(&self, link_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         conn.exec_drop(
             "DELETE FROM payplanlink WHERE PayPlanLinkNum=?",
@@ -2070,6 +2274,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_pay_plan_charge(&self, charge_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         conn.exec_drop(
             "DELETE FROM payplancharge WHERE PayPlanChargeNum=?",
@@ -2197,6 +2402,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_discount_plan(&self, plan: &DiscountPlan) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // Mirrors DiscountPlanCrud.Update/Insert. A zero key is OD's convention
         // for a new row; AUTO_INCREMENT assigns the real DiscountPlanNum.
@@ -2239,6 +2445,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_discount_plan_sub(&self, sub: &DiscountPlanSub) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let sql = "INSERT INTO discountplansub \
                    (DiscountSubNum,DiscountPlanNum,PatNum,DateEffective,DateTerm,SubNote) \
@@ -2268,6 +2475,7 @@ impl Store for MySqlStore {
         discount_sub_num: Id,
         term: NaiveDate,
     ) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // OD has no "terminated" flag: ending a subscription means setting
         // DateTerm. The row is retained so historic adjustments still resolve.
@@ -2820,17 +3028,23 @@ impl Store for MySqlStore {
     }
 
     fn insert_statement(&self, statement: &Statement) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
-        // OD stores an unsent statement as the sentinel date 0001-01-01.
-        let date_sent = statement
-            .date_sent
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "0001-01-01".to_string());
+        // OD stores an unsent statement as the sentinel date 0001-01-01 and
+        // requires every bookkeeping column to be populated explicitly.
+        let date_sent = od_write_date(statement.date_sent);
         conn.exec_drop(
-            "INSERT INTO statement (PatNum,DateSent,Note,IsInvoice) VALUES (?,?,?,?)",
+            "INSERT INTO statement \
+             (PatNum,SuperFamily,DateSent,DateRangeFrom,DateRangeTo,Note,NoteBold,Mode_,\
+              HidePayment,SinglePatient,Intermingled,IsSent,DocNum,IsReceipt,IsInvoice,\
+              IsInvoiceCopy,EmailSubject,EmailBody,IsBalValid,InsEst,BalTotal,StatementType,\
+              ShortGUID,StatementURL,StatementShortURL,SmsSendStatus,LimitedCustomFamily) \
+             VALUES (?,0,?,?,?,?,'',0,0,1,0,0,0,0,?,0,'','',0,0,0,'NotSet','','','',0,0)",
             (
                 statement.pat_num,
                 date_sent,
+                od_write_date(None),
+                od_write_date(None),
                 statement.note.clone(),
                 statement.is_invoice as i8,
             ),
@@ -2928,11 +3142,18 @@ impl Store for MySqlStore {
     }
 
     fn upsert_pay_plan(&self, plan: &PayPlan) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
-        let params = vec![
+        let mut columns = "PlanNum,PatNum,Guarantor,PayPlanDate,APR,Note,CompletedAmt,PaySchedule,\
+                           NumberOfPayments,PayAmt,DownPayment,IsClosed,ChargeFrequency,\
+                           DatePayPlanStart,DateInterestStart,IsDynamic,DynamicPayPlanTPOption,IsLocked"
+            .to_string();
+        let mut placeholders = "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?".to_string();
+        let mut params: Vec<Value> = vec![
+            Value::from(plan.insurance_plan_num),
             Value::from(plan.pat_num),
             Value::from(plan.guarantor),
-            Value::from(plan.pay_plan_date.format("%Y-%m-%d").to_string()),
+            Value::from(od_write_date(Some(plan.pay_plan_date))),
             Value::from(plan.apr),
             Value::from(plan.note.clone()),
             Value::from(plan.completed_amt),
@@ -2942,89 +3163,112 @@ impl Store for MySqlStore {
             Value::from(plan.down_payment),
             Value::from(i8::from(plan.is_closed)),
             Value::from(plan.charge_frequency.as_od()),
-            Value::from(
-                plan.date_pay_plan_start
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default(),
-            ),
-            Value::from(
-                plan.date_interest_start
-                    .map(|d| d.format("%Y-%m-%d").to_string())
-                    .unwrap_or_default(),
-            ),
+            Value::from(od_write_date(plan.date_pay_plan_start)),
+            Value::from(od_write_date(plan.date_interest_start)),
             Value::from(i8::from(plan.is_dynamic)),
             Value::from(plan.dynamic_pay_plan_tp_option.as_od()),
             Value::from(i8::from(plan.is_locked)),
         ];
+        // The remaining OD columns are optional on the reduced schema but
+        // required on 24_3. Never fabricate a SecurityHash; the write gate is
+        // the mitigation. They are insert-only: OD's update path leaves the
+        // signature/audit fields untouched.
+        let base_params = params.clone();
+        for (name, value) in [
+            ("InsSubNum", Value::from(0u64)),
+            ("Signature", Value::from("")),
+            ("SigIsTopaz", Value::from(0i8)),
+            ("PlanCategory", Value::from(0u64)),
+            ("MobileAppDeviceNum", Value::from(0u64)),
+            ("SecurityHash", Value::from("")),
+        ] {
+            append_optional_column(
+                &mut conn,
+                "payplan",
+                name,
+                &mut columns,
+                &mut placeholders,
+                &mut params,
+                value,
+            )?;
+        }
         if plan.pay_plan_num == 0 {
-            conn.exec_drop(
-                "INSERT INTO payplan \
-                 (PatNum,Guarantor,PayPlanDate,APR,Note,CompletedAmt,PaySchedule,NumberOfPayments,PayAmt,DownPayment,IsClosed,ChargeFrequency,DatePayPlanStart,DateInterestStart,IsDynamic,DynamicPayPlanTPOption,IsLocked) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                params,
-            )
-            .map_err(|e| e.to_string())?;
+            let sql = format!("INSERT INTO payplan ({columns}) VALUES ({placeholders})");
+            conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
             Ok(conn.last_insert_id() as Id)
         } else {
-            let mut update_params = params;
+            let mut update_params = base_params;
             update_params.push(Value::from(plan.pay_plan_num));
-            conn.exec_drop(
-                "UPDATE payplan SET PatNum=?,Guarantor=?,PayPlanDate=?,APR=?,Note=?,CompletedAmt=?,PaySchedule=?,NumberOfPayments=?,PayAmt=?,DownPayment=?,IsClosed=?,ChargeFrequency=?,DatePayPlanStart=?,DateInterestStart=?,IsDynamic=?,DynamicPayPlanTPOption=?,IsLocked=? \
-                 WHERE PayPlanNum=?",
-                update_params,
-            )
-            .map_err(|e| e.to_string())?;
+            let sql =
+                "UPDATE payplan SET PlanNum=?,PatNum=?,Guarantor=?,PayPlanDate=?,APR=?,Note=?,\
+                 CompletedAmt=?,PaySchedule=?,NumberOfPayments=?,PayAmt=?,DownPayment=?,\
+                 IsClosed=?,ChargeFrequency=?,DatePayPlanStart=?,DateInterestStart=?,\
+                 IsDynamic=?,DynamicPayPlanTPOption=?,IsLocked=? WHERE PayPlanNum=?";
+            conn.exec_drop(sql, update_params)
+                .map_err(|e| e.to_string())?;
             Ok(plan.pay_plan_num)
         }
     }
 
     fn upsert_pay_plan_charge(&self, charge: &PayPlanCharge) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
+        let mut columns = "PayPlanNum,Guarantor,PatNum,ChargeDate,Principal,Interest,Note,ProvNum,\
+                           ProcNum,ChargeType,FKey,LinkType"
+            .to_string();
+        let mut placeholders = "?,?,?,?,?,?,?,?,?,?,?,?".to_string();
+        let base_params: Vec<Value> = vec![
+            Value::from(charge.pay_plan_num),
+            Value::from(charge.guarantor),
+            Value::from(charge.pat_num),
+            Value::from(od_write_date(Some(charge.charge_date))),
+            Value::from(charge.principal),
+            Value::from(charge.interest),
+            Value::from(charge.note.clone()),
+            Value::from(charge.provider_num),
+            Value::from(charge.proc_num),
+            Value::from(charge.charge_type.as_od()),
+            Value::from(charge.fkey),
+            Value::from(charge.link_type),
+        ];
+        let clinic_num = if charge.proc_num != 0 {
+            procedure_clinic_num(&mut conn, charge.proc_num)?
+        } else {
+            patient_clinic_num(&mut conn, charge.pat_num)?
+        };
+        let mut insert_params = base_params.clone();
+        for (name, value) in [
+            ("ClinicNum", Value::from(clinic_num)),
+            ("StatementNum", Value::from(0u64)),
+            ("IsOffset", Value::from(0i8)),
+            ("SecDateTEntry", Value::from(od_write_datetime(Some(Local::now().naive_local())))),
+        ] {
+            append_optional_column(
+                &mut conn,
+                "payplancharge",
+                name,
+                &mut columns,
+                &mut placeholders,
+                &mut insert_params,
+                value,
+            )?;
+        }
         // OD upsert semantics: PayPlanChargeNum=0 inserts, otherwise update the
         // existing charge in place. This matters for safe stale resolution,
         // where we zero/annotate a previously issued charge without deleting it.
         if charge.pay_plan_charge_num == 0 {
-            conn.exec_drop(
-                "INSERT INTO payplancharge \
-                 (PayPlanNum,Guarantor,PatNum,ChargeDate,Principal,Interest,Note,ProvNum,ProcNum,ChargeType,FKey,LinkType) \
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    charge.pay_plan_num,
-                    charge.guarantor,
-                    charge.pat_num,
-                    charge.charge_date.format("%Y-%m-%d").to_string(),
-                    charge.principal,
-                    charge.interest,
-                    charge.note.clone(),
-                    charge.provider_num,
-                    charge.proc_num,
-                    charge.charge_type.as_od(),
-                    charge.fkey,
-                    charge.link_type,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
+            let sql = format!("INSERT INTO payplancharge ({columns}) VALUES ({placeholders})");
+            conn.exec_drop(sql, insert_params)
+                .map_err(|e| e.to_string())?;
             Ok(conn.last_insert_id() as Id)
         } else {
+            let mut update_params = base_params;
+            update_params.push(Value::from(charge.pay_plan_charge_num));
             conn.exec_drop(
                 "UPDATE payplancharge SET \
                  PayPlanNum=?,Guarantor=?,PatNum=?,ChargeDate=?,Principal=?,Interest=?,Note=?,ProvNum=?,ProcNum=?,ChargeType=?,FKey=?,LinkType=? \
                  WHERE PayPlanChargeNum=?",
-                mysql::Params::Positional(vec![
-                    Value::from(charge.pay_plan_num),
-                    Value::from(charge.guarantor),
-                    Value::from(charge.pat_num),
-                    Value::from(charge.charge_date.format("%Y-%m-%d").to_string()),
-                    Value::from(charge.principal),
-                    Value::from(charge.interest),
-                    Value::from(charge.note.clone()),
-                    Value::from(charge.provider_num),
-                    Value::from(charge.proc_num),
-                    Value::from(charge.charge_type.as_od()),
-                    Value::from(charge.fkey),
-                    Value::from(charge.link_type),
-                    Value::from(charge.pay_plan_charge_num),
-                ]),
+                mysql::Params::Positional(update_params),
             )
             .map_err(|e| e.to_string())?;
             Ok(charge.pay_plan_charge_num)
@@ -3032,6 +3276,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_adjustment(&self, adjustment: &Adjustment) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // OD stores the service date on ProcDate. Manual entries in this port
         // leave proc_date at its zero value, so keep the previous behaviour
@@ -3041,40 +3286,91 @@ impl Store for MySqlStore {
         } else {
             adjustment.adj_date
         };
-        // OD's upsert semantics: AdjNum=0 inserts, otherwise update in place.
-        // A plain INSERT with an explicit key would not update linked production.
+        // OD's adjustment insert also writes the service date, clinic and
+        // audit columns. A linked adjustment follows the procedure's clinic;
+        // a manual one follows the patient.
+        let clinic_num = if adjustment.proc_num != 0 {
+            procedure_clinic_num(&mut conn, adjustment.proc_num)?
+        } else {
+            patient_clinic_num(&mut conn, adjustment.pat_num)?
+        };
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let mut columns = "AdjDate,AdjAmt,PatNum,AdjType,ProvNum,ProcNum,AdjNote,ProcDate"
+            .to_string();
+        let mut placeholders = "?,?,?,?,?,?,?,?".to_string();
+        let mut params: Vec<Value> = vec![
+            Value::from(od_write_date(Some(adjustment.adj_date))),
+            Value::from(adjustment.adj_amount),
+            Value::from(adjustment.pat_num),
+            Value::from(adjustment.adj_type),
+            Value::from(adjustment.provider_num),
+            Value::from(adjustment.proc_num),
+            Value::from(adjustment.note.clone()),
+            Value::from(od_write_date(Some(proc_date))),
+        ];
+        let base_params = params.clone();
+        append_optional_column(
+            &mut conn,
+            "adjustment",
+            "DateEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(od_write_date(Some(adjustment.adj_date))),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "adjustment",
+            "ClinicNum",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(clinic_num),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "adjustment",
+            "StatementNum",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(0u64),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "adjustment",
+            "SecUserNumEntry",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(audit_user),
+        )?;
+        append_optional_column(
+            &mut conn,
+            "adjustment",
+            "TaxTransID",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(0u64),
+        )?;
         if adjustment.adj_num == 0 {
-            conn.exec_drop(
-                "INSERT INTO adjustment (AdjDate,AdjAmt,PatNum,AdjType,ProvNum,ProcNum,AdjNote,ProcDate) VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    adjustment.adj_date.format("%Y-%m-%d").to_string(),
-                    adjustment.adj_amount,
-                    adjustment.pat_num,
-                    adjustment.adj_type,
-                    adjustment.provider_num,
-                    adjustment.proc_num,
-                    adjustment.note.clone(),
-                    proc_date.format("%Y-%m-%d").to_string(),
-                ),
-            )
-            .map_err(|e| e.to_string())?;
+            let sql = format!(
+                "INSERT INTO adjustment ({columns}) VALUES ({placeholders}) \
+                 ON DUPLICATE KEY UPDATE AdjDate=VALUES(AdjDate),AdjAmt=VALUES(AdjAmt),\
+                 PatNum=VALUES(PatNum),AdjType=VALUES(AdjType),ProvNum=VALUES(ProvNum),\
+                 ProcNum=VALUES(ProcNum),AdjNote=VALUES(AdjNote),ProcDate=VALUES(ProcDate)"
+            );
+            conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
             Ok(conn.last_insert_id() as Id)
         } else {
-            conn.exec_drop(
-                "UPDATE adjustment SET AdjDate=?,AdjAmt=?,PatNum=?,AdjType=?,ProvNum=?,ProcNum=?,AdjNote=?,ProcDate=? WHERE AdjNum=?",
-                (
-                    adjustment.adj_date.format("%Y-%m-%d").to_string(),
-                    adjustment.adj_amount,
-                    adjustment.pat_num,
-                    adjustment.adj_type,
-                    adjustment.provider_num,
-                    adjustment.proc_num,
-                    adjustment.note.clone(),
-                    proc_date.format("%Y-%m-%d").to_string(),
-                    adjustment.adj_num,
-                ),
-            )
-            .map_err(|e| e.to_string())?;
+            let mut update_params = base_params;
+            update_params.push(Value::from(adjustment.adj_num));
+            let sql = "UPDATE adjustment SET AdjDate=?,AdjAmt=?,PatNum=?,AdjType=?,ProvNum=?,\
+                 ProcNum=?,AdjNote=?,ProcDate=? WHERE AdjNum=?";
+            // Optional columns are only set on insert in OD's update path; the
+            // original values are audit facts that must not be rewritten.
+            conn.exec_drop(sql, update_params).map_err(|e| e.to_string())?;
             Ok(adjustment.adj_num)
         }
     }
@@ -3107,46 +3403,112 @@ impl Store for MySqlStore {
         payment: &Payment,
         allocations: &[PaymentAllocation],
     ) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let splits = payment.splits(allocations)?;
         let mut conn = self.conn()?;
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
+        let now = od_write_datetime(Some(Local::now().naive_local()));
+        let clinic_num = write_clinic_num(&mut conn, 0, payment.pat_num)?;
+
+        // Resolve optional OD columns before opening the transaction; MySQL
+        // transactions cannot run information_schema checks. Each flag appends
+        // one column and one value so genuine 24_3 schemas get full audit rows
+        // while reduced demo schemas keep working.
+        let mut payment_columns =
+            "PatNum,PayDate,PayAmt,PayType,CheckNum,PayNote".to_string();
+        let mut payment_placeholders = "?,?,?,?,?,?".to_string();
+        let mut payment_values: Vec<(String, Value)> = Vec::new();
+        for (name, value) in [
+            ("BankBranch", Value::from("")),
+            ("IsSplit", Value::from(1i8)),
+            ("ClinicNum", Value::from(clinic_num)),
+            ("DateEntry", Value::from(now.clone())),
+            ("DepositNum", Value::from(0u64)),
+            ("Receipt", Value::from("")),
+            ("IsRecurringCC", Value::from(0i8)),
+            ("SecUserNumEntry", Value::from(audit_user)),
+            ("PaymentSource", Value::from(0i8)),
+            ("ProcessStatus", Value::from(0i8)),
+            ("RecurringChargeDate", Value::from(od_write_date(None))),
+            ("ExternalId", Value::from("")),
+            ("PaymentStatus", Value::from(0i8)),
+            ("IsCcCompleted", Value::from(0i8)),
+            ("MerchantFee", Value::from(0.0f64)),
+        ] {
+            if column_exists(&mut conn, "payment", name)? {
+                payment_columns.push(',');
+                payment_columns.push_str(name);
+                payment_placeholders.push_str(",?");
+                payment_values.push((name.to_string(), value));
+            }
+        }
+        let payment_sql = format!(
+            "INSERT INTO payment ({payment_columns}) VALUES ({payment_placeholders})"
+        );
+
+        let mut split_columns = "PayNum,PatNum,ProcNum,SplitAmt,DatePay,ProcDate,ProvNum,\
+                                  PayPlanNum,AdjNum,UnearnedType,PayPlanChargeNum,PayPlanDebitType"
+            .to_string();
+        let mut split_placeholders = "?,?,?,?,?,?,?,?,?,?,?,?".to_string();
+        let mut split_values: Vec<(String, Value)> = Vec::new();
+        for (name, value) in [
+            ("IsDiscount", Value::from(0i8)),
+            ("DiscountType", Value::from(0i8)),
+            ("DateEntry", Value::from(now.clone())),
+            ("ClinicNum", Value::from(clinic_num)),
+            ("SecUserNumEntry", Value::from(audit_user)),
+            ("FSplitNum", Value::from(0u64)),
+            // This port cannot reproduce CDT.dll's salted hash; the write
+            // policy gate is the only mitigation, so never fabricate one.
+            ("SecurityHash", Value::from("")),
+        ] {
+            if column_exists(&mut conn, "paysplit", name)? {
+                split_columns.push(',');
+                split_columns.push_str(name);
+                split_placeholders.push_str(",?");
+                split_values.push((name.to_string(), value));
+            }
+        }
+        let split_sql = format!(
+            "INSERT INTO paysplit ({split_columns}) VALUES ({split_placeholders})"
+        );
+
         // One payment and all its splits must be written atomically; otherwise
         // a failed split would leave an unbalanced OD ledger.
         let mut tx = conn
             .start_transaction(mysql::TxOpts::default())
             .map_err(|e| e.to_string())?;
-        tx.exec_drop(
-            "INSERT INTO payment (PatNum,PayDate,PayAmt,PayType,CheckNum,PayNote) VALUES (?,?,?,?,?,?)",
-            (
-                payment.pat_num,
-                payment.pay_date.format("%Y-%m-%d").to_string(),
-                payment.pay_amount,
-                payment.pay_type,
-                payment.check_num.clone(),
-                payment.note.clone(),
-            ),
-        )
-        .map_err(|e| e.to_string())?;
-        let pay_num = tx.last_insert_id().unwrap_or(0) as Id;
-        let pay_date = payment.pay_date.format("%Y-%m-%d").to_string();
-        for split in &splits {
-            tx.exec_drop(
-                "INSERT INTO paysplit (PayNum,PatNum,ProcNum,SplitAmt,DatePay,ProcDate,ProvNum,PayPlanNum,AdjNum,UnearnedType,PayPlanChargeNum,PayPlanDebitType) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    pay_num,
-                    split.pat_num,
-                    split.proc_num,
-                    split.split_amount,
-                    pay_date.clone(),
-                    pay_date.clone(),
-                    split.provider_num,
-                    split.pay_plan_num,
-                    split.adj_num,
-                    split.unearned_type,
-                    split.pay_plan_charge_num,
-                    split.pay_plan_debit_type.as_db(),
-                ),
-            )
+        let mut payment_params: Vec<Value> = vec![
+            Value::from(payment.pat_num),
+            Value::from(od_write_date(Some(payment.pay_date))),
+            Value::from(payment.pay_amount),
+            Value::from(payment.pay_type),
+            Value::from(payment.check_num.clone()),
+            Value::from(payment.note.clone()),
+        ];
+        payment_params.extend(payment_values.into_iter().map(|(_, value)| value));
+        tx.exec_drop(&payment_sql, payment_params)
             .map_err(|e| e.to_string())?;
+        let pay_num = tx.last_insert_id().unwrap_or(0) as Id;
+        let pay_date = od_write_date(Some(payment.pay_date));
+        for split in &splits {
+            let mut split_params: Vec<Value> = vec![
+                Value::from(pay_num),
+                Value::from(split.pat_num),
+                Value::from(split.proc_num),
+                Value::from(split.split_amount),
+                Value::from(pay_date.clone()),
+                Value::from(pay_date.clone()),
+                Value::from(split.provider_num),
+                Value::from(split.pay_plan_num),
+                Value::from(split.adj_num),
+                Value::from(split.unearned_type),
+                Value::from(split.pay_plan_charge_num),
+                Value::from(split.pay_plan_debit_type.as_db()),
+            ];
+            split_params.extend(split_values.iter().map(|(_, value)| value.clone()));
+            tx.exec_drop(&split_sql, split_params)
+                .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok(pay_num)
@@ -3180,6 +3542,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_treat_plan(&self, plan: &TreatPlan) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // Every NOT NULL column without a default gets an explicit OD-style
         // zero value. SecDateEntry is set on insert only, like OD's DateEntry.
@@ -3191,6 +3554,7 @@ impl Store for MySqlStore {
             ON DUPLICATE KEY UPDATE DateTP=VALUES(DateTP),Heading=VALUES(Heading),Note=VALUES(Note),\
              TPStatus=VALUES(TPStatus),UserNumPresenter=VALUES(UserNumPresenter),TPType=VALUES(TPType)";
         let today = Local::now().date_naive().format("%Y-%m-%d").to_string();
+        let audit_user = audit_user_num(&mut conn, self.current_user())?;
         let params: Vec<Value> = vec![
             Value::from(plan.treat_plan_num),
             Value::from(plan.pat_num),
@@ -3202,7 +3566,7 @@ impl Store for MySqlStore {
             Value::from(0u64),
             Value::from(0u64),
             Value::from(i32::from(plan.status.as_od())),
-            Value::from(0u64),
+            Value::from(audit_user),
             Value::from(today),
             Value::from(0u64),
             Value::from(0i32),
@@ -3222,6 +3586,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_treat_plan(&self, plan_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // OD refuses to delete a plan that still has proctp rows; clear both
         // line tables first.
@@ -3362,6 +3727,7 @@ impl Store for MySqlStore {
         plan: &TreatPlan,
         line: &TreatPlanLine,
     ) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let saved = treat_plan_status(&mut conn, plan.treat_plan_num)?
             .ok_or_else(|| format!("treatment plan {} not found", plan.treat_plan_num))?
@@ -3381,15 +3747,25 @@ impl Store for MySqlStore {
             } else {
                 line.item_order
             };
+            // `proctp` has no alternate unique key, so the PK must be in the
+            // INSERT for ON DUPLICATE KEY UPDATE to fire. Without it an edit
+            // silently inserted a second line and returned the stale id.
             let sql = "INSERT INTO proctp \
-                (TreatPlanNum,PatNum,ProcNumOrig,ItemOrder,Priority,ToothNumTP,Surf,ProcCode,Descript,\
-                 FeeAmt,PriInsAmt,SecInsAmt,PatAmt,Discount,Prognosis,Dx,ProcAbbr,SecUserNumEntry,\
-                 SecDateEntry,FeeAllowed,TaxAmt,ProvNum,DateTP,ClinicNum,CatPercUCR) \
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
-                ON DUPLICATE KEY UPDATE ProcNumOrig=VALUES(ProcNumOrig),ToothNumTP=VALUES(ToothNumTP),\
-                 Surf=VALUES(Surf),ProcCode=VALUES(ProcCode),Descript=VALUES(Descript),\
-                 FeeAmt=VALUES(FeeAmt),ProvNum=VALUES(ProvNum),DateTP=VALUES(DateTP)";
+                (ProcTPNum,TreatPlanNum,PatNum,ProcNumOrig,ItemOrder,Priority,ToothNumTP,Surf,\
+                 ProcCode,Descript,FeeAmt,PriInsAmt,SecInsAmt,PatAmt,Discount,Prognosis,Dx,\
+                 ProcAbbr,SecUserNumEntry,SecDateEntry,FeeAllowed,TaxAmt,ProvNum,DateTP,ClinicNum,\
+                 CatPercUCR) \
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) \
+                ON DUPLICATE KEY UPDATE TreatPlanNum=VALUES(TreatPlanNum),PatNum=VALUES(PatNum),\
+                 ProcNumOrig=VALUES(ProcNumOrig),ItemOrder=VALUES(ItemOrder),\
+                 Priority=VALUES(Priority),ToothNumTP=VALUES(ToothNumTP),Surf=VALUES(Surf),\
+                 ProcCode=VALUES(ProcCode),Descript=VALUES(Descript),FeeAmt=VALUES(FeeAmt),\
+                 FeeAllowed=VALUES(FeeAllowed),TaxAmt=VALUES(TaxAmt),ProvNum=VALUES(ProvNum),\
+                 DateTP=VALUES(DateTP),ClinicNum=VALUES(ClinicNum),CatPercUCR=VALUES(CatPercUCR)";
+            let audit_user = audit_user_num(&mut conn, self.current_user())?;
+            let clinic_num = write_clinic_num(&mut conn, 0, plan.pat_num)?;
             let params: Vec<Value> = vec![
+                Value::from(line.line_num),
                 Value::from(plan.treat_plan_num),
                 Value::from(plan.pat_num),
                 Value::from(line.proc_num),
@@ -3407,13 +3783,13 @@ impl Store for MySqlStore {
                 Value::from(""),
                 Value::from(""),
                 Value::from(""),
-                Value::from(0u64),
+                Value::from(audit_user),
                 Value::from(today),
                 Value::from(0.0f64),
                 Value::from(0.0f64),
                 Value::from(line.provider_num),
                 Value::from(od_date_param(line.date_tp)),
-                Value::from(0u64),
+                Value::from(clinic_num),
                 Value::from(0.0f64),
             ];
             conn.exec_drop(sql, params).map_err(|e| e.to_string())?;
@@ -3424,7 +3800,8 @@ impl Store for MySqlStore {
             }
         } else {
             let sql = "INSERT INTO treatplanattach (TreatPlanAttachNum,TreatPlanNum,ProcNum,Priority) \
-                       VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE ProcNum=VALUES(ProcNum),Priority=VALUES(Priority)";
+                       VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE TreatPlanNum=VALUES(TreatPlanNum),\
+                       ProcNum=VALUES(ProcNum),Priority=VALUES(Priority)";
             conn.exec_drop(
                 sql,
                 (
@@ -3444,6 +3821,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_treat_plan_line(&self, plan: &TreatPlan, line_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let saved = treat_plan_status(&mut conn, plan.treat_plan_num)?
             .ok_or_else(|| format!("treatment plan {} not found", plan.treat_plan_num))?
@@ -3470,6 +3848,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_definition(&self, definition: &Definition) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let params = (
             definition.category.as_od() as i32,
@@ -3513,6 +3892,7 @@ impl Store for MySqlStore {
     }
 
     fn delete_definition(&self, def_num: Id) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let category: Option<i16> = conn
             .exec_first(
@@ -3555,6 +3935,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_display_field(&self, field: &DisplayField) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let params = (
             field.internal_name.clone(),
@@ -3608,6 +3989,7 @@ impl Store for MySqlStore {
         category: DisplayFieldCategory,
         fields: &[DisplayField],
     ) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let normalized: Vec<DisplayField> = fields
             .iter()
             .enumerate()
@@ -3693,6 +4075,7 @@ impl Store for MySqlStore {
     }
 
     fn upsert_pref(&self, name: &str, value: &str) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         // Check existence explicitly: MySQL counts *changed* rows in
         // affected_rows(), so an UPDATE that writes the same value would report
@@ -3773,6 +4156,7 @@ impl Store for MySqlStore {
     }
 
     fn append_security_log(&self, event: &SecurityEvent) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
         let params: Vec<Value> = vec![
             Value::from(event.perm_type.as_od()),
@@ -3805,12 +4189,17 @@ impl Store for MySqlStore {
     }
 
     fn upsert_reminder_rule(&self, rule: &ReminderRule) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
         let mut conn = self.conn()?;
+        // `SendOrder` is an ordered comma-delimited preference list (e.g.
+        // "0,1,2"), not a single comm type. Preserve the fallback chain while
+        // making the port's edited `comm_type` the primary channel.
+        let send_order = send_order_for_write(rule);
         let params: Vec<Value> = vec![
             Value::from(rule.rule_num),
             Value::from(rule.type_cur.as_od()),
             Value::from(minutes_to_ticks(rule.minutes_prior)),
-            Value::from(rule.comm_type.as_od().to_string()),
+            Value::from(send_order),
             Value::from(rule.sms_template.clone()),
             Value::from(rule.email_subject.clone()),
             Value::from(rule.email_body.clone()),
@@ -3869,8 +4258,10 @@ impl Store for MySqlStore {
 
     fn list_reminder_sent(&self) -> Result<Vec<(Id, Id)>, String> {
         let mut conn = self.conn()?;
+        // Port-local dedupe only. OD's apptremindersent belongs to HQ and its
+        // SendStatus=1 means DoNotSend, so the port must never write it.
         let rows: Vec<mysql::Row> = conn
-            .query("SELECT ApptReminderRuleNum,ApptNum FROM apptremindersent")
+            .query("SELECT ApptReminderRuleNum,ApptNum FROM odclinic_reminder_sent")
             .map_err(|e| e.to_string())?;
         Ok(rows
             .iter()
@@ -3879,12 +4270,13 @@ impl Store for MySqlStore {
     }
 
     fn mark_reminder_sent(&self, rule_num: Id, apt_num: Id, pat_num: Id) -> Result<(), String> {
+        // Port-local table: not gated by WritePolicy, never touches OD state.
         let mut conn = self.conn()?;
         conn.exec_drop(
-            "INSERT INTO apptremindersent \
-             (PatNum,ClinicNum,SendStatus,MessageType,MessageFk,ApptReminderRuleNum,ApptNum,TSPrior) \
-             VALUES (?,0,1,0,0,?,?,0)",
-            (pat_num, rule_num, apt_num),
+            "INSERT INTO odclinic_reminder_sent \
+             (ApptReminderRuleNum,ApptNum,PatNum) VALUES (?,?,?) \
+             ON DUPLICATE KEY UPDATE SentAt = CURRENT_TIMESTAMP",
+            (rule_num, apt_num, pat_num),
         )
         .map_err(|e| e.to_string())
     }

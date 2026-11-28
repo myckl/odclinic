@@ -49,6 +49,11 @@ try {
         $env:ODCLINIC_DB_URL = 'mysql://root:' + [uri]::EscapeDataString($password) + '@localhost:3306/demo'
     }
 
+    # This harness exists to exercise OD-owned writes against an untouched
+    # schema, so it explicitly opts into them. The application itself still
+    # fails closed (WritePolicy::DenyOdWrites) unless an operator opts in.
+    $env:ODCLINIC_ALLOW_OD_WRITES = '1'
+
     $manifest = Join-Path $PSScriptRoot '..\Cargo.toml'
     $previousPreference = $ErrorActionPreference
     try {
