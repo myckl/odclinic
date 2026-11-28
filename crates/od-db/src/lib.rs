@@ -180,8 +180,24 @@ pub trait Store: Send + Sync {
     /// OD `disease` rows joined to `diseasedef` for the condition name, surfaced
     /// on the patient registry's clinical record.
     fn list_diseases(&self, pat_num: Id) -> Result<Vec<Disease>, String>;
+    /// OD `diseasedef` rows offered when adding a registry condition. Optional
+    /// backends without the table return an empty list.
+    fn list_disease_defs(&self) -> Result<Vec<DiseaseDef>, String> {
+        Ok(Vec::new())
+    }
     /// OD `patientnote` free-text medical/treatment history.
     fn get_patient_note(&self, pat_num: Id) -> Result<Option<PatientNote>, String>;
+    /// Write the four chart-owned note fields of one patient's own `patientnote`
+    /// row. `FamFinancial` and the other OD-owned columns are never changed by
+    /// this port. Writes require the explicit OD-write opt-in.
+    fn upsert_patient_note(&self, _note: &PatientNote) -> Result<(), String> {
+        Err("Patient note writes are not supported by this store".into())
+    }
+    /// Insert or update one OD `disease` row. `disease_num = 0` inserts. The
+    /// caller supplies a `diseasedef` key from `list_disease_defs`.
+    fn upsert_disease(&self, _disease: &Disease) -> Result<Id, String> {
+        Err("Condition writes are not supported by this store".into())
+    }
     /// Existing treatments from OD `procedurelog`.
     fn list_registry_treatments(&self, pat_num: Id) -> Result<Vec<RegistryTreatment>, String>;
     /// Port-local clinic cards. Issuing one never writes a statement, payment
@@ -687,10 +703,28 @@ impl Store for Backend {
             Backend::MySql(s) => s.list_diseases(pat_num),
         }
     }
+    fn list_disease_defs(&self) -> Result<Vec<DiseaseDef>, String> {
+        match self {
+            Backend::Demo(s) => s.list_disease_defs(),
+            Backend::MySql(s) => s.list_disease_defs(),
+        }
+    }
+    fn upsert_disease(&self, disease: &Disease) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.upsert_disease(disease),
+            Backend::MySql(s) => s.upsert_disease(disease),
+        }
+    }
     fn get_patient_note(&self, pat_num: Id) -> Result<Option<PatientNote>, String> {
         match self {
             Backend::Demo(s) => s.get_patient_note(pat_num),
             Backend::MySql(s) => s.get_patient_note(pat_num),
+        }
+    }
+    fn upsert_patient_note(&self, note: &PatientNote) -> Result<(), String> {
+        match self {
+            Backend::Demo(s) => s.upsert_patient_note(note),
+            Backend::MySql(s) => s.upsert_patient_note(note),
         }
     }
     fn list_registry_treatments(&self, pat_num: Id) -> Result<Vec<RegistryTreatment>, String> {

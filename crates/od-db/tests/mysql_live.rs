@@ -54,10 +54,11 @@ use od_domain::reports::{
 };
 use od_domain::{
     Account, Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
-    CommLog, CommLogDirection, CommLogMode, DiscountPlan, DiscountPlanSub, Gender, JournalEntry,
-    LabCase, LabCaseStage, Patient, PatientCorrection, PayPlan, PayPlanCharge, PayPlanChargeType,
-    Payment, PaymentAllocation, PaymentTarget, PaySplit, Pref, Procedure, ProcedureStatus, ProcNote,
-    Recall, RecallPriority, Statement, SupplyDispense, TreatPlan, TreatPlanLine, TreatPlanStatus,
+    CommLog, CommLogDirection, CommLogMode, Disease, DiscountPlan, DiscountPlanSub, Gender,
+    JournalEntry, LabCase, LabCaseStage, Patient, PatientCorrection, PatientNote, PayPlan,
+    PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Pref,
+    Procedure, ProcedureStatus, ProcNote, ProblemStatus, Recall, RecallPriority, Statement,
+    SupplyDispense, TreatPlan, TreatPlanLine, TreatPlanStatus,
 };
 
 fn live_db_pool(url: &str) -> mysql::Pool {
@@ -5991,40 +5992,367 @@ fn mysql_wave2_proc_note_append_is_gated_and_od_shaped() {
     println!("live procnote gate/write passed and fixture was removed");
 }
 
-/// Wave 2 gate: in strict mode the local call-log side table is not created.
-/// Reads degrade to empty and writes fail closed with a bootstrap hint.
+/// Wave 2 gate: strict startup never creates the port-local call-log table.
+/// On a schema where the table is genuinely absent, reads degrade to empty and
+/// writes fail closed with a bootstrap hint. A prior opt-in bootstrap may
+/// already have created the side table; in that case exercise a temporary
+/// round-trip instead and clean it up, so the suite stays green on a shared
+/// demo database without ever dropping someone else's call history.
 #[test]
-#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; read-only on a strict schema"]
-fn mysql_wave2_call_log_is_absent_in_strict_mode() {
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes temporary port-local fixtures when bootstrapped"]
+fn mysql_wave2_call_log_respects_bootstrap_state() {
     let url = live_url();
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+    let schema_before = schema_snapshot(&mut conn);
     let store = MySqlStore::with_mode(&url, SchemaMode::Strict)
         .expect("strict startup rejected a genuine OD 24_3 schema");
-    let logs = store
-        .list_comm_logs()
-        .expect("missing call log table should read as empty");
-    assert!(logs.is_empty(), "strict mode should not expose a call log");
+    let schema_after = schema_snapshot(&mut conn);
+    assert_eq!(
+        schema_before, schema_after,
+        "strict startup mutated the OD schema"
+    );
 
+    let bootstrapped = table_present(&mut conn, "odclinic_appointment_call_log");
     let pat_num: u32 = {
-        let pool = live_db_pool(&url);
-        let mut conn = pool.get_conn().expect("MySQL connect failed");
         let first: i64 = conn
             .query_first("SELECT MIN(PatNum) FROM patient")
             .expect("could not read patients")
             .expect("no patient rows in the demo database");
         first as u32
     };
-    let error = store
+
+    if !bootstrapped {
+        let logs = store
+            .list_comm_logs()
+            .expect("missing call log table should read as empty");
+        assert!(logs.is_empty(), "strict mode should not expose a call log");
+        let error = store
+            .upsert_comm_log(&CommLog {
+                pat_num,
+                mode: CommLogMode::Phone,
+                sent_or_received: CommLogDirection::Received,
+                note: "ODCLINIC_WAVE2_STRICT".into(),
+                ..Default::default()
+            })
+            .expect_err("call log write succeeded without a side table");
+        assert!(
+            error.contains("bootstrap"),
+            "unexpected missing-table error: {error}"
+        );
+        println!("live call-log absence behaviour passed without changing the schema");
+        return;
+    }
+
+    let marker = format!("ODCLINIC_WAVE2_{}", high_fixture_num(46));
+    let nums = store
+        .list_comm_logs()
+        .expect("existing call log table should be readable");
+    assert!(
+        nums.iter().all(|log| log.note != marker),
+        "temporary call log marker collided with an existing row"
+    );
+    let log_num = store
         .upsert_comm_log(&CommLog {
+            apt_num: high_fixture_num(47),
             pat_num,
             mode: CommLogMode::Phone,
             sent_or_received: CommLogDirection::Received,
-            note: "ODCLINIC_WAVE2_STRICT".into(),
+            note: marker.clone(),
             ..Default::default()
         })
-        .expect_err("call log write succeeded without a side table");
-    assert!(
-        error.contains("bootstrap"),
-        "unexpected missing-table error: {error}"
+        .expect("existing call log table should accept a temporary row");
+    let read = store
+        .list_comm_logs()
+        .expect("call log read-back failed")
+        .into_iter()
+        .find(|log| log.comm_log_num == log_num);
+    let cleanup = conn.exec_drop(
+        "DELETE FROM odclinic_appointment_call_log WHERE CallLogNum = ?",
+        (log_num,),
     );
-    println!("live call-log absence behaviour passed without changing the schema");
+    assert!(cleanup.is_ok(), "temporary call log fixture was not removed");
+    let read = read.expect("temporary call log missing on read-back");
+    assert_eq!(read.pat_num, pat_num);
+    assert_eq!(read.note, marker);
+    println!("live call-log round trip passed on the existing bootstrap table and was cleaned up");
+}
+
+/// Wave 3 gate: OD `patientnote` and `disease` writes obey the default deny
+/// gate. When writes are allowed, the note update touches only the four
+/// chart-owned fields and each condition stays attached to one patient. All
+/// fixtures are restored before assertions, including a temporary `diseasedef`
+/// used only when the demo schema has no problem definitions.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes and restores temporary fixtures"]
+fn mysql_wave3_clinical_record_edit_is_gated_and_od_shaped() {
+    let url = live_url();
+    let deny_store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::DenyOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let pat_num: u32 = {
+        let first: i64 = conn
+            .query_first("SELECT MIN(PatNum) FROM patient")
+            .expect("could not read patients")
+            .expect("no patient rows in the demo database");
+        first as u32
+    };
+    let existing_def: Option<i64> = conn
+        .query_first("SELECT DiseaseDefNum FROM diseasedef ORDER BY DiseaseDefNum LIMIT 1")
+        .expect("could not read disease definitions");
+    let (def_num, created_def) = match existing_def {
+        Some(num) => (num as u32, false),
+        None => {
+            let num = high_fixture_num(43);
+            conn.exec_drop(
+                "INSERT INTO diseasedef \
+                 (DiseaseDefNum,DiseaseName,ItemOrder,IsHidden,ICD9Code,SnomedCode,Icd10Code) \
+                 VALUES (?,?,?,?,?,?,?)",
+                (
+                    num,
+                    "ODCLINIC_WAVE3",
+                    0i32,
+                    0i32,
+                    "",
+                    "",
+                    "",
+                ),
+            )
+            .expect("temporary disease definition insert failed");
+            (num, true)
+        }
+    };
+    let defs = store
+        .list_disease_defs()
+        .expect("diseasedef list read failed");
+    assert!(
+        defs.iter().any(|def| def.disease_def_num == def_num),
+        "condition picker did not see the OD diseasedef row"
+    );
+
+    let deny_marker = format!("ODCLINIC_WAVE3_DENY_{}", high_fixture_num(44));
+    let deny_note = PatientNote {
+        pat_num,
+        medical: deny_marker.clone(),
+        ..Default::default()
+    };
+    let denied = deny_store
+        .upsert_patient_note(&deny_note)
+        .expect_err("patientnote write succeeded while DenyOdWrites was active");
+    assert!(
+        denied.contains("OD writes are disabled"),
+        "unexpected note gate error: {denied}"
+    );
+    let deny_disease = Disease {
+        pat_num,
+        disease_def_num: def_num,
+        note: deny_marker.clone(),
+        date_start: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        ..Default::default()
+    };
+    let denied = deny_store
+        .upsert_disease(&deny_disease)
+        .expect_err("disease write succeeded while DenyOdWrites was active");
+    assert!(
+        denied.contains("OD writes are disabled"),
+        "unexpected condition gate error: {denied}"
+    );
+    let denied_notes: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM patientnote WHERE PatNum = ? AND Medical = ?",
+            (pat_num, &deny_marker),
+        )
+        .expect("could not verify denied note left no row");
+    let denied_conditions: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM disease WHERE PatNote = ?",
+            (&deny_marker,),
+        )
+        .expect("could not verify denied condition left no row");
+    assert_eq!(denied_notes.unwrap_or(0), 0);
+    assert_eq!(denied_conditions.unwrap_or(0), 0);
+
+    type NoteBackup = (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let original: Option<NoteBackup> = conn
+        .exec_first(
+            "SELECT Medical,Treatment,Service,MedicalComp,FamFinancial \
+             FROM patientnote WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .expect("could not back up the patient's OD chart note");
+    let had_note = original.is_some();
+    let (orig_medical, orig_treatment, orig_service, orig_company, orig_fam) =
+        original.clone().unwrap_or_default();
+
+    let stamp = high_fixture_num(45);
+    let medical = format!("ODCLINIC_WAVE3_MED_{stamp}");
+    let treatment = format!("ODCLINIC_WAVE3_TREAT_{stamp}");
+    let service = format!("ODCLINIC_WAVE3_SERVICE_{stamp}");
+    let company = format!("ODCLINIC_WAVE3_HISTORY_{stamp}");
+    let note = PatientNote {
+        pat_num,
+        medical: medical.clone(),
+        treatment: treatment.clone(),
+        service: service.clone(),
+        medical_company: company.clone(),
+        // This field belongs to OD's family note. A write that changed it would
+        // break the port's one-patient-per-chart rule.
+        fam_financial: "SHOULD NOT CHANGE".into(),
+    };
+    store
+        .upsert_patient_note(&note)
+        .expect("patientnote write failed under AllowOdWrites");
+    let note_read = store
+        .get_patient_note(pat_num)
+        .expect("patientnote read-back failed")
+        .expect("written patientnote missing");
+    let db_note: Option<NoteBackup> = conn
+        .exec_first(
+            "SELECT Medical,Treatment,Service,MedicalComp,FamFinancial \
+             FROM patientnote WHERE PatNum = ?",
+            (pat_num,),
+        )
+        .expect("direct patientnote read-back failed");
+
+    let disease_num = high_fixture_num(42);
+    conn.exec_drop("DELETE FROM disease WHERE DiseaseNum = ?", (disease_num,))
+        .expect("could not clean old disease fixture");
+    let condition = Disease {
+        pat_num,
+        disease_def_num: def_num,
+        note: format!("ODCLINIC_WAVE3_{stamp}"),
+        status: ProblemStatus::Active,
+        date_start: NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+        ..Default::default()
+    };
+    let saved_num = store
+        .upsert_disease(&condition)
+        .expect("disease insert failed under AllowOdWrites");
+    assert!(saved_num > 0, "disease insert returned no primary key");
+    let stored = store
+        .list_diseases(pat_num)
+        .expect("disease read-back failed")
+        .into_iter()
+        .find(|d| d.disease_num == saved_num)
+        .expect("inserted condition missing from store read");
+    assert_eq!(stored.disease_def_num, def_num);
+    assert_eq!(stored.status, ProblemStatus::Active);
+
+    let resolved_note = format!("ODCLINIC_WAVE3_RESOLVED_{stamp}");
+    let mut edited = stored.clone();
+    edited.status = ProblemStatus::Resolved;
+    edited.note = resolved_note.clone();
+    edited.date_stop = Some(NaiveDate::from_ymd_opt(2026, 2, 3).unwrap());
+    store
+        .upsert_disease(&edited)
+        .expect("disease update failed under AllowOdWrites");
+    let edited_read = store
+        .list_diseases(pat_num)
+        .expect("disease update read-back failed")
+        .into_iter()
+        .find(|d| d.disease_num == saved_num)
+        .expect("updated condition missing from store read");
+    let db_condition: Option<(i64, i64, Option<String>, i8, String, String)> = conn
+        .exec_first(
+            "SELECT PatNum,DiseaseDefNum,PatNote,ProbStatus, \
+             CAST(DateStart AS CHAR),CAST(DateStop AS CHAR) \
+             FROM disease WHERE DiseaseNum = ?",
+            (saved_num,),
+        )
+        .expect("direct disease read-back failed");
+
+    // MyISAM ignores ROLLBACK, so restore every fixture before assertions.
+    let condition_cleanup = conn.exec_drop("DELETE FROM disease WHERE DiseaseNum = ?", (saved_num,));
+    let note_cleanup = if had_note {
+        conn.exec_drop(
+            "UPDATE patientnote SET Medical = ?, Treatment = ?, Service = ?, \
+             MedicalComp = ?, FamFinancial = ? WHERE PatNum = ?",
+            (
+                orig_medical.clone(),
+                orig_treatment.clone(),
+                orig_service.clone(),
+                orig_company.clone(),
+                orig_fam.clone(),
+                pat_num,
+            ),
+        )
+    } else {
+        conn.exec_drop("DELETE FROM patientnote WHERE PatNum = ?", (pat_num,))
+    };
+    let def_cleanup = if created_def {
+        conn.exec_drop("DELETE FROM diseasedef WHERE DiseaseDefNum = ?", (def_num,))
+    } else {
+        Ok(())
+    };
+    assert!(condition_cleanup.is_ok(), "disease fixture was not removed");
+    assert!(note_cleanup.is_ok(), "patientnote fixture was not restored");
+    assert!(def_cleanup.is_ok(), "temporary diseasedef was not removed");
+
+    assert_eq!(note_read.medical, medical);
+    assert_eq!(note_read.treatment, treatment);
+    assert_eq!(note_read.service, service);
+    assert_eq!(note_read.medical_company, company);
+    assert_eq!(note_read.fam_financial, orig_fam.clone().unwrap_or_default());
+    let db_note = db_note.expect("written patientnote missing on direct read-back");
+    assert_eq!(db_note.0.as_deref(), Some(medical.as_str()));
+    assert_eq!(db_note.1.as_deref(), Some(treatment.as_str()));
+    assert_eq!(db_note.2.as_deref(), Some(service.as_str()));
+    assert_eq!(db_note.3.as_deref(), Some(company.as_str()));
+    if had_note {
+        assert_eq!(db_note.4, orig_fam, "OD family note was changed by a chart edit");
+    } else {
+        assert_eq!(db_note.4.as_deref(), Some(""));
+    }
+
+    assert_eq!(edited_read.status, ProblemStatus::Resolved);
+    assert_eq!(edited_read.note, resolved_note);
+    assert_eq!(
+        edited_read.date_stop,
+        Some(NaiveDate::from_ymd_opt(2026, 2, 3).unwrap())
+    );
+    let (db_pat, db_def, db_condition_note, db_status, db_start, db_stop) =
+        db_condition.expect("inserted condition missing on direct read-back");
+    assert_eq!(db_pat as u32, pat_num);
+    assert_eq!(db_def as u32, def_num);
+    assert_eq!(db_condition_note.as_deref(), Some(resolved_note.as_str()));
+    assert_eq!(db_status, ProblemStatus::Resolved.as_od());
+    assert_eq!(db_start, "2026-01-02");
+    assert_eq!(db_stop, "2026-02-03");
+    println!("live clinical record gate/write passed and fixtures were restored");
+}
+
+/// Wave 3 gate: Chart's prescription list is a plain OD `rxpat` read. It must
+/// neither write rows nor depend on the OD-write opt-in.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; read-only"]
+fn mysql_wave3_prescription_list_is_read_only() {
+    let url = live_url();
+    let store = MySqlStore::with_mode(&url, SchemaMode::Strict)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+    let before: i64 = conn
+        .query_first("SELECT COUNT(*) FROM rxpat")
+        .expect("could not count rxpat rows")
+        .unwrap_or(0);
+    let rows = store
+        .list_prescriptions()
+        .expect("Chart prescription list failed against OD rxpat");
+    let after: i64 = conn
+        .query_first("SELECT COUNT(*) FROM rxpat")
+        .expect("could not re-count rxpat rows")
+        .unwrap_or(0);
+    assert_eq!(rows.len() as i64, before, "Chart prescription list dropped rows");
+    assert_eq!(after, before, "reading prescriptions wrote to OD rxpat");
+    println!("live prescription list passed without changing rxpat");
 }

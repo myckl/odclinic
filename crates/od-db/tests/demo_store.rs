@@ -1374,3 +1374,69 @@ fn demo_store_wave2_call_log_and_proc_note_round_trip() {
         "seeded completion timestamp should feed the 72-hour rule"
     );
 }
+
+#[test]
+fn demo_store_edits_patient_note_without_touching_fam_financial() {
+    let store = Backend::Demo(seeded());
+    let defs = store.list_disease_defs().unwrap();
+    assert!(defs.iter().any(|def| def.disease_name == "Hypertension"));
+
+    let original = store.get_patient_note(1).unwrap().unwrap();
+    assert_eq!(original.fam_financial, "Self-pay");
+    let mut updated = original.clone();
+    updated.medical = "Updated medical summary".into();
+    updated.medical_company = "Asthma".into();
+    updated.fam_financial = "SHOULD NOT CHANGE".into();
+    store.upsert_patient_note(&updated).unwrap();
+
+    let reread = store.get_patient_note(1).unwrap().unwrap();
+    assert_eq!(reread.medical, "Updated medical summary");
+    assert_eq!(reread.medical_company, "Asthma");
+    assert_eq!(reread.fam_financial, "Self-pay");
+
+    store
+        .upsert_patient_note(&PatientNote {
+            pat_num: 4,
+            medical: "New patient history".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let new = store.get_patient_note(4).unwrap().unwrap();
+    assert_eq!(new.medical, "New patient history");
+    assert!(new.fam_financial.is_empty());
+}
+
+#[test]
+fn demo_store_adds_and_updates_disease_rows() {
+    let store = Backend::Demo(seeded());
+    let def_num = store.list_disease_defs().unwrap()[0].disease_def_num;
+    let num = store
+        .upsert_disease(&Disease {
+            pat_num: 2,
+            disease_def_num: def_num,
+            status: ProblemStatus::Active,
+            date_start: NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
+            ..Default::default()
+        })
+        .unwrap();
+    let rows = store.list_diseases(2).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].disease_num, num);
+
+    let mut edit = rows[0].clone();
+    edit.status = ProblemStatus::Resolved;
+    edit.note = "Resolved after review".into();
+    edit.date_stop = Some(NaiveDate::from_ymd_opt(2026, 2, 3).unwrap());
+    store.upsert_disease(&edit).unwrap();
+    let rows = store.list_diseases(2).unwrap();
+    assert_eq!(rows.len(), 1, "update must not add a second condition");
+    assert_eq!(rows[0].status, ProblemStatus::Resolved);
+    assert_eq!(rows[0].note, "Resolved after review");
+
+    assert!(store
+        .upsert_disease(&Disease {
+            pat_num: 2,
+            ..Default::default()
+        })
+        .is_err());
+}

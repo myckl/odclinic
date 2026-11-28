@@ -2914,6 +2914,180 @@ impl Store for MySqlStore {
         }))
     }
 
+    fn list_disease_defs(&self) -> Result<Vec<DiseaseDef>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "diseasedef")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT DiseaseDefNum,COALESCE(DiseaseName,''),COALESCE(ICD9Code,''), \
+                 COALESCE(Icd10Code,''),COALESCE(IsHidden,0) FROM diseasedef \
+                 ORDER BY DiseaseName,DiseaseDefNum",
+                (),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let (num, name, icd9, icd10, hidden): (
+                    u32,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    i8,
+                ) = from_row(row);
+                DiseaseDef {
+                    disease_def_num: num,
+                    disease_name: s(name),
+                    icd9_code: s(icd9),
+                    icd10_code: s(icd10),
+                    is_hidden: hidden != 0,
+                }
+            })
+            .collect())
+    }
+
+    fn upsert_patient_note(&self, note: &PatientNote) -> Result<(), String> {
+        self.ensure_od_writes_allowed()?;
+        let mut conn = self.conn()?;
+        let found: Option<i64> = conn
+            .exec_first(
+                "SELECT COUNT(*) FROM patientnote WHERE PatNum = ?",
+                (Value::from(note.pat_num),),
+            )
+            .map_err(|e| e.to_string())?;
+        if found.unwrap_or(0) > 0 {
+            // OD's patient note is one-to-one with the chart. Only the four
+            // chart-owned fields are touched; FamFinancial and the family note
+            // semantics are deliberately left alone.
+            conn.exec_drop(
+                "UPDATE patientnote SET Medical = ?, Treatment = ?, Service = ?, \
+                 MedicalComp = ? WHERE PatNum = ?",
+                (
+                    Value::from(note.medical.clone()),
+                    Value::from(note.treatment.clone()),
+                    Value::from(note.service.clone()),
+                    Value::from(note.medical_company.clone()),
+                    Value::from(note.pat_num),
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let mut columns = vec![
+            "PatNum",
+            "FamFinancial",
+            "ApptPhone",
+            "Medical",
+            "Service",
+            "MedicalComp",
+            "Treatment",
+        ];
+        let mut params: Vec<Value> = vec![
+            Value::from(note.pat_num),
+            Value::from(""),
+            Value::from(""),
+            Value::from(note.medical.clone()),
+            Value::from(note.service.clone()),
+            Value::from(note.medical_company.clone()),
+            Value::from(note.treatment.clone()),
+        ];
+        // OD 24_3 added these columns after the original patientnote table.
+        // A reduced demo schema can omit them, so each one is checked before
+        // being included in the INSERT.
+        for (column, value) in [
+            ("ICEName", Value::from("")),
+            ("ICEPhone", Value::from("")),
+            ("OrthoMonthsTreatOverride", Value::from(-1i32)),
+            ("DateOrthoPlacementOverride", Value::from("0001-01-01")),
+            (
+                "SecDateTEntry",
+                Value::from(Local::now().format("%Y-%m-%d %H:%M:%S").to_string()),
+            ),
+            ("Consent", Value::from(0i32)),
+            ("UserNumOrthoLocked", Value::from(0u32)),
+            ("Pronoun", Value::from(0i32)),
+        ] {
+            if column_exists(&mut conn, "patientnote", column)? {
+                columns.push(column);
+                params.push(value);
+            }
+        }
+        let sql = format!(
+            "INSERT INTO patientnote ({}) VALUES ({})",
+            columns.join(","),
+            vec!["?"; columns.len()].join(",")
+        );
+        conn.exec_drop(&sql, params).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn upsert_disease(&self, disease: &Disease) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
+        if disease.disease_def_num == 0 {
+            return Err("Select a condition before saving.".into());
+        }
+        let mut conn = self.conn()?;
+        let start = disease.date_start.format("%Y-%m-%d").to_string();
+        let stop = disease
+            .date_stop
+            .map(|date| date.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "0001-01-01".into());
+        if disease.disease_num != 0 {
+            conn.exec_drop(
+                "UPDATE disease SET DiseaseDefNum = ?, PatNote = ?, ProbStatus = ?, \
+                 DateStart = ?, DateStop = ? WHERE DiseaseNum = ? AND PatNum = ?",
+                (
+                    Value::from(disease.disease_def_num),
+                    Value::from(disease.note.clone()),
+                    Value::from(disease.status.as_od()),
+                    Value::from(start),
+                    Value::from(stop),
+                    Value::from(disease.disease_num),
+                    Value::from(disease.pat_num),
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            if conn.affected_rows() == 0 {
+                return Err(format!("Condition #{} no longer exists.", disease.disease_num));
+            }
+            return Ok(disease.disease_num);
+        }
+        let mut columns = vec![
+            "PatNum",
+            "DiseaseDefNum",
+            "PatNote",
+            "ProbStatus",
+            "DateStart",
+            "DateStop",
+        ];
+        let mut params: Vec<Value> = vec![
+            Value::from(disease.pat_num),
+            Value::from(disease.disease_def_num),
+            Value::from(disease.note.clone()),
+            Value::from(disease.status.as_od()),
+            Value::from(start),
+            Value::from(stop),
+        ];
+        for (column, value) in [
+            ("SnomedProblemType", Value::from("")),
+            ("FunctionStatus", Value::from(0i32)),
+        ] {
+            if column_exists(&mut conn, "disease", column)? {
+                columns.push(column);
+                params.push(value);
+            }
+        }
+        let sql = format!(
+            "INSERT INTO disease ({}) VALUES ({})",
+            columns.join(","),
+            vec!["?"; columns.len()].join(",")
+        );
+        conn.exec_drop(&sql, params).map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_id() as Id)
+    }
+
     fn list_registry_treatments(&self, pat_num: Id) -> Result<Vec<RegistryTreatment>, String> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn

@@ -1941,6 +1941,26 @@ struct OdApp {
     proc_note_pat_num: Id,
     proc_note_text: String,
 
+    // Editable clinical record: OD patientnote and disease rows, plus the
+    // OD diseasedef picker used when adding a condition.
+    disease_defs: Vec<DiseaseDef>,
+    clinical_note_open: bool,
+    clinical_note_pat_num: Id,
+    clinical_note_medical: String,
+    clinical_note_treatment: String,
+    clinical_note_service: String,
+    clinical_note_company: String,
+    condition_open: bool,
+    condition_edit_num: Id,
+    condition_pat_num: Id,
+    condition_def_num: Id,
+    condition_status: ProblemStatus,
+    condition_start_text: String,
+    condition_note: String,
+
+    // OD rxpat rows shown read-only in Chart.
+    prescriptions: Vec<Prescription>,
+
     // Lab cases (Chart) and supplies (Setup) use OD-owned optional tables.
     // Empty lists mean the table is absent, never a startup failure.
     laboratories: Vec<Laboratory>,
@@ -2304,6 +2324,21 @@ impl OdApp {
             proc_note_proc_num: 0,
             proc_note_pat_num: 0,
             proc_note_text: String::new(),
+            disease_defs: Vec::new(),
+            clinical_note_open: false,
+            clinical_note_pat_num: 0,
+            clinical_note_medical: String::new(),
+            clinical_note_treatment: String::new(),
+            clinical_note_service: String::new(),
+            clinical_note_company: String::new(),
+            condition_open: false,
+            condition_edit_num: 0,
+            condition_pat_num: 0,
+            condition_def_num: 0,
+            condition_status: ProblemStatus::Active,
+            condition_start_text: today.format("%Y-%m-%d").to_string(),
+            condition_note: String::new(),
+            prescriptions: Vec::new(),
             laboratories: Vec::new(),
             lab_cases: Vec::new(),
             lab_case_edit: None,
@@ -2485,6 +2520,20 @@ impl OdApp {
         }
         if let Ok(rows) = self.store.list_proc_notes() {
             self.proc_notes = rows;
+        }
+        if self.features.enabled(FeatureKey::ClinicalRecordEdit) {
+            if let Ok(rows) = self.store.list_disease_defs() {
+                self.disease_defs = rows;
+            }
+        } else {
+            self.disease_defs.clear();
+        }
+        if self.features.enabled(FeatureKey::ChartPrescriptions) {
+            if let Ok(rows) = self.store.list_prescriptions() {
+                self.prescriptions = rows;
+            }
+        } else {
+            self.prescriptions.clear();
         }
         // Call logs live in an odclinic_* side table; a missing table simply
         // leaves the board without call history.
@@ -3249,6 +3298,8 @@ impl OdApp {
         self.rule_window(&ctx);
         self.comm_log_window(&ctx);
         self.proc_note_window(&ctx);
+        self.clinical_note_window(&ctx);
+        self.condition_window(&ctx);
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -4196,6 +4247,10 @@ impl OdApp {
         let mut collect_invoice = false;
         let mut error: Option<String> = None;
         let mut notice: Option<String> = None;
+        let mut edit_condition: Option<Disease> = None;
+        let mut edit_note: Option<PatientNote> = None;
+        let can_edit_record = self.features.enabled(FeatureKey::ClinicalRecordEdit)
+            && self.can(Permission::PATIENT_EDIT);
 
         egui::Window::new("Patient registry")
             .open(&mut self.registry_open)
@@ -4271,26 +4326,50 @@ impl OdApp {
                         ));
                     }
                     RegistryTab::Clinical => {
+                        let conditions = self.registry_conditions.clone();
                         ui.heading("Existing conditions");
                         egui::Grid::new("registry_conditions")
-                            .num_columns(4)
+                            .num_columns(if can_edit_record { 5 } else { 4 })
                             .striped(true)
                             .show(ui, |ui| {
                                 ui.strong("Condition");
                                 ui.strong("Status");
                                 ui.strong("Start");
                                 ui.strong("Note");
+                                if can_edit_record {
+                                    ui.strong("Action");
+                                }
                                 ui.end_row();
-                                for disease in &self.registry_conditions {
+                                for disease in &conditions {
                                     ui.label(&disease.disease_name);
                                     ui.label(disease.status.label());
                                     ui.label(disease.date_start.to_string());
                                     ui.label(&disease.note);
+                                    if can_edit_record && ui.button("Edit").clicked() {
+                                        edit_condition = Some(disease.clone());
+                                    }
                                     ui.end_row();
                                 }
                             });
-                        if self.registry_conditions.is_empty() {
+                        if conditions.is_empty() {
                             ui.label("No conditions recorded (OD disease).");
+                        }
+                        if can_edit_record {
+                            if ui.button("Add condition…").clicked() {
+                                let def_num = self
+                                    .disease_defs
+                                    .first()
+                                    .map(|def| def.disease_def_num)
+                                    .unwrap_or(0);
+                                edit_condition = Some(Disease {
+                                    pat_num,
+                                    disease_def_num: def_num,
+                                    date_start: Local::now().date_naive(),
+                                    ..Default::default()
+                                });
+                            }
+                        } else {
+                            ui.label("Condition editing is off in Settings (or needs Patient Edit permission).");
                         }
                         ui.separator();
                         ui.heading("Existing treatments");
@@ -4318,14 +4397,21 @@ impl OdApp {
                         }
                         ui.separator();
                         ui.heading("Clinical notes");
-                        if let Some(note) = &self.registry_note {
+                        let note = self.registry_note.clone();
+                        if let Some(note) = &note {
                             ui.label(format!("Medical: {}", note.medical));
                             ui.label(format!("Treatment: {}", note.treatment));
                             if !note.service.trim().is_empty() {
                                 ui.label(format!("Service: {}", note.service));
                             }
+                            if !note.medical_company.trim().is_empty() {
+                                ui.label(format!("Medical history: {}", note.medical_company));
+                            }
                         } else {
                             ui.label("No patient note (OD patientnote).");
+                        }
+                        if can_edit_record && ui.button("Edit clinical notes…").clicked() {
+                            edit_note = Some(note.clone().unwrap_or_default());
                         }
                         ui.separator();
                         ui.heading("Procedure notes");
@@ -4540,6 +4626,18 @@ impl OdApp {
         self.registry_invoice_tax_text = tax_text.clone();
         self.registry_invoice_note = invoice_note.clone();
         self.registry_invoice_pdf_path = pdf_path.clone();
+
+        if let Some(disease) = edit_condition {
+            self.open_condition_editor(pat_num, &disease);
+        }
+        if let Some(note) = edit_note {
+            self.clinical_note_pat_num = pat_num;
+            self.clinical_note_medical = note.medical;
+            self.clinical_note_treatment = note.treatment;
+            self.clinical_note_service = note.service;
+            self.clinical_note_company = note.medical_company;
+            self.clinical_note_open = true;
+        }
 
         if issue_card {
             match validate_clinic_card_issue(&auth, ack) {
@@ -6518,6 +6616,49 @@ impl OdApp {
         }
         ui.separator();
         self.lab_cases_ui(ui, num);
+        if self.features.enabled(FeatureKey::ChartPrescriptions) {
+            ui.separator();
+            ui.strong("Prescriptions");
+            let rows: Vec<&Prescription> = self
+                .prescriptions
+                .iter()
+                .filter(|rx| rx.pat_num == num)
+                .collect();
+            egui::Grid::new("chart_prescriptions")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    ui.strong("Date");
+                    ui.strong("Drug");
+                    ui.strong("Directions");
+                    ui.strong("Prescriber");
+                    ui.end_row();
+                    for rx in &rows {
+                        ui.label(rx.rx_date.to_string());
+                        ui.label(&rx.drug);
+                        ui.label(&rx.sig);
+                        ui.label(
+                            self.providers
+                                .iter()
+                                .find(|p| p.provider_num == rx.prov_num)
+                                .map(|p| p.abbreviation.clone())
+                                .unwrap_or_else(|| {
+                                    if rx.prov_num == 0 {
+                                        String::new()
+                                    } else {
+                                        format!("#{}", rx.prov_num)
+                                    }
+                                }),
+                        );
+                        ui.end_row();
+                    }
+                });
+            if rows.is_empty() {
+                ui.label("No prescriptions recorded (OD rxpat). Prescribing stays in Open Dental.");
+            } else {
+                ui.label("Prescriptions are read-only in this port; no e-prescribe messages are sent.");
+            }
+        }
     }
 
     /// Open the new-procedure dialog with OD-like defaults from the selected
@@ -14029,6 +14170,224 @@ impl OdApp {
             }
         }
     }
+
+    /// Pre-fill the condition editor from an existing OD `disease` row, or from
+    /// a blank row when adding a new condition.
+    fn open_condition_editor(&mut self, pat_num: Id, disease: &Disease) {
+        self.condition_edit_num = disease.disease_num;
+        self.condition_pat_num = pat_num;
+        self.condition_def_num = disease.disease_def_num;
+        self.condition_status = disease.status;
+        self.condition_start_text = disease.date_start.format("%Y-%m-%d").to_string();
+        self.condition_note = disease.note.clone();
+        self.condition_open = true;
+    }
+
+    /// Edit the four chart-owned OD `patientnote` fields. `FamFinancial` is
+    /// deliberately not offered: this port never shares a family/guarantor note.
+    fn clinical_note_window(&mut self, ctx: &egui::Context) {
+        if !self.clinical_note_open || !self.features.enabled(FeatureKey::ClinicalRecordEdit) {
+            return;
+        }
+        let pat_num = self.clinical_note_pat_num;
+        let patient = patient_name(&self.patients, pat_num);
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new("Clinical notes — Edit")
+            .open(&mut self.clinical_note_open)
+            .resizable(true)
+            .default_width(480.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{patient} · chart #{pat_num}"));
+                ui.label("Medical summary");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.clinical_note_medical)
+                        .desired_rows(3)
+                        .hint_text("Current medical summary…"),
+                );
+                ui.label("Medical history");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.clinical_note_company)
+                        .desired_rows(3)
+                        .hint_text("Complete medical history…"),
+                );
+                ui.label("Service notes");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.clinical_note_service)
+                        .desired_rows(3)
+                        .hint_text("Service notes…"),
+                );
+                ui.label("Odontogram notes");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.clinical_note_treatment)
+                        .desired_rows(3)
+                        .hint_text("Notes shown below the tooth chart…"),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.button("Save notes").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if cancel {
+            self.clinical_note_open = false;
+        }
+        if save {
+            let mut note = self
+                .store
+                .get_patient_note(pat_num)
+                .unwrap_or_default()
+                .unwrap_or_default();
+            note.pat_num = pat_num;
+            note.medical = self.clinical_note_medical.trim().to_string();
+            note.medical_company = self.clinical_note_company.trim().to_string();
+            note.service = self.clinical_note_service.trim().to_string();
+            note.treatment = self.clinical_note_treatment.trim().to_string();
+            match self.store.upsert_patient_note(&note) {
+                Ok(()) => {
+                    self.clinical_note_open = false;
+                    self.notice = Some("Clinical notes saved".into());
+                    self.error = None;
+                    self.audit_if(
+                        FeatureKey::AuditPatientChanges,
+                        Permission::PATIENT_EDIT,
+                        pat_num,
+                        "Clinical notes edited in registry".into(),
+                    );
+                    self.reload_registry(pat_num);
+                    self.refresh();
+                }
+                Err(err) => self.error = Some(err),
+            }
+        }
+    }
+
+    /// Add or update one OD `disease` row from the registry's conditions list.
+    fn condition_window(&mut self, ctx: &egui::Context) {
+        if !self.condition_open || !self.features.enabled(FeatureKey::ClinicalRecordEdit) {
+            return;
+        }
+        let pat_num = self.condition_pat_num;
+        let editing = self.condition_edit_num != 0;
+        let defs = self.disease_defs.clone();
+        let selected = defs
+            .iter()
+            .find(|def| def.disease_def_num == self.condition_def_num)
+            .map(|def| def.disease_name.clone())
+            .unwrap_or_else(|| "(select)".into());
+        let patient = patient_name(&self.patients, pat_num);
+        let mut save = false;
+        let mut cancel = false;
+        egui::Window::new(if editing {
+            "Condition — Edit"
+        } else {
+            "Condition — New"
+        })
+        .open(&mut self.condition_open)
+        .resizable(true)
+        .default_width(440.0)
+        .show(ctx, |ui| {
+            ui.label(format!("{patient} · chart #{pat_num}"));
+            egui::ComboBox::from_id_salt("registry_condition_def")
+                .selected_text(selected.clone())
+                .show_ui(ui, |ui| {
+                    for def in &defs {
+                        if def.is_hidden {
+                            continue;
+                        }
+                        let label = if def.icd10_code.is_empty() {
+                            def.disease_name.clone()
+                        } else {
+                            format!("{} · {}", def.disease_name, def.icd10_code)
+                        };
+                        ui.selectable_value(
+                            &mut self.condition_def_num,
+                            def.disease_def_num,
+                            label,
+                        );
+                    }
+                });
+            ui.horizontal(|ui| {
+                ui.label("Start  ");
+                ui.text_edit_singleline(&mut self.condition_start_text);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Status");
+                ui.selectable_value(&mut self.condition_status, ProblemStatus::Active, "Active");
+                ui.selectable_value(
+                    &mut self.condition_status,
+                    ProblemStatus::Resolved,
+                    "Resolved",
+                );
+                ui.selectable_value(
+                    &mut self.condition_status,
+                    ProblemStatus::Inactive,
+                    "Inactive",
+                );
+            });
+            ui.add(
+                egui::TextEdit::multiline(&mut self.condition_note)
+                    .desired_rows(3)
+                    .hint_text("Note specific to this patient…"),
+            );
+            ui.horizontal(|ui| {
+                save = ui.button("Save condition").clicked();
+                cancel = ui.button("Cancel").clicked();
+            });
+        });
+        if cancel {
+            self.condition_open = false;
+        }
+        if save {
+            if self.condition_def_num == 0 {
+                self.error = Some("Select a condition before saving.".into());
+                return;
+            }
+            let Ok(start) = NaiveDate::parse_from_str(&self.condition_start_text, "%Y-%m-%d")
+            else {
+                self.error = Some("Start date must be YYYY-MM-DD.".into());
+                return;
+            };
+            let today = Local::now().date_naive();
+            let disease = Disease {
+                disease_num: self.condition_edit_num,
+                pat_num,
+                disease_def_num: self.condition_def_num,
+                disease_name: String::new(),
+                note: self.condition_note.trim().to_string(),
+                status: self.condition_status,
+                date_start: start,
+                date_stop: if self.condition_status == ProblemStatus::Active {
+                    None
+                } else {
+                    Some(today)
+                },
+            };
+            match self.store.upsert_disease(&disease) {
+                Ok(_) => {
+                    self.condition_open = false;
+                    self.notice = Some(if editing {
+                        "Condition updated".into()
+                    } else {
+                        "Condition added".into()
+                    });
+                    self.error = None;
+                    self.audit_if(
+                        FeatureKey::AuditPatientChanges,
+                        Permission::PATIENT_EDIT,
+                        pat_num,
+                        if editing {
+                            "Condition updated in registry".into()
+                        } else {
+                            "Condition added in registry".into()
+                        },
+                    );
+                    self.reload_registry(pat_num);
+                    self.refresh();
+                }
+                Err(err) => self.error = Some(err),
+            }
+        }
+    }
 }
 
 fn patient_name(patients: &[Patient], pat_num: Id) -> String {
@@ -16300,4 +16659,38 @@ fn lab_and_inventory_views_load_from_store_and_toggles_round_trip() {
     let configured = FeatureSettings::from_text("lab_cases=false\ninventory=false\n");
     assert!(!configured.enabled(FeatureKey::LabCasesEnabled));
     assert!(!configured.enabled(FeatureKey::InventoryEnabled));
+}
+
+#[test]
+fn clinical_record_views_load_from_store_and_respect_feature_toggles() {
+    let mut app = OdApp::new();
+    app.selected_patient = Some(1);
+    // Feature settings persist per user, so pin the two switches under test
+    // instead of inheriting whatever the last GUI session left on disk.
+    app.features.set(FeatureKey::ClinicalRecordEdit, true);
+    app.features.set(FeatureKey::ChartPrescriptions, true);
+    app.refresh();
+    assert!(
+        !app.disease_defs.is_empty(),
+        "condition picker should load OD diseasedef rows"
+    );
+    assert!(
+        app.prescriptions.iter().any(|rx| rx.pat_num == 1),
+        "Chart should show the selected patient's OD rxpat rows"
+    );
+
+    let defaults = FeatureSettings::default();
+    assert!(defaults.enabled(FeatureKey::ClinicalRecordEdit));
+    assert!(defaults.enabled(FeatureKey::ChartPrescriptions));
+    let configured = FeatureSettings::from_text(
+        "clinical_record_edit=false\nchart_prescriptions=false\n",
+    );
+    assert!(!configured.enabled(FeatureKey::ClinicalRecordEdit));
+    assert!(!configured.enabled(FeatureKey::ChartPrescriptions));
+
+    app.features.set(FeatureKey::ClinicalRecordEdit, false);
+    app.features.set(FeatureKey::ChartPrescriptions, false);
+    app.refresh();
+    assert!(app.disease_defs.is_empty());
+    assert!(app.prescriptions.is_empty());
 }

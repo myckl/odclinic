@@ -149,6 +149,12 @@ pub enum FeatureKey {
     AppointmentCallLog,
     PatientBadges,
     ClinicalNotes,
+    /// Edit OD `patientnote` fields and add/resolve `disease` rows from the
+    /// patient registry. Writes still require the OD-write opt-in.
+    ClinicalRecordEdit,
+    /// List the patient's OD `rxpat` prescriptions in Chart. Read-only: the
+    /// prescribing workflow stays in Open Dental.
+    ChartPrescriptions,
     ReminderDryRun,
     AuditReminders,
     ShowDefinitions,
@@ -209,7 +215,7 @@ pub enum FeatureKey {
 }
 
 impl FeatureKey {
-    pub const ALL: [Self; 121] = [
+    pub const ALL: [Self; 123] = [
         Self::ModuleAppointments,
         Self::ModuleFamily,
         Self::ModuleAccount,
@@ -274,6 +280,8 @@ impl FeatureKey {
         Self::AppointmentCallLog,
         Self::PatientBadges,
         Self::ClinicalNotes,
+        Self::ClinicalRecordEdit,
+        Self::ChartPrescriptions,
         Self::ReminderDryRun,
         Self::AuditReminders,
         Self::ShowDefinitions,
@@ -399,6 +407,8 @@ impl FeatureKey {
             Self::AppointmentCallLog => "appointment_call_log",
             Self::PatientBadges => "patient_badges",
             Self::ClinicalNotes => "clinical_notes",
+            Self::ClinicalRecordEdit => "clinical_record_edit",
+            Self::ChartPrescriptions => "chart_prescriptions",
             Self::ReminderDryRun => "reminder_dry_run",
             Self::AuditReminders => "audit_reminders",
             Self::ShowDefinitions => "show_definitions",
@@ -525,6 +535,8 @@ impl FeatureKey {
             Self::AppointmentCallLog => "Confirmation and call log",
             Self::PatientBadges => "New-patient and referral badges",
             Self::ClinicalNotes => "Procedure notes in the registry",
+            Self::ClinicalRecordEdit => "Edit clinical notes and conditions",
+            Self::ChartPrescriptions => "Prescriptions in Chart",
             Self::ReminderDryRun => "Reminder dry-run mode",
             Self::AuditReminders => "Audit reminder sends",
             Self::ShowDefinitions => "Definitions in Setup",
@@ -653,6 +665,8 @@ impl FeatureKey {
             Self::AppointmentCallLog => "Record confirmations and phone calls against an appointment in the port-local call log and show the latest entries on the board. Confirmation changes still write OD appointment.Confirmed and require ODCLINIC_ALLOW_OD_WRITES=1 on a configured database.",
             Self::PatientBadges => "Show derived New patient and referral badges in the patient picker, family grid and registry overview. Read-only; no family or guarantor grouping.",
             Self::ClinicalNotes => "Add and read procedure notes in the registry's Clinical tab. OD procnote rows are append-only and OD-owned writes require ODCLINIC_ALLOW_OD_WRITES=1.",
+            Self::ClinicalRecordEdit => "Edit the patient's OD patientnote summary, medical history, service notes and odontogram notes, and add or resolve OD disease problems from the registry's Clinical tab. Each chart is edited on its own; no family or guarantor note is shared. OD writes require ODCLINIC_ALLOW_OD_WRITES=1.",
+            Self::ChartPrescriptions => "Show the patient's OD rxpat prescriptions in Chart. This port lists them read-only; prescribing stays in Open Dental.",
             Self::ReminderDryRun => "Render messages and write them to the outbox with Dry run status, but do not call any transport. On by default so nothing leaves the machine until you configure a channel.",
             Self::AuditReminders => "Write a securitylog entry when reminders are generated or delivered.",
             Self::ShowDefinitions => "Show the OD definition list editor in Setup (adjustment types, payment types, colours and other drop-downs). Requires the OD Definition Edit permission when enforcement is on.",
@@ -810,7 +824,7 @@ impl FeatureKey {
             | Self::ReminderDryRun
             | Self::AuditReminders => "eServices",
             Self::AppointmentCallLog => "Appointments",
-            Self::ClinicalNotes => "Chart",
+            Self::ClinicalNotes | Self::ClinicalRecordEdit | Self::ChartPrescriptions => "Chart",
             Self::PatientBadges | Self::ShowImagingNote | Self::ShowDatabaseLabel => "Display",
             Self::ShowPreferences
             | Self::ShowUsers
@@ -2517,6 +2531,17 @@ pub struct Disease {
     pub status: ProblemStatus,
     pub date_start: NaiveDate,
     pub date_stop: Option<NaiveDate>,
+}
+
+/// A selectable problem definition (OD `diseasedef`). New conditions in the
+/// registry must reference one of these rows, matching OD's `Disease.DiseaseDefNum`.
+#[derive(Clone, Debug, Default)]
+pub struct DiseaseDef {
+    pub disease_def_num: Id,
+    pub disease_name: String,
+    pub icd9_code: String,
+    pub icd10_code: String,
+    pub is_hidden: bool,
 }
 
 /// Free-text clinical notes for a patient (OD `patientnote`). The `medical`

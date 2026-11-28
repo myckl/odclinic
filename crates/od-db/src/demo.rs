@@ -63,6 +63,8 @@ struct Data {
     carriers: Vec<Carrier>,
     /// OD `disease` rows with the `diseasedef` name resolved.
     diseases: Vec<Disease>,
+    /// OD `diseasedef` rows offered when adding a registry condition.
+    disease_defs: Vec<DiseaseDef>,
     /// OD `patientnote` free-text medical/treatment history.
     patient_notes: Vec<PatientNote>,
     /// Port-local clinic cards; issuing one never writes financial rows.
@@ -1061,6 +1063,29 @@ fn seed(today: NaiveDate) -> Data {
             date_stop: Some(NaiveDate::from_ymd_opt(2025, 8, 2).unwrap()),
         },
     ];
+    let disease_defs = vec![
+        DiseaseDef {
+            disease_def_num: 101,
+            disease_name: "Hypertension".into(),
+            icd9_code: "401.9".into(),
+            icd10_code: "I10".into(),
+            is_hidden: false,
+        },
+        DiseaseDef {
+            disease_def_num: 102,
+            disease_name: "Allergic rhinitis".into(),
+            icd9_code: "477.9".into(),
+            icd10_code: "J30.9".into(),
+            is_hidden: false,
+        },
+        DiseaseDef {
+            disease_def_num: 103,
+            disease_name: "Type 2 diabetes mellitus".into(),
+            icd9_code: "250.00".into(),
+            icd10_code: "E11.9".into(),
+            is_hidden: false,
+        },
+    ];
     let patient_notes = vec![PatientNote {
         pat_num: 1,
         medical: "Hypertension; allergic rhinitis".into(),
@@ -1230,6 +1255,7 @@ fn seed(today: NaiveDate) -> Data {
         pay_plan_links,
         carriers,
         diseases,
+        disease_defs,
         patient_notes,
         clinic_cards,
         payments,
@@ -1799,6 +1825,29 @@ impl Store for DemoStore {
             .cloned()
             .collect())
     }
+    fn list_disease_defs(&self) -> Result<Vec<DiseaseDef>, String> {
+        Ok(self.data.lock().unwrap().disease_defs.clone())
+    }
+    fn upsert_disease(&self, disease: &Disease) -> Result<Id, String> {
+        if disease.disease_def_num == 0 {
+            return Err("Select a condition before saving.".into());
+        }
+        let mut data = self.data.lock().unwrap();
+        if disease.disease_num != 0 {
+            match data.diseases.iter_mut().find(|d| {
+                d.disease_num == disease.disease_num && d.pat_num == disease.pat_num
+            }) {
+                Some(row) => *row = disease.clone(),
+                None => return Err(format!("Condition #{} no longer exists.", disease.disease_num)),
+            }
+            return Ok(disease.disease_num);
+        }
+        let num = data.diseases.iter().map(|d| d.disease_num).max().unwrap_or(0) + 1;
+        let mut row = disease.clone();
+        row.disease_num = num;
+        data.diseases.push(row);
+        Ok(num)
+    }
     fn get_patient_note(&self, pat_num: Id) -> Result<Option<PatientNote>, String> {
         Ok(self
             .data
@@ -1808,6 +1857,25 @@ impl Store for DemoStore {
             .iter()
             .find(|note| note.pat_num == pat_num)
             .cloned())
+    }
+    fn upsert_patient_note(&self, note: &PatientNote) -> Result<(), String> {
+        let mut data = self.data.lock().unwrap();
+        match data.patient_notes.iter_mut().find(|n| n.pat_num == note.pat_num) {
+            Some(row) => {
+                row.medical = note.medical.clone();
+                row.treatment = note.treatment.clone();
+                row.service = note.service.clone();
+                row.medical_company = note.medical_company.clone();
+                // FamFinancial belongs to OD's family/guarantor note. This port
+                // treats each patient as an individual and never changes it.
+            }
+            None => {
+                let mut row = note.clone();
+                row.fam_financial.clear();
+                data.patient_notes.push(row);
+            }
+        }
+        Ok(())
     }
     fn list_registry_treatments(&self, pat_num: Id) -> Result<Vec<RegistryTreatment>, String> {
         Ok(self
