@@ -187,6 +187,36 @@ pub trait Store: Send + Sync {
     /// Writes an OD `statement` row. `DateSent` is set when the statement is
     /// generated, leaving a dated record for the patient's account history.
     fn insert_statement(&self, statement: &Statement) -> Result<Id, String>;
+    /// OD laboratories, for the lab-case picker. Backends without the optional
+    /// `laboratory` table return an empty list.
+    fn list_laboratories(&self) -> Result<Vec<Laboratory>, String> {
+        Ok(Vec::new())
+    }
+    /// OD `labcase` rows for one patient. Backends without the optional table
+    /// return an empty list rather than failing the whole application startup.
+    fn list_lab_cases(&self, _pat_num: Id) -> Result<Vec<LabCase>, String> {
+        Ok(Vec::new())
+    }
+    /// Insert or update an OD `labcase` row. A `lab_case_num` of 0 inserts.
+    /// The dated created/sent/received/checked columns are written as supplied.
+    fn upsert_lab_case(&self, case: &LabCase) -> Result<Id, String>;
+
+    /// OD suppliers, for the supply list. Optional table.
+    fn list_suppliers(&self) -> Result<Vec<Supplier>, String> {
+        Ok(Vec::new())
+    }
+    /// OD `supply` rows. Optional table; an absent table yields an empty list.
+    fn list_supplies(&self) -> Result<Vec<Supply>, String> {
+        Ok(Vec::new())
+    }
+    /// Recent OD `dispsupply` movements for one supply item, newest first.
+    fn list_supply_dispenses(&self, _supply_num: Id) -> Result<Vec<SupplyDispense>, String> {
+        Ok(Vec::new())
+    }
+    /// Record one OD `dispsupply` movement. Supply stock levels are not
+    /// recalculated from it, matching OD's deprecated `LevelOnHand` semantics.
+    fn record_supply_dispense(&self, dispense: &SupplyDispense) -> Result<Id, String>;
+
     fn list_pay_plans(&self, pat_num: Id) -> Result<Vec<PayPlan>, String>;
     fn list_pay_plan_charges(&self, pat_num: Id) -> Result<Vec<PayPlanCharge>, String>;
     fn upsert_pay_plan(&self, plan: &PayPlan) -> Result<Id, String>;
@@ -696,6 +726,48 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.insert_statement(statement),
             Backend::MySql(s) => s.insert_statement(statement),
+        }
+    }
+    fn list_laboratories(&self) -> Result<Vec<Laboratory>, String> {
+        match self {
+            Backend::Demo(s) => s.list_laboratories(),
+            Backend::MySql(s) => s.list_laboratories(),
+        }
+    }
+    fn list_lab_cases(&self, pat_num: Id) -> Result<Vec<LabCase>, String> {
+        match self {
+            Backend::Demo(s) => s.list_lab_cases(pat_num),
+            Backend::MySql(s) => s.list_lab_cases(pat_num),
+        }
+    }
+    fn upsert_lab_case(&self, case: &LabCase) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.upsert_lab_case(case),
+            Backend::MySql(s) => s.upsert_lab_case(case),
+        }
+    }
+    fn list_suppliers(&self) -> Result<Vec<Supplier>, String> {
+        match self {
+            Backend::Demo(s) => s.list_suppliers(),
+            Backend::MySql(s) => s.list_suppliers(),
+        }
+    }
+    fn list_supplies(&self) -> Result<Vec<Supply>, String> {
+        match self {
+            Backend::Demo(s) => s.list_supplies(),
+            Backend::MySql(s) => s.list_supplies(),
+        }
+    }
+    fn list_supply_dispenses(&self, supply_num: Id) -> Result<Vec<SupplyDispense>, String> {
+        match self {
+            Backend::Demo(s) => s.list_supply_dispenses(supply_num),
+            Backend::MySql(s) => s.list_supply_dispenses(supply_num),
+        }
+    }
+    fn record_supply_dispense(&self, dispense: &SupplyDispense) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.record_supply_dispense(dispense),
+            Backend::MySql(s) => s.record_supply_dispense(dispense),
         }
     }
     fn upsert_adjustment(&self, adjustment: &Adjustment) -> Result<Id, String> {

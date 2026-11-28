@@ -761,7 +761,7 @@ fn demo_store_records_one_payment_with_multiple_splits() {
         },
         PaymentAllocation { unearned_type: 0, 
             target: PaymentTarget::PayPlan(1),
-            pat_num: 2,
+            pat_num: 1,
             provider_num: 3,
             amount: 50.0,
         
@@ -790,7 +790,7 @@ fn demo_store_records_one_payment_with_multiple_splits() {
     assert_eq!(proc.split_amount, 60.0);
     assert_eq!(proc.pay_plan_num, 0);
     let plan = splits.iter().find(|s| s.pay_plan_num == 1).unwrap();
-    assert_eq!(plan.pat_num, 2);
+    assert_eq!(plan.pat_num, 1);
     assert_eq!(plan.provider_num, 3);
     assert_eq!(plan.split_amount, 50.0);
     let unallocated = splits
@@ -811,6 +811,20 @@ fn demo_store_records_one_payment_with_multiple_splits() {
         }],
     );
     assert!(bad.is_err());
+    assert_eq!(split_count(), before + 3);
+
+    // Family/guarantor grouping is unsupported: a split for another patient
+    // is rejected before anything is written.
+    let cross_patient = store.record_payment_splits(
+        &payment,
+        &[PaymentAllocation {
+            target: PaymentTarget::Unallocated,
+            pat_num: 2,
+            amount: 150.0,
+            ..Default::default()
+        }],
+    );
+    assert!(cross_patient.is_err());
     assert_eq!(split_count(), before + 3);
 }
 
@@ -1175,4 +1189,120 @@ fn demo_store_posts_a_balanced_adjustment_journal() {
     assert!(balance_sheet.rows.iter().any(|r| r[0] == "Total Expenses"));
 
     assert!(store.post_journal_transaction(&[]).is_err());
+}
+
+#[test]
+fn demo_store_lab_case_round_trip_and_stage_derivation() {
+    let store = seeded();
+    assert_eq!(store.list_laboratories().unwrap().len(), 2);
+    let before = store.list_lab_cases(1).unwrap().len();
+    assert_eq!(store.list_lab_cases(2).unwrap().len(), 0);
+
+    let mut case = LabCase {
+        pat_num: 1,
+        laboratory_num: 2,
+        apt_num: 3,
+        prov_num: 1,
+        date_time_due: Some(at(2026, 12, 1, 9, 0)),
+        date_time_created: Some(at(2026, 11, 28, 10, 0)),
+        lab_fee: 87.5,
+        instructions: "Check margins".into(),
+        ..Default::default()
+    };
+    assert_eq!(case.stage(), LabCaseStage::Created);
+    let num = store.upsert_lab_case(&case).unwrap();
+    case.lab_case_num = num;
+    case.date_time_sent = Some(at(2026, 11, 28, 12, 0));
+    assert_eq!(store.upsert_lab_case(&case).unwrap(), num);
+
+    let cases = store.list_lab_cases(1).unwrap();
+    assert_eq!(cases.len(), before + 1);
+    let stored = cases.iter().find(|c| c.lab_case_num == num).unwrap();
+    assert_eq!(stored.laboratory_num, 2);
+    assert_eq!(stored.apt_num, 3);
+    assert_eq!(stored.lab_fee, 87.5);
+    assert_eq!(stored.instructions, "Check margins");
+    assert_eq!(stored.stage(), LabCaseStage::Sent);
+    assert_eq!(store.list_lab_cases(2).unwrap().len(), 0);
+}
+
+#[test]
+fn demo_store_supply_dispense_round_trip_does_not_recalculate_on_hand() {
+    let store = seeded();
+    assert_eq!(store.list_suppliers().unwrap().len(), 2);
+    let supplies = store.list_supplies().unwrap();
+    assert_eq!(supplies.len(), 2);
+    let supply = &supplies[0];
+    let before = store.list_supply_dispenses(supply.supply_num).unwrap().len();
+
+    let num = store
+        .record_supply_dispense(&SupplyDispense {
+            supply_num: supply.supply_num,
+            prov_num: 2,
+            date_dispensed: NaiveDate::from_ymd_opt(2026, 11, 28).unwrap(),
+            disp_quantity: 3.0,
+            note: "Chairside use".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let rows = store.list_supply_dispenses(supply.supply_num).unwrap();
+    assert_eq!(rows.len(), before + 1);
+    let stored = rows.iter().find(|r| r.disp_supply_num == num).unwrap();
+    assert_eq!(stored.prov_num, 2);
+    assert_eq!(stored.disp_quantity, 3.0);
+    assert_eq!(stored.note, "Chairside use");
+    assert_eq!(
+        store
+            .list_supplies()
+            .unwrap()
+            .iter()
+            .find(|s| s.supply_num == supply.supply_num)
+            .unwrap()
+            .level_on_hand,
+        supply.level_on_hand,
+        "OD's stored LevelOnHand is displayed, never inferred from movements"
+    );
+    assert!(store.list_supply_dispenses(999).unwrap().is_empty());
+}
+
+#[test]
+fn demo_store_payment_plans_are_patient_only() {
+    let store = seeded();
+    let today = chrono::Local::now().date_naive();
+    let num = store
+        .upsert_pay_plan(&PayPlan {
+            pat_num: 4,
+            guarantor: 9,
+            pay_plan_date: today,
+            ..Default::default()
+        })
+        .unwrap();
+    let plan = store
+        .list_pay_plans(4)
+        .unwrap()
+        .into_iter()
+        .find(|p| p.pay_plan_num == num)
+        .unwrap();
+    assert_eq!(plan.guarantor, 4, "OD Guarantor is forced onto the patient");
+    assert!(store.list_pay_plans(9).unwrap().is_empty());
+
+    store
+        .upsert_pay_plan_charge(&PayPlanCharge {
+            pay_plan_num: num,
+            pat_num: 4,
+            guarantor: 9,
+            charge_date: today,
+            principal: 25.0,
+            charge_type: PayPlanChargeType::Debit,
+            ..Default::default()
+        })
+        .unwrap();
+    let charge = store
+        .list_pay_plan_charges(4)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.pay_plan_charge_num != 0)
+        .unwrap();
+    assert_eq!(charge.guarantor, 4);
+    assert!(store.list_pay_plan_charges(9).unwrap().is_empty());
 }

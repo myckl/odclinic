@@ -71,6 +71,13 @@ struct Data {
     claims: Vec<Claim>,
     claim_procs: Vec<ClaimProc>,
     statements: Vec<Statement>,
+    /// OD `labcase` rows and their laboratory names.
+    laboratories: Vec<Laboratory>,
+    lab_cases: Vec<LabCase>,
+    /// OD `supply`, `supplier` and `dispsupply` rows for the inventory view.
+    suppliers: Vec<Supplier>,
+    supplies: Vec<Supply>,
+    supply_dispenses: Vec<SupplyDispense>,
     pay_plans: Vec<PayPlan>,
     pay_plan_charges: Vec<PayPlanCharge>,
     treat_plans: Vec<TreatPlan>,
@@ -1093,6 +1100,85 @@ fn seed(today: NaiveDate) -> Data {
         JournalEntry { journal_entry_num: 4, account_num: 1, date_displayed: jan1 + Duration::days(45), debit_amt: 0.0, credit_amt: 300.0, memo: "Supplies".into(), check_number: "101".into(), transaction_num: 2, ..Default::default() },
     ];
 
+    let laboratories = vec![
+        Laboratory { laboratory_num: 1, description: "Sunrise Dental Lab".into() },
+        Laboratory { laboratory_num: 2, description: "City Ceramics".into() },
+    ];
+    let lab_cases = vec![
+        LabCase {
+            lab_case_num: 1,
+            pat_num: 1,
+            laboratory_num: 1,
+            apt_num: 1,
+            planned_apt_num: 0,
+            date_time_due: Some(at(today + Duration::days(3), 9, 0)),
+            date_time_created: Some(at(today - Duration::days(2), 11, 30)),
+            date_time_sent: Some(at(today - Duration::days(1), 15, 45)),
+            date_time_recd: None,
+            date_time_checked: None,
+            prov_num: 1,
+            instructions: "Crown shade A2; please match adjacent shade.".into(),
+            lab_fee: 145.0,
+            invoice_num: "LAB-2041".into(),
+        },
+        LabCase {
+            lab_case_num: 2,
+            pat_num: 3,
+            laboratory_num: 2,
+            apt_num: 2,
+            planned_apt_num: 0,
+            date_time_due: Some(at(today + Duration::days(5), 8, 30)),
+            date_time_created: Some(at(today - Duration::days(1), 10, 0)),
+            date_time_sent: None,
+            date_time_recd: None,
+            date_time_checked: None,
+            prov_num: 3,
+            instructions: String::new(),
+            lab_fee: 22.0,
+            invoice_num: String::new(),
+        },
+    ];
+    let suppliers = vec![
+        Supplier { supplier_num: 1, name: "Medident Supply".into() },
+        Supplier { supplier_num: 2, name: "Dental Depot".into() },
+    ];
+    let supplies = vec![
+        Supply {
+            supply_num: 1,
+            supplier_num: 1,
+            catalog_number: "GC-110".into(),
+            description: "Composite cartridges, shade A2 (20/box)".into(),
+            category: 28,
+            item_order: 0,
+            level_desired: 4.0,
+            is_hidden: false,
+            price: 78.5,
+            level_on_hand: 2.0,
+            order_qty: 0,
+        },
+        Supply {
+            supply_num: 2,
+            supplier_num: 2,
+            catalog_number: "DD-450".into(),
+            description: "Nitrile gloves, medium (100/box)".into(),
+            category: 28,
+            item_order: 1,
+            level_desired: 10.0,
+            is_hidden: false,
+            price: 12.0,
+            level_on_hand: 8.0,
+            order_qty: 0,
+        },
+    ];
+    let supply_dispenses = vec![SupplyDispense {
+        disp_supply_num: 1,
+        supply_num: 1,
+        prov_num: 1,
+        date_dispensed: today,
+        disp_quantity: 1.0,
+        note: "Used for chairside composite".into(),
+    }];
+
     Data {
         patients,
         appointments,
@@ -1129,6 +1215,11 @@ fn seed(today: NaiveDate) -> Data {
         claims,
         claim_procs,
         statements,
+        laboratories,
+        lab_cases,
+        suppliers,
+        supplies,
+        supply_dispenses,
         pay_plans,
         pay_plan_charges,
         treat_plans,
@@ -1800,6 +1891,81 @@ impl Store for DemoStore {
         data.statements.push(stored);
         Ok(num)
     }
+    fn list_laboratories(&self) -> Result<Vec<Laboratory>, String> {
+        Ok(self.data.lock().unwrap().laboratories.clone())
+    }
+
+    fn list_lab_cases(&self, pat_num: Id) -> Result<Vec<LabCase>, String> {
+        Ok(self
+            .data
+            .lock()
+            .unwrap()
+            .lab_cases
+            .iter()
+            .filter(|case| case.pat_num == pat_num)
+            .cloned()
+            .collect())
+    }
+
+    fn upsert_lab_case(&self, case: &LabCase) -> Result<Id, String> {
+        let mut data = self.data.lock().unwrap();
+        let num = if case.lab_case_num == 0 {
+            data.lab_cases
+                .iter()
+                .map(|c| c.lab_case_num)
+                .max()
+                .unwrap_or(0)
+                + 1
+        } else {
+            case.lab_case_num
+        };
+        let mut stored = case.clone();
+        stored.lab_case_num = num;
+        if let Some(existing) = data.lab_cases.iter_mut().find(|c| c.lab_case_num == num) {
+            *existing = stored;
+        } else {
+            data.lab_cases.push(stored);
+        }
+        Ok(num)
+    }
+
+    fn list_suppliers(&self) -> Result<Vec<Supplier>, String> {
+        Ok(self.data.lock().unwrap().suppliers.clone())
+    }
+
+    fn list_supplies(&self) -> Result<Vec<Supply>, String> {
+        Ok(self.data.lock().unwrap().supplies.clone())
+    }
+
+    fn list_supply_dispenses(&self, supply_num: Id) -> Result<Vec<SupplyDispense>, String> {
+        let mut rows: Vec<SupplyDispense> = self
+            .data
+            .lock()
+            .unwrap()
+            .supply_dispenses
+            .iter()
+            .filter(|d| d.supply_num == supply_num)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.date_dispensed.cmp(&a.date_dispensed));
+        Ok(rows)
+    }
+
+    fn record_supply_dispense(&self, dispense: &SupplyDispense) -> Result<Id, String> {
+        let mut data = self.data.lock().unwrap();
+        let num = data
+            .supply_dispenses
+            .iter()
+            .map(|d| d.disp_supply_num)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let mut stored = dispense.clone();
+        stored.disp_supply_num = num;
+        data.supply_dispenses.push(stored);
+        Ok(num)
+    }
+
     fn list_pay_plans(&self, pat_num: Id) -> Result<Vec<PayPlan>, String> {
         Ok(self
             .data
@@ -1807,7 +1973,7 @@ impl Store for DemoStore {
             .unwrap()
             .pay_plans
             .iter()
-            .filter(|p| p.pat_num == pat_num || p.guarantor == pat_num)
+            .filter(|p| p.pat_num == pat_num)
             .cloned()
             .collect())
     }
@@ -1818,7 +1984,7 @@ impl Store for DemoStore {
             .unwrap()
             .pay_plans
             .iter()
-            .filter(|p| p.pat_num == pat_num || p.guarantor == pat_num)
+            .filter(|p| p.pat_num == pat_num)
             .map(|p| p.pay_plan_num)
             .collect();
         Ok(self
@@ -1840,6 +2006,9 @@ impl Store for DemoStore {
         };
         let mut stored = plan.clone();
         stored.pay_plan_num = num;
+        // OD's Guarantor is a family-billing column. This port treats each
+        // patient individually, so every plan's guarantor stays its patient.
+        stored.guarantor = stored.pat_num;
         if let Some(existing) = data.pay_plans.iter_mut().find(|p| p.pay_plan_num == num) {
             *existing = stored;
         } else {
@@ -1861,6 +2030,7 @@ impl Store for DemoStore {
         };
         let mut stored = charge.clone();
         stored.pay_plan_charge_num = num;
+        stored.guarantor = stored.pat_num;
         if let Some(existing) = data
             .pay_plan_charges
             .iter_mut()

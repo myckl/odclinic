@@ -232,6 +232,20 @@ pub(crate) fn column_exists(
     Ok(found.unwrap_or(0) > 0)
 }
 
+/// True when an optional OD table is present. Lab-case and inventory tables are
+/// not part of `OD_TABLES`, so a reduced demo schema can omit them without
+/// failing strict startup; their views simply stay empty.
+fn table_exists(conn: &mut PooledConn, table: &str) -> Result<bool, String> {
+    let found: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            (table,),
+        )
+        .map_err(|e| format!("could not inspect table {table}: {e}"))?;
+    Ok(found.unwrap_or(0) > 0)
+}
+
 fn verify_schema(conn: &mut PooledConn) -> Result<(), String> {
     let mut missing_tables = Vec::new();
     for table in OD_TABLES {
@@ -562,6 +576,16 @@ fn datetime(value: Option<String>) -> Option<NaiveDateTime> {
             .or_else(|_| NaiveDate::parse_from_str(&s, "%Y-%m-%d").map(|d| d.and_hms_opt(0, 0, 0).unwrap()))
             .ok()
     })
+}
+
+/// OD's zero date/time sentinel for "not set" is `DateTime.MinValue` or an
+/// all-zero MySQL date. Neither should surface as a lab-slip date in the UI.
+fn od_datetime(value: Option<String>) -> Option<NaiveDateTime> {
+    let text = value?;
+    if text.starts_with("0001-01-01") || text.starts_with("0000-00-00") {
+        return None;
+    }
+    datetime(Some(text))
 }
 
 fn s(value: Option<String>) -> String {
@@ -3053,13 +3077,217 @@ impl Store for MySqlStore {
         Ok(conn.last_insert_id() as Id)
     }
 
+    fn list_laboratories(&self) -> Result<Vec<Laboratory>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "laboratory")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT LaboratoryNum,COALESCE(Description,'') FROM laboratory ORDER BY Description",
+                (),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Laboratory {
+                laboratory_num: cell_u32(&row, 0),
+                description: s(cell_text(&row, 1)),
+            })
+            .collect())
+    }
+
+    fn list_lab_cases(&self, pat_num: Id) -> Result<Vec<LabCase>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "labcase")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT LabCaseNum,PatNum,LaboratoryNum,COALESCE(AptNum,0),COALESCE(PlannedAptNum,0), \
+                 CAST(DateTimeDue AS CHAR),CAST(DateTimeCreated AS CHAR),CAST(DateTimeSent AS CHAR), \
+                 CAST(DateTimeRecd AS CHAR),CAST(DateTimeChecked AS CHAR),COALESCE(ProvNum,0), \
+                 COALESCE(Instructions,''),COALESCE(LabFee,0),COALESCE(InvoiceNum,'') \
+                 FROM labcase WHERE PatNum = ? ORDER BY DateTimeDue DESC",
+                (Value::from(pat_num),),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| LabCase {
+                lab_case_num: cell_u32(&row, 0),
+                pat_num: cell_u32(&row, 1),
+                laboratory_num: cell_u32(&row, 2),
+                apt_num: cell_u32(&row, 3),
+                planned_apt_num: cell_u32(&row, 4),
+                date_time_due: od_datetime(cell_text(&row, 5)),
+                date_time_created: od_datetime(cell_text(&row, 6)),
+                date_time_sent: od_datetime(cell_text(&row, 7)),
+                date_time_recd: od_datetime(cell_text(&row, 8)),
+                date_time_checked: od_datetime(cell_text(&row, 9)),
+                prov_num: cell_u32(&row, 10),
+                instructions: s(cell_text(&row, 11)),
+                lab_fee: cell_f64(&row, 12),
+                invoice_num: s(cell_text(&row, 13)),
+            })
+            .collect())
+    }
+
+    fn upsert_lab_case(&self, case: &LabCase) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "labcase")? {
+            return Err("This Open Dental schema has no labcase table.".into());
+        }
+        // mysql_common implements positional Params only for small tuples; a
+        // Vec keeps wide OD rows readable and still binds every value.
+        let values: Vec<Value> = vec![
+            Value::from(case.pat_num),
+            Value::from(case.laboratory_num),
+            Value::from(case.apt_num),
+            Value::from(case.planned_apt_num),
+            Value::from(od_write_datetime(case.date_time_due)),
+            Value::from(od_write_datetime(case.date_time_created)),
+            Value::from(od_write_datetime(case.date_time_sent)),
+            Value::from(od_write_datetime(case.date_time_recd)),
+            Value::from(od_write_datetime(case.date_time_checked)),
+            Value::from(case.prov_num),
+            Value::from(case.instructions.clone()),
+            Value::from(case.lab_fee),
+            Value::from(case.invoice_num.clone()),
+        ];
+        if case.lab_case_num == 0 {
+            conn.exec_drop(
+                "INSERT INTO labcase \
+                 (PatNum,LaboratoryNum,AptNum,PlannedAptNum,DateTimeDue,DateTimeCreated, \
+                  DateTimeSent,DateTimeRecd,DateTimeChecked,ProvNum,Instructions,LabFee,InvoiceNum) \
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                values,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_id() as Id)
+        } else {
+            conn.exec_drop(
+                "UPDATE labcase SET PatNum=?,LaboratoryNum=?,AptNum=?,PlannedAptNum=?, \
+                 DateTimeDue=?,DateTimeCreated=?,DateTimeSent=?,DateTimeRecd=?,DateTimeChecked=?, \
+                 ProvNum=?,Instructions=?,LabFee=?,InvoiceNum=? WHERE LabCaseNum=?",
+                {
+                    let mut params = values;
+                    params.push(Value::from(case.lab_case_num));
+                    params
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(case.lab_case_num)
+        }
+    }
+
+    fn list_suppliers(&self) -> Result<Vec<Supplier>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "supplier")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT SupplierNum,COALESCE(Name,'') FROM supplier ORDER BY Name",
+                (),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Supplier {
+                supplier_num: cell_u32(&row, 0),
+                name: s(cell_text(&row, 1)),
+            })
+            .collect())
+    }
+
+    fn list_supplies(&self) -> Result<Vec<Supply>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "supply")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT SupplyNum,SupplierNum,COALESCE(CatalogNumber,''),COALESCE(Descript,''), \
+                 COALESCE(Category,0),ItemOrder,COALESCE(LevelDesired,0),IsHidden, \
+                 COALESCE(Price,0),COALESCE(LevelOnHand,0),COALESCE(OrderQty,0) \
+                 FROM supply ORDER BY Category,ItemOrder,Descript",
+                (),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| Supply {
+                supply_num: cell_u32(&row, 0),
+                supplier_num: cell_u32(&row, 1),
+                catalog_number: s(cell_text(&row, 2)),
+                description: s(cell_text(&row, 3)),
+                category: cell_u32(&row, 4),
+                item_order: cell_i32(&row, 5),
+                level_desired: cell_f64(&row, 6),
+                is_hidden: cell_i16(&row, 7) != 0,
+                price: cell_f64(&row, 8),
+                level_on_hand: cell_f64(&row, 9),
+                order_qty: cell_i32(&row, 10),
+            })
+            .collect())
+    }
+
+    fn list_supply_dispenses(&self, supply_num: Id) -> Result<Vec<SupplyDispense>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "dispsupply")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .exec(
+                "SELECT DispSupplyNum,SupplyNum,ProvNum,CAST(DateDispensed AS CHAR), \
+                 DispQuantity,COALESCE(Note,'') FROM dispsupply WHERE SupplyNum = ? \
+                 ORDER BY DateDispensed DESC",
+                (Value::from(supply_num),),
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| SupplyDispense {
+                disp_supply_num: cell_u32(&row, 0),
+                supply_num: cell_u32(&row, 1),
+                prov_num: cell_u32(&row, 2),
+                date_dispensed: date(cell_text(&row, 3)).unwrap_or_default(),
+                disp_quantity: cell_f64(&row, 4),
+                note: s(cell_text(&row, 5)),
+            })
+            .collect())
+    }
+
+    fn record_supply_dispense(&self, dispense: &SupplyDispense) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "dispsupply")? {
+            return Err("This Open Dental schema has no dispsupply table.".into());
+        }
+        conn.exec_drop(
+            "INSERT INTO dispsupply (SupplyNum,ProvNum,DateDispensed,DispQuantity,Note) \
+             VALUES (?,?,?,?,?)",
+            (
+                dispense.supply_num,
+                dispense.prov_num,
+                dispense.date_dispensed.format("%Y-%m-%d").to_string(),
+                dispense.disp_quantity,
+                dispense.note.clone(),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_id() as Id)
+    }
+
     fn list_pay_plans(&self, pat_num: Id) -> Result<Vec<PayPlan>, String> {
         let mut conn = self.conn()?;
         let rows: Vec<mysql::Row> = conn
             .exec(
                 "SELECT PayPlanNum,PlanNum,PatNum,Guarantor,CAST(PayPlanDate AS CHAR),APR,Note,CompletedAmt,PaySchedule,NumberOfPayments,PayAmt,DownPayment,IsClosed,ChargeFrequency,CAST(DatePayPlanStart AS CHAR),CAST(DateInterestStart AS CHAR),IsDynamic,DynamicPayPlanTPOption,IsLocked \
-                 FROM payplan WHERE PatNum = ? OR Guarantor = ? ORDER BY PayPlanDate DESC",
-                (Value::from(pat_num), Value::from(pat_num)),
+                 FROM payplan WHERE PatNum = ? ORDER BY PayPlanDate DESC",
+                (Value::from(pat_num),),
             )
             .map_err(|e| e.to_string())?;
         Ok(rows
@@ -3116,8 +3344,8 @@ impl Store for MySqlStore {
             .exec(
                 "SELECT pc.PayPlanChargeNum,pc.PayPlanNum,pc.Guarantor,pc.PatNum,CAST(pc.ChargeDate AS CHAR),pc.Principal,pc.Interest,pc.Note,pc.ProvNum,pc.ProcNum,pc.ChargeType,pc.FKey,pc.LinkType \
                  FROM payplancharge pc INNER JOIN payplan pp ON pp.PayPlanNum = pc.PayPlanNum \
-                 WHERE pp.PatNum = ? OR pp.Guarantor = ? ORDER BY pc.ChargeDate",
-                (Value::from(pat_num), Value::from(pat_num)),
+                 WHERE pp.PatNum = ? ORDER BY pc.ChargeDate",
+                (Value::from(pat_num),),
             )
             .map_err(|e| e.to_string())?;
         // 13 columns exceed `FromRow`'s tuple limit, so map by index.
@@ -3152,7 +3380,8 @@ impl Store for MySqlStore {
         let mut params: Vec<Value> = vec![
             Value::from(plan.insurance_plan_num),
             Value::from(plan.pat_num),
-            Value::from(plan.guarantor),
+            // Patient-scoped practice: OD Guarantor must stay on the same patient.
+            Value::from(plan.pat_num),
             Value::from(od_write_date(Some(plan.pay_plan_date))),
             Value::from(plan.apr),
             Value::from(plan.note.clone()),
@@ -3219,7 +3448,8 @@ impl Store for MySqlStore {
         let mut placeholders = "?,?,?,?,?,?,?,?,?,?,?,?".to_string();
         let base_params: Vec<Value> = vec![
             Value::from(charge.pay_plan_num),
-            Value::from(charge.guarantor),
+            // Patient-scoped practice: OD Guarantor must stay on the same patient.
+            Value::from(charge.pat_num),
             Value::from(charge.pat_num),
             Value::from(od_write_date(Some(charge.charge_date))),
             Value::from(charge.principal),

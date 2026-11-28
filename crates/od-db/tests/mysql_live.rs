@@ -54,10 +54,10 @@ use od_domain::reports::{
 };
 use od_domain::{
     Account, Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
-    DiscountPlan, DiscountPlanSub, Gender, JournalEntry, Patient, PatientCorrection, PayPlan,
-    PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation, PaymentTarget, PaySplit, Pref,
-    Procedure, ProcedureStatus, Recall, RecallPriority, Statement, TreatPlan, TreatPlanLine,
-    TreatPlanStatus,
+    DiscountPlan, DiscountPlanSub, Gender, JournalEntry, LabCase, LabCaseStage, Patient,
+    PatientCorrection, PayPlan, PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation,
+    PaymentTarget, PaySplit, Pref, Procedure, ProcedureStatus, Recall, RecallPriority, Statement,
+    SupplyDispense, TreatPlan, TreatPlanLine, TreatPlanStatus,
 };
 
 fn live_db_pool(url: &str) -> mysql::Pool {
@@ -83,6 +83,17 @@ fn schema_snapshot(conn: &mut mysql::PooledConn) -> Vec<(String, String, String)
          WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME,ORDINAL_POSITION",
     )
     .expect("could not read information_schema")
+}
+
+fn table_present(conn: &mut mysql::PooledConn, table: &str) -> bool {
+    let count: Option<i64> = conn
+        .exec_first(
+            "SELECT COUNT(*) FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+            (table,),
+        )
+        .expect("could not probe information_schema");
+    count.unwrap_or(0) > 0
 }
 
 fn high_fixture_num(offset: u32) -> u32 {
@@ -5526,4 +5537,248 @@ fn mysql_live_ledger_tie_out_reads_live_sources() {
         assert!(row("Unposted sources")[1].parse::<usize>().unwrap() > 0);
     }
     println!("live ledger tie-out: {} checks from live sources", report.rows.len());
+}
+
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; verifies the lab/inventory write gate"]
+fn mysql_wave1_lab_inventory_default_deny_blocks_writes() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::DenyOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+
+    let lab = store.upsert_lab_case(&LabCase::default());
+    let message = lab.expect_err("labcase write succeeded while DenyOdWrites was active");
+    assert!(
+        message.contains("OD writes are disabled"),
+        "unexpected lab gate error: {message}"
+    );
+
+    let dispense = store.record_supply_dispense(&SupplyDispense::default());
+    let message =
+        dispense.expect_err("dispsupply write succeeded while DenyOdWrites was active");
+    assert!(
+        message.contains("OD writes are disabled"),
+        "unexpected inventory gate error: {message}"
+    );
+    println!("default-deny gate refused lab and inventory writes");
+}
+
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes and deletes one labcase fixture"]
+fn mysql_wave1_lab_case_round_trip() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    // Optional reads must never fail startup on a reduced schema.
+    let _labs = store.list_laboratories().expect("laboratory read failed");
+    let _existing = store.list_lab_cases(0).expect("labcase read failed");
+
+    let pat_num: i64 = conn
+        .query_first("SELECT MIN(PatNum) FROM patient")
+        .expect("could not read patients")
+        .expect("no patient rows in the demo database");
+    let laboratory_num: i64 = conn
+        .query_first("SELECT COALESCE(MIN(LaboratoryNum),0) FROM laboratory")
+        .expect("could not read laboratories")
+        .unwrap_or(0);
+
+    if !table_present(&mut conn, "labcase") {
+        let err = store
+            .upsert_lab_case(&LabCase {
+                pat_num: pat_num as u32,
+                ..Default::default()
+            })
+            .expect_err("write succeeded against a missing labcase table");
+        assert!(err.contains("no labcase table"), "unexpected error: {err}");
+        println!("labcase table absent; optional read/write degraded as designed");
+        return;
+    }
+
+    conn.query_drop("DELETE FROM labcase WHERE Instructions = 'ODCLINIC_WAVE1_LAB'")
+        .expect("could not clean old lab fixtures");
+    let mut case = LabCase {
+        pat_num: pat_num as u32,
+        laboratory_num: laboratory_num as u32,
+        date_time_due: Some(
+            NaiveDate::from_ymd_opt(2026, 12, 1)
+                .unwrap()
+                .and_hms_opt(9, 0, 0)
+                .unwrap(),
+        ),
+        date_time_created: Some(
+            NaiveDate::from_ymd_opt(2026, 11, 28)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap(),
+        ),
+        lab_fee: 88.25,
+        instructions: "ODCLINIC_WAVE1_LAB".into(),
+        ..Default::default()
+    };
+    assert_eq!(case.stage(), LabCaseStage::Created);
+    let num = store.upsert_lab_case(&case).expect("labcase insert failed");
+    case.lab_case_num = num;
+    case.date_time_sent = Some(
+        NaiveDate::from_ymd_opt(2026, 11, 28)
+            .unwrap()
+            .and_hms_opt(15, 30, 0)
+            .unwrap(),
+    );
+    assert_eq!(
+        store.upsert_lab_case(&case).expect("labcase update failed"),
+        num
+    );
+
+    let stored = store
+        .list_lab_cases(pat_num as u32)
+        .expect("labcase read-back failed")
+        .into_iter()
+        .find(|c| c.lab_case_num == num)
+        .expect("inserted labcase missing");
+    assert_eq!(stored.instructions, "ODCLINIC_WAVE1_LAB");
+    assert_eq!(stored.laboratory_num, laboratory_num as u32);
+    assert!((stored.lab_fee - 88.25).abs() < 0.01);
+    assert_eq!(stored.stage(), LabCaseStage::Sent);
+
+    let _ = conn.exec_drop("DELETE FROM labcase WHERE LabCaseNum = ?", (num,));
+    println!("live labcase round trip passed and fixture was removed");
+}
+
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes and deletes one dispsupply fixture"]
+fn mysql_wave1_supply_dispense_round_trip() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let _suppliers = store.list_suppliers().expect("supplier read failed");
+    let supplies = store.list_supplies().expect("supply read failed");
+
+    if !table_present(&mut conn, "dispsupply") {
+        let err = store
+            .record_supply_dispense(&SupplyDispense::default())
+            .expect_err("write succeeded against a missing dispsupply table");
+        assert!(err.contains("no dispsupply table"), "unexpected error: {err}");
+        println!("dispsupply table absent; optional read/write degraded as designed");
+        return;
+    }
+    let Some(supply) = supplies.first() else {
+        println!("no supply rows in the demo database; skipping the movement fixture");
+        return;
+    };
+
+    conn.query_drop("DELETE FROM dispsupply WHERE Note = 'ODCLINIC_WAVE1_SUPPLY'")
+        .expect("could not clean old dispense fixtures");
+    let num = store
+        .record_supply_dispense(&SupplyDispense {
+            supply_num: supply.supply_num,
+            prov_num: 0,
+            date_dispensed: NaiveDate::from_ymd_opt(2026, 11, 28).unwrap(),
+            disp_quantity: 2.5,
+            note: "ODCLINIC_WAVE1_SUPPLY".into(),
+            ..Default::default()
+        })
+        .expect("dispsupply insert failed");
+    let stored = store
+        .list_supply_dispenses(supply.supply_num)
+        .expect("dispsupply read-back failed")
+        .into_iter()
+        .find(|d| d.disp_supply_num == num)
+        .expect("inserted movement missing");
+    assert_eq!(stored.date_dispensed, NaiveDate::from_ymd_opt(2026, 11, 28).unwrap());
+    assert!((stored.disp_quantity - 2.5).abs() < 0.01);
+    assert_eq!(stored.note, "ODCLINIC_WAVE1_SUPPLY");
+
+    let _ = conn.exec_drop("DELETE FROM dispsupply WHERE DispSupplyNum = ?", (num,));
+    println!("live dispsupply round trip passed and fixture was removed");
+}
+
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes and deletes plan fixtures"]
+fn mysql_wave1_payment_plans_force_patient_guarantor() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let pat_num: i64 = conn
+        .query_first("SELECT MIN(PatNum) FROM patient")
+        .expect("could not read patients")
+        .expect("no patient rows in the demo database");
+    let pat_num = pat_num as u32;
+    let other_guarantor = pat_num.wrapping_add(2_100_000_000);
+
+    // Clear stale fixtures first, then keep all cleanup before the assertions
+    // so a failed invariant cannot leave rows behind.
+    conn.exec_drop(
+        "DELETE pc FROM payplancharge pc INNER JOIN payplan pp \
+         ON pp.PayPlanNum = pc.PayPlanNum WHERE pp.Note = ?",
+        ("ODCLINIC_WAVE1_GUARANTOR",),
+    )
+    .expect("could not clean old plan-charge fixtures");
+    conn.exec_drop("DELETE FROM payplan WHERE Note = ?", ("ODCLINIC_WAVE1_GUARANTOR",))
+        .expect("could not clean old plan fixtures");
+
+    let plan_num = store
+        .upsert_pay_plan(&PayPlan {
+            pat_num,
+            guarantor: other_guarantor,
+            pay_plan_date: NaiveDate::from_ymd_opt(2099, 3, 1).unwrap(),
+            note: "ODCLINIC_WAVE1_GUARANTOR".into(),
+            ..Default::default()
+        })
+        .expect("plan insert failed");
+    let charge_num = store
+        .upsert_pay_plan_charge(&PayPlanCharge {
+            pay_plan_num: plan_num,
+            pat_num,
+            guarantor: other_guarantor,
+            charge_date: NaiveDate::from_ymd_opt(2099, 3, 1).unwrap(),
+            principal: 10.0,
+            note: "ODCLINIC_WAVE1_GUARANTOR".into(),
+            charge_type: PayPlanChargeType::Debit,
+            ..Default::default()
+        })
+        .expect("plan charge insert failed");
+
+    let plan_guarantor = store
+        .list_pay_plans(pat_num)
+        .expect("plan read-back failed")
+        .into_iter()
+        .find(|p| p.pay_plan_num == plan_num)
+        .map(|p| p.guarantor);
+    let charge_guarantor = store
+        .list_pay_plan_charges(pat_num)
+        .expect("plan charge read-back failed")
+        .into_iter()
+        .find(|c| c.pay_plan_charge_num == charge_num)
+        .map(|c| c.guarantor);
+    let wrong_patient_plans = store
+        .list_pay_plans(other_guarantor)
+        .expect("wrong-patient plan read failed")
+        .into_iter()
+        .any(|p| p.pay_plan_num == plan_num);
+    let wrong_patient_charges = store
+        .list_pay_plan_charges(other_guarantor)
+        .expect("wrong-patient charge read failed")
+        .into_iter()
+        .any(|c| c.pay_plan_charge_num == charge_num);
+
+    let charge_cleanup =
+        conn.exec_drop("DELETE FROM payplancharge WHERE PayPlanChargeNum = ?", (charge_num,));
+    let plan_cleanup = conn.exec_drop("DELETE FROM payplan WHERE PayPlanNum = ?", (plan_num,));
+    assert!(charge_cleanup.is_ok(), "plan charge fixture was not removed");
+    assert!(plan_cleanup.is_ok(), "plan fixture was not removed");
+
+    assert_eq!(plan_guarantor, Some(pat_num), "OD plan guarantor was not forced onto the patient");
+    assert_eq!(charge_guarantor, Some(pat_num), "OD charge guarantor was not forced onto the patient");
+    assert!(!wrong_patient_plans, "plan leaked into another patient's account");
+    assert!(!wrong_patient_charges, "plan charge leaked into another patient's account");
+    println!("live plan/charge guarantor scoping passed and fixtures were removed");
 }

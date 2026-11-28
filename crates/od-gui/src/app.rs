@@ -6,6 +6,7 @@
 
 mod definitions;
 mod eservices;
+mod lab_inventory;
 mod schedule_board;
 mod shell;
 
@@ -114,6 +115,8 @@ fn open_in_browser(target: &str) -> Result<(), String> {
 enum CollectionsAction {
     OpenAccount,
     RecordPayment,
+    ApplyCredit,
+    OpenPlan,
     Statement,
 }
 
@@ -1913,6 +1916,38 @@ struct OdApp {
     proc_tooth_text: String,
     proc_units_text: String,
 
+    // Lab cases (Chart) and supplies (Setup) use OD-owned optional tables.
+    // Empty lists mean the table is absent, never a startup failure.
+    laboratories: Vec<Laboratory>,
+    lab_cases: Vec<LabCase>,
+    lab_case_edit: Option<LabCase>,
+    lab_case_edit_open: bool,
+    lab_case_lab_num: Id,
+    lab_case_apt_num: Id,
+    lab_case_prov_num: Id,
+    lab_case_due_text: String,
+    lab_case_created_text: String,
+    lab_case_sent_text: String,
+    lab_case_recd_text: String,
+    lab_case_checked_text: String,
+    lab_case_fee_text: String,
+    lab_case_instructions: String,
+
+    suppliers: Vec<Supplier>,
+    supplies: Vec<Supply>,
+    supply_dispenses: Vec<SupplyDispense>,
+    inventory_supply_num: Id,
+    supply_dispense_open: bool,
+    supply_dispense_supply_num: Id,
+    supply_dispense_prov_num: Id,
+    supply_dispense_date_text: String,
+    supply_dispense_quantity_text: String,
+    supply_dispense_note: String,
+
+    /// Keep the invoice→payment→statement loop explicit and opt-in; recording
+    /// a payment never opens a statement without the operator asking for it.
+    generate_statement_after_payment: bool,
+
     // Discount plan state (Setup → Discount plans). Plans price procedures;
     // subscriptions attach a patient to a plan over an effective/term range.
     discount_plans: Vec<DiscountPlan>,
@@ -2228,6 +2263,31 @@ impl OdApp {
             proc_fee_text: String::new(),
             proc_tooth_text: String::new(),
             proc_units_text: "1".into(),
+            laboratories: Vec::new(),
+            lab_cases: Vec::new(),
+            lab_case_edit: None,
+            lab_case_edit_open: false,
+            lab_case_lab_num: 0,
+            lab_case_apt_num: 0,
+            lab_case_prov_num: 0,
+            lab_case_due_text: String::new(),
+            lab_case_created_text: String::new(),
+            lab_case_sent_text: String::new(),
+            lab_case_recd_text: String::new(),
+            lab_case_checked_text: String::new(),
+            lab_case_fee_text: String::new(),
+            lab_case_instructions: String::new(),
+            suppliers: Vec::new(),
+            supplies: Vec::new(),
+            supply_dispenses: Vec::new(),
+            inventory_supply_num: 0,
+            supply_dispense_open: false,
+            supply_dispense_supply_num: 0,
+            supply_dispense_prov_num: 0,
+            supply_dispense_date_text: today.format("%Y-%m-%d").to_string(),
+            supply_dispense_quantity_text: "1".into(),
+            supply_dispense_note: String::new(),
+            generate_statement_after_payment: false,
             discount_plans: Vec::new(),
             discount_plan_subs: Vec::new(),
             discount_plan_edit: None,
@@ -2390,6 +2450,27 @@ impl OdApp {
         }
         if let Ok(rows) = self.store.list_display_fields() {
             self.display_fields = rows;
+        }
+        // Lab/inventory tables are optional in a reduced schema; read failures
+        // here only leave the corresponding view empty instead of blocking startup.
+        if let Ok(rows) = self.store.list_laboratories() {
+            self.laboratories = rows;
+        }
+        if let Ok(rows) = self.store.list_suppliers() {
+            self.suppliers = rows;
+        }
+        if let Ok(rows) = self.store.list_supplies() {
+            self.supplies = rows;
+        }
+        if let Some(pat_num) = self.selected_patient {
+            if let Ok(rows) = self.store.list_lab_cases(pat_num) {
+                self.lab_cases = rows;
+            }
+        }
+        if self.inventory_supply_num != 0 {
+            if let Ok(rows) = self.store.list_supply_dispenses(self.inventory_supply_num) {
+                self.supply_dispenses = rows;
+            }
         }
         if let Ok(rows) = self.store.list_waitlist_appointments() {
             self.waitlist = rows;
@@ -3085,6 +3166,8 @@ impl OdApp {
         self.post_all_window(&ctx);
         self.period_action_window(&ctx);
         self.payment_window(&ctx);
+        self.lab_case_window(&ctx);
+        self.supply_dispense_window(&ctx);
         self.plan_window(&ctx);
         self.plan_charge_window(&ctx);
         self.discount_plan_window(&ctx);
@@ -3914,6 +3997,67 @@ impl OdApp {
         self.registry_cards = self.store.list_clinic_cards(pat_num).unwrap_or_default();
     }
 
+    /// Pre-fill the existing payment dialog from the invoice that is on screen.
+    /// The balance is spread across completed procedures in proportion to each
+    /// fee; staff can still edit, remove or add splits before saving.
+    fn take_payment_for_invoice(&mut self, pat_num: Id, procedures: &[Procedure], balance: f64) {
+        if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+            && self.can(Permission::PAYMENT_CREATE))
+        {
+            self.error =
+                Some("Payment permission/feature required to collect an invoice".into());
+            return;
+        }
+        if balance <= 0.005 {
+            self.notice = Some("This invoice has no balance to collect.".into());
+            return;
+        }
+        let invoiced: Vec<&Procedure> = procedures
+            .iter()
+            .filter(|p| p.proc_status.is_completed())
+            .collect();
+        let fee_total: f64 = invoiced.iter().map(|p| p.fee.max(0.0)).sum();
+        let mut rows = Vec::new();
+        if fee_total > 0.0 {
+            let mut allocated = 0.0;
+            for (index, proc) in invoiced.iter().enumerate() {
+                let amount = if index + 1 == invoiced.len() {
+                    (balance - allocated).max(0.0)
+                } else {
+                    let share = (balance * proc.fee.max(0.0) / fee_total * 100.0).round() / 100.0;
+                    allocated += share;
+                    share
+                };
+                if amount > 0.0 {
+                    rows.push(PaymentRow {
+                        target: PaymentTarget::Procedure(proc.proc_num),
+                        amount_text: format!("{amount:.2}"),
+                    });
+                }
+            }
+        }
+        if rows.is_empty() {
+            rows.push(PaymentRow {
+                target: PaymentTarget::Unallocated,
+                amount_text: format!("{balance:.2}"),
+            });
+        }
+        self.payment_edit = Some(Payment {
+            pat_num,
+            pay_date: Local::now().date_naive(),
+            note: "A5 invoice collection".into(),
+            ..Default::default()
+        });
+        self.payment_date_text = Local::now().format("%Y-%m-%d").to_string();
+        self.payment_amount_text = format!("{balance:.2}");
+        self.payment_rows = rows;
+        // The invoice loop continues to a statement unless staff opts out in
+        // the payment dialog. Regular Account payments keep the old default.
+        self.generate_statement_after_payment = true;
+        self.payment_edit_open = true;
+        self.error = None;
+    }
+
     fn registry_window(&mut self, ctx: &egui::Context) {
         if !self.registry_open || !self.features.enabled(FeatureKey::PatientRegistry) {
             return;
@@ -3960,6 +4104,7 @@ impl OdApp {
         let mut deactivate_card = None;
         let mut record_invoice = false;
         let mut write_pdf = false;
+        let mut collect_invoice = false;
         let mut error: Option<String> = None;
         let mut notice: Option<String> = None;
 
@@ -4226,6 +4371,9 @@ impl OdApp {
                             if ui.button("Write A5 PDF").clicked() {
                                 write_pdf = true;
                             }
+                            if ui.button("Collect payment").clicked() {
+                                collect_invoice = true;
+                            }
                         });
                         }
                     }
@@ -4332,6 +4480,11 @@ impl OdApp {
                 }
                 Err(err) => error = Some(err),
             }
+        }
+
+        if collect_invoice {
+            let balance = doc.balance();
+            self.take_payment_for_invoice(pat_num, &procedures, balance);
         }
 
         if write_pdf {
@@ -6195,7 +6348,14 @@ impl OdApp {
                     ui.label(format!("{:.2}", proc.fee));
                     if show_actions {
                         if ui.button("Complete").clicked() {
-                            self.complete_procedure(proc);
+                            let pat_num = proc.pat_num;
+                            if self.complete_procedure(proc)
+                                && self.features.enabled(FeatureKey::A5Invoice)
+                                && self.features.enabled(FeatureKey::PatientRegistry)
+                            {
+                                self.open_registry(pat_num);
+                                self.registry_tab = RegistryTab::Invoice;
+                            }
                         }
                     }
                     ui.end_row();
@@ -6204,6 +6364,8 @@ impl OdApp {
         if procedures.is_empty() {
             ui.label("No completed or planned procedures recorded.");
         }
+        ui.separator();
+        self.lab_cases_ui(ui, num);
     }
 
     /// Open the new-procedure dialog with OD-like defaults from the selected
@@ -6344,9 +6506,9 @@ impl OdApp {
     /// Mirror `Procedures.FormProcEditUpdate` → `Adjustments.CreateAdjustmentForDiscountPlan`:
     /// price the procedure from the patient's active subscription, post the
     /// negative adjustment, store `DiscountPlanAmt`, then mark it complete.
-    fn complete_procedure(&mut self, source: &Procedure) {
+    fn complete_procedure(&mut self, source: &Procedure) -> bool {
         if !self.features.enabled(FeatureKey::ProcedureCompletion) {
-            return;
+            return false;
         }
         let proc = source.clone();
         let auto = self.features.enabled(FeatureKey::DiscountPlans)
@@ -6356,7 +6518,7 @@ impl OdApp {
                 "Completing a discounted procedure requires the Adjustment Create permission."
                     .into(),
             );
-            return;
+            return false;
         }
         let today = Local::now().date_naive();
         let mut discount_amount_value = 0.0;
@@ -6469,7 +6631,7 @@ impl OdApp {
                 }
                 Err(e) => {
                     self.error = Some(format!("Could not post discount adjustment: {e}"));
-                    return;
+                    return false;
                 }
             }
         }
@@ -6494,8 +6656,12 @@ impl OdApp {
                     ));
                 }
                 self.error = None;
+                true
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                self.error = Some(e);
+                false
+            }
         }
     }
 
@@ -6896,6 +7062,77 @@ impl OdApp {
                     amount_text: String::new(),
                 }];
                 self.payment_edit_open = true;
+                self.error = None;
+            }
+            CollectionsAction::ApplyCredit => {
+                let procedures = self.store.list_procedures(pat_num).unwrap_or_default();
+                let adjustments = self.store.list_adjustments(pat_num).unwrap_or_default();
+                let splits = self.store.list_pay_splits(pat_num).unwrap_or_default();
+                self.apply_patient_credit(pat_num, &procedures, &adjustments, &splits);
+            }
+            CollectionsAction::OpenPlan => {
+                if !self.features.enabled(FeatureKey::PaymentPlansEnabled) {
+                    self.error = Some("Payment plans are turned off in Settings".into());
+                    return;
+                }
+                if !(self.features.enabled(FeatureKey::AccountBillingEdits)
+                    && self.can(Permission::BILLING))
+                {
+                    self.error =
+                        Some("Billing permission/feature required to manage a plan".into());
+                    return;
+                }
+                if !self.open_patient_account(pat_num) {
+                    return;
+                }
+                let plans = self.store.list_pay_plans(pat_num).unwrap_or_default();
+                if let Some(plan) = plans.first() {
+                    self.plan_edit = Some(plan.clone());
+                    self.plan_amount_text = if plan.is_dynamic {
+                        format!("{:.2}", plan.pay_amt)
+                    } else {
+                        format!("{:.2}", plan.completed_amt)
+                    };
+                    self.plan_count_text = plan.number_of_payments.to_string();
+                    self.plan_start_text = plan
+                        .date_pay_plan_start
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    self.plan_apr_text = format!("{}", plan.apr);
+                    self.plan_down_payment_text = format!("{}", plan.down_payment);
+                    self.plan_interest_start_text = plan
+                        .date_interest_start
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default();
+                    self.plan_note_text = plan.note.clone();
+                    self.plan_frequency = plan.charge_frequency;
+                    self.plan_is_dynamic = plan.is_dynamic;
+                    self.plan_tp_option = plan.dynamic_pay_plan_tp_option;
+                    self.plan_is_closed = plan.is_closed;
+                    self.plan_is_locked = plan.is_locked;
+                } else {
+                    self.plan_edit = Some(PayPlan {
+                        pat_num,
+                        guarantor: pat_num,
+                        pay_plan_date: Local::now().date_naive(),
+                        charge_frequency: PayPlanFrequency::Monthly,
+                        pay_schedule: PaymentSchedule::Monthly,
+                        ..Default::default()
+                    });
+                    self.plan_amount_text.clear();
+                    self.plan_count_text = "6".into();
+                    self.plan_start_text = Local::now().format("%Y-%m-%d").to_string();
+                    self.plan_apr_text = "0".into();
+                    self.plan_down_payment_text = "0".into();
+                    self.plan_interest_start_text.clear();
+                    self.plan_note_text.clear();
+                    self.plan_frequency = PayPlanFrequency::Monthly;
+                    self.plan_is_dynamic = false;
+                    self.plan_tp_option = DynamicPayPlanTPOption::None;
+                    self.plan_is_closed = false;
+                    self.plan_is_locked = false;
+                }
+                self.plan_edit_open = true;
                 self.error = None;
             }
             CollectionsAction::Statement => {
@@ -8234,17 +8471,15 @@ impl OdApp {
                         if !opts.include.any() {
                             ui.label("Select at least one transaction type before running the report.");
                         }
+                        if opts.family_grouping != AgingFamilyGrouping::Individual {
+                            opts.family_grouping = AgingFamilyGrouping::Individual;
+                            options_changed = true;
+                        }
                         ui.horizontal(|ui| {
                             ui.label("Group by");
-                            for grouping in AgingFamilyGrouping::ALL {
-                                options_changed |= ui
-                                    .radio_value(
-                                        &mut opts.family_grouping,
-                                        grouping,
-                                        grouping.label(),
-                                    )
-                                    .clicked();
-                            }
+                            ui.label(
+                                "Individual (family grouping is not supported: each patient has their own account)",
+                            );
                         });
                         if insurance && opts.include.write_offs {
                             ui.horizontal(|ui| {
@@ -8901,6 +9136,11 @@ impl OdApp {
                         );
                     }
                 }
+                let mut custom_aging = self.report_prefs.custom_aging.clone();
+                // Saved preferences from an older build may still carry the
+                // upstream family grouping; this practice bills patients
+                // individually, so never let it reach the report engine.
+                custom_aging.family_grouping = AgingFamilyGrouping::Individual;
                 upstream_table = Some(custom_aging_report(
                     &patients,
                     &procedures,
@@ -8911,7 +9151,7 @@ impl OdApp {
                     &claim_snapshots,
                     self.report_to,
                     insurance,
-                    self.report_prefs.custom_aging.clone(),
+                    custom_aging,
                 ));
             }
             ReportKind::PayPlanDetail => {
@@ -10002,6 +10242,18 @@ impl OdApp {
                                     worklist_actions
                                         .push((entry.pat_num, CollectionsAction::RecordPayment));
                                 }
+                                if self.features.enabled(FeatureKey::PatientCreditApplication) {
+                                    if ui.button("Apply credit").clicked() {
+                                        worklist_actions
+                                            .push((entry.pat_num, CollectionsAction::ApplyCredit));
+                                    }
+                                }
+                                if self.features.enabled(FeatureKey::PaymentPlansEnabled) {
+                                    if ui.button("Plan...").clicked() {
+                                        worklist_actions
+                                            .push((entry.pat_num, CollectionsAction::OpenPlan));
+                                    }
+                                }
                                 if ui.button("Statement").clicked() {
                                     worklist_actions
                                         .push((entry.pat_num, CollectionsAction::Statement));
@@ -10355,6 +10607,7 @@ impl OdApp {
         ui.separator();
         self.definitions_ui(ui);
         self.discount_plans_ui(ui);
+        self.inventory_ui(ui);
         ui.separator();
         ui.label("Preferences are loaded from the preference table (OD: Pref.ValueString).");
 
@@ -11748,6 +12001,10 @@ impl OdApp {
                     ui.label("Note");
                     ui.add(egui::TextEdit::singleline(&mut payment.note).desired_width(260.0).hint_text("Required for refunds/transfers"));
                 });
+                ui.checkbox(
+                    &mut self.generate_statement_after_payment,
+                    "Generate statement after saving payment",
+                );
                 ui.label("Writes one OD payment row plus one paysplit row per allocation. Refunds/transfers require a note.");
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -11794,10 +12051,14 @@ impl OdApp {
                     );
                     self.notice = Some(format!("Payment and {split_count} paysplit(s) recorded"));
                     self.error = None;
+                    if self.generate_statement_after_payment {
+                        self.generate_statement_for(pat_num);
+                    }
                 }
                 Err(e) => self.error = Some(e),
             }
             self.payment_edit_open = false;
+            self.generate_statement_after_payment = false;
         } else if cancel {
             self.payment_edit_open = false;
         } else if self.payment_edit_open {
@@ -15585,4 +15846,94 @@ fn account_transfer_filter_and_export_respect_plan_target_and_date() {
     assert!(csv.contains("102,refund reason"));
     assert!(!csv.contains("procedure #10"));
     assert!(html.contains("patient account (unallocated)"));
+}
+
+#[test]
+fn invoice_collection_prefills_payment_rows_and_statement_follow_up() {
+    let mut app = OdApp::new();
+    app.features.set(FeatureKey::AccountBillingEdits, true);
+    app.features.set(FeatureKey::PaymentPlansEnabled, true);
+    let procedures = [
+        Procedure {
+            proc_num: 7,
+            pat_num: 1,
+            proc_status: ProcedureStatus::Complete,
+            fee: 40.0,
+            ..Default::default()
+        },
+        Procedure {
+            proc_num: 8,
+            pat_num: 1,
+            proc_status: ProcedureStatus::Complete,
+            fee: 20.0,
+            ..Default::default()
+        },
+    ];
+    app.take_payment_for_invoice(1, &procedures, 60.0);
+    assert!(app.payment_edit_open);
+    assert!(app.generate_statement_after_payment);
+    let payment = app.payment_edit.clone().unwrap();
+    assert_eq!(payment.pat_num, 1);
+    assert_eq!(payment.note, "A5 invoice collection");
+    assert_eq!(app.payment_amount_text, "60.00");
+    assert_eq!(app.payment_rows.len(), 2);
+    assert_eq!(app.payment_rows[0].target, PaymentTarget::Procedure(7));
+    assert_eq!(app.payment_rows[0].amount_text, "40.00");
+    assert_eq!(app.payment_rows[1].target, PaymentTarget::Procedure(8));
+    assert_eq!(app.payment_rows[1].amount_text, "20.00");
+
+    app.features.set(FeatureKey::AccountBillingEdits, false);
+    app.payment_edit = None;
+    app.payment_edit_open = false;
+    app.take_payment_for_invoice(1, &procedures, 60.0);
+    assert!(app.payment_edit.is_none());
+    assert!(!app.payment_edit_open);
+    assert!(app
+        .error
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains("payment permission"));
+}
+
+#[test]
+fn collections_plan_action_prefills_a_patient_owned_plan() {
+    let mut app = OdApp::new();
+    app.features.set(FeatureKey::PaymentPlansEnabled, true);
+    app.features.set(FeatureKey::AccountBillingEdits, true);
+    app.apply_collections_action(1, CollectionsAction::OpenPlan);
+    assert!(app.plan_edit_open);
+    assert_eq!(app.module, Module::Account);
+    let plan = app.plan_edit.clone().unwrap();
+    assert_eq!(plan.pat_num, 1);
+    assert_eq!(plan.guarantor, 1, "no family billing in this practice");
+
+    app.features.set(FeatureKey::PaymentPlansEnabled, false);
+    app.plan_edit = None;
+    app.plan_edit_open = false;
+    app.apply_collections_action(1, CollectionsAction::OpenPlan);
+    assert!(app.plan_edit.is_none());
+    assert!(app.error.as_deref().unwrap_or("").contains("turned off"));
+}
+
+#[test]
+fn lab_and_inventory_views_load_from_store_and_toggles_round_trip() {
+    let mut app = OdApp::new();
+    app.selected_patient = Some(1);
+    app.refresh();
+    assert!(!app.laboratories.is_empty());
+    assert!(!app.lab_cases.is_empty());
+    assert!(
+        app.lab_cases.iter().all(|case| case.pat_num == 1),
+        "Chart shows only the selected patient's lab cases"
+    );
+    assert!(!app.suppliers.is_empty());
+    assert!(!app.supplies.is_empty());
+
+    let defaults = FeatureSettings::default();
+    assert!(defaults.enabled(FeatureKey::LabCasesEnabled));
+    assert!(defaults.enabled(FeatureKey::InventoryEnabled));
+    let configured = FeatureSettings::from_text("lab_cases=false\ninventory=false\n");
+    assert!(!configured.enabled(FeatureKey::LabCasesEnabled));
+    assert!(!configured.enabled(FeatureKey::InventoryEnabled));
 }

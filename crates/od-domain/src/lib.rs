@@ -118,6 +118,10 @@ pub enum FeatureKey {
     DiscountPlans,
     DiscountPlanAutoAdjust,
     ProcedureCompletion,
+    /// Patient lab cases in Chart, with OD lab-slip dates and appointment links.
+    LabCasesEnabled,
+    /// Supply list and dispsupply movement recording in Setup.
+    InventoryEnabled,
     TreatmentPlanLines,
     TreatmentPlanEdit,
     AuditTreatmentPlans,
@@ -201,7 +205,7 @@ pub enum FeatureKey {
 }
 
 impl FeatureKey {
-    pub const ALL: [Self; 115] = [
+    pub const ALL: [Self; 117] = [
         Self::ModuleAppointments,
         Self::ModuleFamily,
         Self::ModuleAccount,
@@ -237,6 +241,8 @@ impl FeatureKey {
         Self::DiscountPlans,
         Self::DiscountPlanAutoAdjust,
         Self::ProcedureCompletion,
+        Self::LabCasesEnabled,
+        Self::InventoryEnabled,
         Self::TreatmentPlanLines,
         Self::TreatmentPlanEdit,
         Self::AuditTreatmentPlans,
@@ -356,6 +362,8 @@ impl FeatureKey {
             Self::DiscountPlans => "discount_plans",
             Self::DiscountPlanAutoAdjust => "discount_plan_auto_adjust",
             Self::ProcedureCompletion => "procedure_completion",
+            Self::LabCasesEnabled => "lab_cases",
+            Self::InventoryEnabled => "inventory",
             Self::TreatmentPlanLines => "treatment_plan_lines",
             Self::TreatmentPlanEdit => "treatment_plan_edit",
             Self::AuditTreatmentPlans => "audit_treatment_plans",
@@ -476,6 +484,8 @@ impl FeatureKey {
             Self::DiscountPlans => "Discount plans in Setup",
             Self::DiscountPlanAutoAdjust => "Automatic discount-plan adjustments",
             Self::ProcedureCompletion => "Complete procedures in Chart",
+            Self::LabCasesEnabled => "Lab cases in Chart",
+            Self::InventoryEnabled => "Supplies and inventory in Setup",
             Self::TreatmentPlanLines => "Procedure lines in treatment plans",
             Self::TreatmentPlanEdit => "Edit treatment plans",
             Self::AuditTreatmentPlans => "Audit treatment plan changes",
@@ -598,6 +608,8 @@ impl FeatureKey {
             Self::DiscountPlans => "Show the discount-plan editor in Setup: define plans (fee schedule, adjustment type, annual maximum, frequency limits and note) and subscribe patients with effective/term dates. Discount plans are the patient-facing alternative to insurance. On by default.",
             Self::DiscountPlanAutoAdjust => "When a procedure is completed for a patient with an active discount subscription, price it from the plan's reduced fee schedule and post the difference as a negative adjustment of the plan's adjustment type. Mirrors OD Adjustments.CreateAdjustmentForDiscountPlan, including the annual maximum and frequency limits. Requires Discount plans.",
             Self::ProcedureCompletion => "Allow creating a procedure in Chart and moving it to Complete. Completing a procedure is the trigger for automatic discount-plan pricing. Also requires the OD Adjustment Create permission when enforcement is on.",
+            Self::LabCasesEnabled => "Show the patient's OD lab cases in Chart, with the laboratory, due date, appointment link, lab fee and the created/sent/received/checked date chain. Marking stages writes the same labcase columns as the lab-slip form; no procedure charge or payment is created.",
+            Self::InventoryEnabled => "Show OD supplies in Setup with supplier, catalog number, target and on-hand levels, and record dispsupply movements with provider, date, quantity and note. Purchases and supply orders stay outside this port.",
             Self::TreatmentPlanLines => "Show the procedure table inside each treatment plan.",
             Self::TreatmentPlanEdit => "Allow creating and editing treatment plans, their status and their proctp procedure lines. Also requires the OD Treat Plan Edit permission when enforcement is on.",
             Self::AuditTreatmentPlans => "Write a securitylog entry when a treatment plan or its lines are created, changed or set active.",
@@ -716,7 +728,9 @@ impl FeatureKey {
             Self::TreatmentPlanLines
             | Self::TreatmentPlanEdit
             | Self::AuditTreatmentPlans => "Treatment Plan",
-            Self::ChartToothSelection | Self::ProcedureCompletion => "Chart",
+            Self::ChartToothSelection
+            | Self::ProcedureCompletion
+            | Self::LabCasesEnabled => "Chart",
             Self::ReportPatientList
             | Self::ReportProduction
             | Self::ReportCollections
@@ -792,6 +806,7 @@ impl FeatureKey {
             | Self::AuditDefinitionChanges
             | Self::DiscountPlans
             | Self::DiscountPlanAutoAdjust
+            | Self::InventoryEnabled
             | Self::PreferDemoData => "Setup & data",
             Self::PatientRegistry | Self::ClinicCardsEnabled | Self::A5Invoice => {
                 "Patient registry"
@@ -1736,11 +1751,13 @@ impl PaymentTarget {
 }
 
 /// One line of a payment allocation. A single OD `payment` can fund many
-/// `paysplit` rows across procedures, family members and payment plans.
+/// `paysplit` rows, but this port keeps every split on the paying patient:
+/// there is no family/guarantor grouping or cross-patient allocation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PaymentAllocation {
     pub target: PaymentTarget,
-    /// OD `PatNum`; 0 means the payment's own patient.
+    /// OD `PatNum`; kept for schema compatibility but must be 0 or equal to
+    /// the payment's own patient. Cross-patient splits are rejected.
     pub pat_num: Id,
     /// OD `ProvNum`; 0 when not specified.
     pub provider_num: Id,
@@ -1765,6 +1782,12 @@ impl Payment {
         for (index, allocation) in allocations.iter().enumerate() {
             if !allocation.amount.is_finite() || allocation.amount == 0.0 {
                 return Err(format!("Allocation {} has an invalid amount", index + 1));
+            }
+            if allocation.pat_num != 0 && allocation.pat_num != self.pat_num {
+                return Err(format!(
+                    "Allocation {} targets another patient; this practice treats each patient individually",
+                    index + 1
+                ));
             }
             total += allocation.amount;
         }
@@ -1798,7 +1821,7 @@ impl Payment {
             .map(|a| PaySplit {
                 split_num: 0,
                 pay_num: self.pay_num,
-                pat_num: if a.pat_num == 0 { self.pat_num } else { a.pat_num },
+                pat_num: self.pat_num,
                 proc_num: match a.target {
                     PaymentTarget::Procedure(num) => num,
                     _ => 0,
@@ -2210,6 +2233,108 @@ pub struct Statement {
     pub date_sent: Option<NaiveDate>,
     pub note: String,
     pub is_invoice: bool,
+}
+
+/// The stage a lab case has reached, derived from OD's dated lab-slip columns.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LabCaseStage {
+    #[default]
+    Created,
+    Sent,
+    Received,
+    Checked,
+}
+
+impl LabCaseStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Sent => "Sent to lab",
+            Self::Received => "Received",
+            Self::Checked => "Checked",
+        }
+    }
+}
+
+/// A dental laboratory (OD `laboratory`), reduced to the fields a lab-case
+/// picker needs.
+#[derive(Clone, Debug, Default)]
+pub struct Laboratory {
+    pub laboratory_num: Id,
+    pub description: String,
+}
+
+/// A patient lab case (OD `labcase`). Dates are optional because OD stores
+/// unset values as `DateTime.MinValue`; the port never displays that sentinel.
+#[derive(Clone, Debug, Default)]
+pub struct LabCase {
+    pub lab_case_num: Id,
+    pub pat_num: Id,
+    pub laboratory_num: Id,
+    /// Scheduled appointment this case is attached to; zero when unattached.
+    pub apt_num: Id,
+    /// Planned appointment, in addition to the scheduled one.
+    pub planned_apt_num: Id,
+    pub date_time_due: Option<NaiveDateTime>,
+    pub date_time_created: Option<NaiveDateTime>,
+    pub date_time_sent: Option<NaiveDateTime>,
+    pub date_time_recd: Option<NaiveDateTime>,
+    pub date_time_checked: Option<NaiveDateTime>,
+    pub prov_num: Id,
+    pub instructions: String,
+    pub lab_fee: f64,
+    pub invoice_num: String,
+}
+
+impl LabCase {
+    /// OD treats the last completed dated stage as the case's current state.
+    pub fn stage(&self) -> LabCaseStage {
+        if self.date_time_checked.is_some() {
+            LabCaseStage::Checked
+        } else if self.date_time_recd.is_some() {
+            LabCaseStage::Received
+        } else if self.date_time_sent.is_some() {
+            LabCaseStage::Sent
+        } else {
+            LabCaseStage::Created
+        }
+    }
+}
+
+/// A supply supplier (OD `supplier`), reduced to its name.
+#[derive(Clone, Debug, Default)]
+pub struct Supplier {
+    pub supplier_num: Id,
+    pub name: String,
+}
+
+/// An OD supply item (`supply`). `LevelOnHand` is deprecated upstream but is
+/// still the only on-hand column an untouched OD database provides, so it is
+/// displayed as stored and never inferred from movement rows.
+#[derive(Clone, Debug, Default)]
+pub struct Supply {
+    pub supply_num: Id,
+    pub supplier_num: Id,
+    pub catalog_number: String,
+    pub description: String,
+    pub category: Id,
+    pub item_order: i32,
+    pub level_desired: f64,
+    pub is_hidden: bool,
+    pub price: f64,
+    pub level_on_hand: f64,
+    pub order_qty: i32,
+}
+
+/// One stock movement recorded in OD `dispsupply`.
+#[derive(Clone, Debug, Default)]
+pub struct SupplyDispense {
+    pub disp_supply_num: Id,
+    pub supply_num: Id,
+    pub prov_num: Id,
+    pub date_dispensed: NaiveDate,
+    pub disp_quantity: f64,
+    pub note: String,
 }
 
 /// Tooth-specific clinical finding (OD `toothinitial`).
