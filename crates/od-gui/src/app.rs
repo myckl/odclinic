@@ -7,6 +7,7 @@
 mod definitions;
 mod eservices;
 mod lab_inventory;
+mod preferences;
 mod schedule_board;
 mod shell;
 
@@ -1755,6 +1756,7 @@ struct OdApp {
     features: FeatureSettings,
     module: Module,
     show_settings: bool,
+    preferences: preferences::PreferencesDialog,
 
     patients: Vec<Patient>,
     providers: Vec<Provider>,
@@ -2182,6 +2184,7 @@ impl OdApp {
             features,
             module: Module::Appointments,
             show_settings: false,
+            preferences: preferences::PreferencesDialog::default(),
             patients: Vec::new(),
             providers: Vec::new(),
             operatories: Vec::new(),
@@ -3300,6 +3303,7 @@ impl OdApp {
         self.proc_note_window(&ctx);
         self.clinical_note_window(&ctx);
         self.condition_window(&ctx);
+        preferences::window(self, &ctx);
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -3350,10 +3354,17 @@ impl OdApp {
                     self.side_bar_module(ui, Module::Setup);
                 }
                 if ui
-                    .selectable_label(self.show_settings, "Settings")
+                    .selectable_label(self.show_settings, "Show features")
                     .clicked()
                 {
                     self.show_settings = true;
+                    self.preferences.open = false;
+                }
+                if self.features.enabled(FeatureKey::ShowPreferences)
+                    && ui.button("Preferences…").clicked()
+                {
+                    preferences::open(self);
+                    self.show_settings = false;
                 }
 
                 if self.features.enabled(FeatureKey::ShowImagingNote) {
@@ -4252,7 +4263,7 @@ impl OdApp {
         let can_edit_record = self.features.enabled(FeatureKey::ClinicalRecordEdit)
             && self.can(Permission::PATIENT_EDIT);
 
-        egui::Window::new("Patient registry")
+        theme::AppWindow::new("Patient registry")
             .open(&mut self.registry_open)
             .resizable(true)
             .default_width(700.0)
@@ -6703,7 +6714,7 @@ impl OdApp {
             .unwrap_or_else(|| "(select)".into());
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Procedure — New")
+        theme::AppWindow::new("Procedure — New")
             .open(&mut self.proc_edit_open)
             .resizable(true)
             .default_width(420.0)
@@ -10902,11 +10913,15 @@ impl OdApp {
         self.discount_plans_ui(ui);
         self.inventory_ui(ui);
         ui.separator();
-        ui.label("Preferences are loaded from the preference table (OD: Pref.ValueString).");
-
+        ui.label("Preferences are stored in OD's preference table (Pref.ValueString).");
+        if self.features.enabled(FeatureKey::ShowPreferences)
+            && ui.button("Open Preferences…").clicked()
+        {
+            preferences::open(self);
+        }
         if self.features.enabled(FeatureKey::ShowPreferences) {
             let prefs = self.store.list_prefs().unwrap_or_default();
-            ui.collapsing(format!("Preferences ({})", prefs.len()), |ui| {
+            ui.collapsing(format!("Preference rows ({})", prefs.len()), |ui| {
                 egui::Grid::new("pref_grid")
                     .num_columns(2)
                     .striped(true)
@@ -11155,9 +11170,10 @@ impl OdApp {
     // ---------------------------------------------------------------- Settings
 
     fn settings_ui(&mut self, ui: &mut Ui) {
-        ui.heading("Settings");
+        ui.heading("Show features");
         ui.label("Turn features on or off. Changes save automatically.");
-        ui.label("Settings are kept in your Windows AppData folder under odclinic.");
+        ui.label("This is OD's Show Features equivalent. Preferences are edited in Setup → Preferences.");
+        ui.label("Feature toggles are kept in your Windows AppData folder under odclinic.");
         ui.separator();
 
         let mut features = self.features.clone();
@@ -11243,7 +11259,7 @@ impl OdApp {
         };
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Adjustment — New")
+        theme::AppWindow::new("Adjustment — New")
             .open(&mut self.adj_edit_open)
             .resizable(true)
             .default_width(380.0)
@@ -11372,7 +11388,7 @@ impl OdApp {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(format!("Post {} to ledger", source.label()))
+        theme::AppWindow::new(format!("Post {} to ledger", source.label()))
             .open(&mut self.journal_post_open)
             .resizable(true)
             .default_width(560.0)
@@ -11581,7 +11597,7 @@ impl OdApp {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Post all unposted sources")
+        theme::AppWindow::new("Post all unposted sources")
             .open(&mut self.post_all_open)
             .resizable(true)
             .default_width(720.0)
@@ -11951,7 +11967,7 @@ impl OdApp {
             PeriodAction::Close => "Close accounting period",
             PeriodAction::Reopen => "Reopen accounting period",
         };
-        egui::Window::new(title)
+        theme::AppWindow::new(title)
             .open(&mut self.period_action_open)
             .resizable(true)
             .default_width(520.0)
@@ -12083,7 +12099,7 @@ impl OdApp {
 
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Payment — New")
+        theme::AppWindow::new("Payment — New")
             .open(&mut self.payment_edit_open)
             .resizable(true)
             .default_width(480.0)
@@ -12374,7 +12390,7 @@ impl OdApp {
             (false, true) => "Payment plan — New",
             (false, false) => "Payment plan — Edit",
         };
-        egui::Window::new(title)
+        theme::AppWindow::new(title)
             .open(&mut self.plan_edit_open)
             .resizable(true)
             .default_width(460.0)
@@ -12573,7 +12589,7 @@ impl OdApp {
         };
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Plan charge — New")
+        theme::AppWindow::new("Plan charge — New")
             .open(&mut self.plan_charge_edit_open)
             .resizable(true)
             .default_width(360.0)
@@ -12639,7 +12655,7 @@ impl OdApp {
             .collect();
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "Discount plan — New"
         } else {
             "Discount plan — Edit"
@@ -12750,7 +12766,7 @@ impl OdApp {
         let mut selected_plan = sub.discount_plan_num;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "Discount subscription — New"
         } else {
             "Discount subscription — Edit"
@@ -12905,7 +12921,7 @@ impl OdApp {
         let mut save = false;
         let mut cancel = false;
         let status_label = self.treat_plan_status.label().to_string();
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "Treatment plan — New"
         } else {
             "Treatment plan — Edit"
@@ -13042,7 +13058,7 @@ impl OdApp {
         };
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if line.line_num == 0 {
+        theme::AppWindow::new(if line.line_num == 0 {
             "Treatment plan line — New"
         } else {
             "Treatment plan line — Edit"
@@ -13155,7 +13171,7 @@ impl OdApp {
         let is_existing = patient.pat_num != 0;
         let history_on = self.features.enabled(FeatureKey::PatientCorrectionHistory);
 
-        egui::Window::new("Patient — Edit / Correct")
+        theme::AppWindow::new("Patient — Edit / Correct")
             .open(&mut self.patient_edit_open)
             .resizable(true)
             .default_width(460.0)
@@ -13342,7 +13358,7 @@ impl OdApp {
         let mut asap = recall.priority == RecallPriority::Asap;
         let patients = self.patients.clone();
 
-        egui::Window::new("Recall — Edit")
+        theme::AppWindow::new("Recall — Edit")
             .open(&mut self.recall_edit_open)
             .resizable(true)
             .default_width(460.0)
@@ -13462,7 +13478,7 @@ impl OdApp {
         let can_edit_appointments = self.features.enabled(FeatureKey::AppointmentEdit)
             && self.can(Permission::APPOINTMENT_EDIT);
 
-        egui::Window::new(if is_existing {
+        theme::AppWindow::new(if is_existing {
             "Edit appointment"
         } else {
             "New appointment"
@@ -13509,7 +13525,14 @@ impl OdApp {
                         .selected_text(apt.apt_status.label())
                         .show_ui(ui, |ui| {
                             for status in AppointmentStatus::ALL {
-                                ui.selectable_value(&mut apt.apt_status, status, status.label());
+                                if ui
+                                    .selectable_value(&mut apt.apt_status, status, status.label())
+                                    .clicked()
+                                    && status == AppointmentStatus::Asap
+                                {
+                                    // The ASAP list filters on Priority, not AptStatus.
+                                    asap = true;
+                                }
                             }
                         });
                     ui.end_row();
@@ -13657,6 +13680,11 @@ impl OdApp {
         });
 
         if find_patient {
+            apt.priority = if asap {
+                RecallPriority::Asap
+            } else {
+                RecallPriority::Normal
+            };
             self.apt_edit = Some(apt);
             self.apt_edit_open = true;
             self.open_patient_picker(PatientPickerTarget::Appointment);
@@ -13729,10 +13757,9 @@ impl OdApp {
                 );
                 change.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
                 if let Err(e) = self.store.append_appointment_change(&change) {
+                    // History is best-effort; OD writes are policy-gated and must
+                    // not silently swallow the appointment edit itself.
                     self.error = Some(e);
-                    self.apt_edit = Some(apt);
-                    self.apt_edit_open = true;
-                    return;
                 }
             }
             match self.store.upsert_appointment(&apt) {
@@ -13795,7 +13822,7 @@ impl OdApp {
         let rows = self.patient_corrections.clone();
         let mut restore: Option<PatientCorrection> = None;
 
-        egui::Window::new("Patient — Correction history")
+        theme::AppWindow::new("Patient — Correction history")
             .open(&mut self.patient_history_open)
             .resizable(true)
             .default_width(620.0)
@@ -13892,7 +13919,7 @@ impl OdApp {
         let rows = self.apt_history.clone();
         let mut restore: Option<AppointmentChange> = None;
 
-        egui::Window::new("Appointment — History")
+        theme::AppWindow::new("Appointment — History")
             .open(&mut self.apt_history_open)
             .resizable(true)
             .default_width(700.0)
@@ -13984,7 +14011,7 @@ impl OdApp {
         let patient = patient_name(&self.patients, pat_num);
         let mut save = false;
 
-        egui::Window::new("Appointment — Call log")
+        theme::AppWindow::new("Appointment — Call log")
             .open(&mut self.comm_log_open)
             .resizable(true)
             .default_width(460.0)
@@ -14105,7 +14132,7 @@ impl OdApp {
         let mut save = false;
         let mut cancel = false;
 
-        egui::Window::new("Procedure note — New")
+        theme::AppWindow::new("Procedure note — New")
             .open(&mut self.proc_note_open)
             .resizable(true)
             .default_width(460.0)
@@ -14193,7 +14220,7 @@ impl OdApp {
         let patient = patient_name(&self.patients, pat_num);
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Clinical notes — Edit")
+        theme::AppWindow::new("Clinical notes — Edit")
             .open(&mut self.clinical_note_open)
             .resizable(true)
             .default_width(480.0)
@@ -14277,7 +14304,7 @@ impl OdApp {
         let patient = patient_name(&self.patients, pat_num);
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if editing {
+        theme::AppWindow::new(if editing {
             "Condition — Edit"
         } else {
             "Condition — New"

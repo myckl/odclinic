@@ -454,7 +454,9 @@ pub(crate) fn board_ui(app: &mut OdApp, ui: &mut Ui) {
         board.toolbar(
             &patients,
             &providers,
+            &appointments,
             can_create,
+            can_edit,
             can_hold,
             can_message,
             ui,
@@ -489,7 +491,9 @@ impl ScheduleBoard {
         &mut self,
         patients: &[Patient],
         providers: &[Provider],
+        appointments: &[Appointment],
         can_create: bool,
+        can_edit: bool,
         can_hold: bool,
         can_message: bool,
         ui: &mut Ui,
@@ -538,6 +542,24 @@ impl ScheduleBoard {
                         }
                     }
                     ui.separator();
+                    let selected_is_asap = self
+                        .selected_apt
+                        .and_then(|id| appointments.iter().find(|apt| apt.apt_num == id))
+                        .is_some_and(|apt| apt.priority == RecallPriority::Asap);
+                    let asap_label = if selected_is_asap { "Clear ASAP" } else { "Set ASAP" };
+                    if ui
+                        .add_enabled(
+                            can_edit && self.selected_apt.is_some(),
+                            egui::Button::new(asap_label).small(),
+                        )
+                        .on_hover_text("Toggle ASAP priority for the selected appointment")
+                        .clicked()
+                    {
+                        if let Some(apt_num) = self.selected_apt {
+                            actions.push(BoardAction::ToggleAsap(apt_num));
+                        }
+                    }
+                    ui.separator();
                     let search_response = ui.add(
                         egui::TextEdit::singleline(&mut self.search)
                             .hint_text("Search patient…")
@@ -559,7 +581,7 @@ impl ScheduleBoard {
                         if !matches.is_empty() {
                             let ctx = ui.ctx().clone();
                             let action_target = &mut *actions;
-                            egui::Window::new("board_patient_search")
+                            theme::AppWindow::new("board_patient_search")
                                 .anchor(
                                     Align2::LEFT_TOP,
                                     Vec2::new(
@@ -1462,9 +1484,20 @@ impl ScheduleBoard {
                 }
                 egui::Grid::new("board_mini_calendar")
                     .spacing([2.0, 2.0])
+                    // The app theme raises `interact_size.x` to 52px for touch
+                    // targets; seven columns of that width overflow the 258px
+                    // sidebar and clip the last days outside the native window.
+                    .min_col_width(28.0)
+                    .min_row_height(18.0)
                     .show(ui, |ui| {
                         for day in ["S", "M", "T", "W", "T", "F", "S"] {
-                            ui.centered_and_justified(|ui| ui.small(day));
+                            // `centered_and_justified` asks for all available width;
+                            // inside a Grid that makes every column consume the whole
+                            // sidebar and pushes the last days past the window edge.
+                            ui.add_sized(
+                                Vec2::new(26.0, 18.0),
+                                egui::Label::new(egui::RichText::new(day).small()),
+                            );
                         }
                         ui.end_row();
                         let first = self.cal_month.with_day(1).unwrap_or(self.cal_month);
@@ -1676,7 +1709,7 @@ pub(crate) fn hold_window(app: &mut OdApp, ctx: &egui::Context) {
     let mut save = false;
     let mut delete = false;
     let mut cancel = false;
-    egui::Window::new(if is_edit {
+    theme::AppWindow::new(if is_edit {
         "Edit blockout"
     } else {
         "New blockout"
@@ -1903,6 +1936,7 @@ impl OdApp {
             }
             BoardAction::ToggleAsap(apt_num) => {
                 let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+                    self.error = Some(format!("Appointment {apt_num} not found"));
                     return;
                 };
                 apt.priority = if apt.priority == RecallPriority::Asap {
@@ -2024,8 +2058,9 @@ impl OdApp {
             );
             change.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
             if let Err(e) = self.store.append_appointment_change(&change) {
+                // A history write must not prevent the appointment change itself.
+                // OD writes are gated separately and may be disabled by policy.
                 self.error = Some(e);
-                return;
             }
         }
         match self.store.upsert_appointment(&apt) {

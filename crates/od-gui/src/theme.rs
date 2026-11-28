@@ -182,6 +182,73 @@ pub fn apply(ctx: &egui::Context) {
     });
 }
 
+/// A floating dialog that always stays inside the native viewport.
+///
+/// egui keeps an oversized window partly visible but lets its body run past
+/// the app window, where lower buttons cannot be clicked. Bounding the frame
+/// to the viewport and making the body scrollable keeps every control
+/// reachable on short or narrow displays.
+pub struct AppWindow<'a> {
+    inner: egui::Window<'a>,
+}
+
+impl<'a> AppWindow<'a> {
+    pub fn new(title: impl Into<egui::WidgetText>) -> Self {
+        Self {
+            inner: egui::Window::new(title),
+        }
+    }
+
+    pub fn open(mut self, open: &'a mut bool) -> Self {
+        self.inner = self.inner.open(open);
+        self
+    }
+
+    pub fn resizable(mut self, resizable: impl Into<egui::Vec2b>) -> Self {
+        self.inner = self.inner.resizable(resizable);
+        self
+    }
+
+    pub fn default_width(mut self, width: f32) -> Self {
+        self.inner = self.inner.default_width(width);
+        self
+    }
+
+    pub fn default_height(mut self, height: f32) -> Self {
+        self.inner = self.inner.default_height(height);
+        self
+    }
+
+    pub fn anchor(mut self, align: egui::Align2, offset: impl Into<Vec2>) -> Self {
+        self.inner = self.inner.anchor(align, offset);
+        self
+    }
+
+    pub fn collapsible(mut self, collapsible: bool) -> Self {
+        self.inner = self.inner.collapsible(collapsible);
+        self
+    }
+
+    pub fn title_bar(mut self, title_bar: bool) -> Self {
+        self.inner = self.inner.title_bar(title_bar);
+        self
+    }
+
+    pub fn show<R>(
+        self,
+        ctx: &egui::Context,
+        add_contents: impl FnOnce(&mut egui::Ui) -> R,
+    ) -> Option<egui::InnerResponse<Option<R>>> {
+        let rect = ctx.content_rect();
+        let max_size = (rect.size() - Vec2::splat(16.0)).max(Vec2::new(240.0, 160.0));
+        self.inner
+            .constrain_to(rect)
+            .max_size(max_size)
+            .vscroll(true)
+            .show(ctx, add_contents)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

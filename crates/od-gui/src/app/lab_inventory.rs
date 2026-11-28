@@ -217,7 +217,7 @@ impl OdApp {
         let mut save = false;
         let mut cancel = false;
         let mut parse_error: Option<String> = None;
-        egui::Window::new(if case.lab_case_num == 0 {
+        theme::AppWindow::new(if case.lab_case_num == 0 {
             "New lab case"
         } else {
             "Edit lab case"
@@ -430,7 +430,7 @@ impl OdApp {
             .find(|s| s.supply_num == supply_num)
             .map(|s| s.description.clone())
             .unwrap_or_else(|| format!("Supply #{supply_num}"));
-        egui::Window::new(format!("Dispense — {supply_label}"))
+        theme::AppWindow::new(format!("Dispense — {supply_label}"))
             .open(&mut self.supply_dispense_open)
             .resizable(true)
             .default_width(420.0)

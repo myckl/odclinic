@@ -512,7 +512,7 @@ impl OdApp {
         let mut send = false;
         let mut cancel = false;
 
-        egui::Window::new("Send message")
+        theme::AppWindow::new("Send message")
             .open(&mut self.send_message_open)
             .resizable(true)
             .default_width(460.0)
@@ -642,7 +642,7 @@ impl OdApp {
         let rule_type = self.rule_type;
         let comm_type = self.rule_comm_type;
 
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "Reminder rule — New"
         } else {
             "Reminder rule — Edit"

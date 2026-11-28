@@ -30,6 +30,7 @@ enum ShellMenuAction {
     OpenDefinitions(DefinitionsTab),
     OpenEServices(EServicesTab),
     OpenSettings,
+    OpenPreferences,
     SendMessage,
     Logout,
     ScopeNote,
@@ -55,7 +56,8 @@ impl ShellMenuAction {
                 EServicesTab::Rules => "Reminder rules",
                 EServicesTab::Outbox => "Outbox",
             },
-            Self::OpenSettings => "Settings / feature toggles",
+            Self::OpenSettings => "Show features",
+            Self::OpenPreferences => "Preferences…",
             Self::SendMessage => "Send message…",
             Self::Logout => "Log off",
             Self::ScopeNote => "Scope and limitations",
@@ -112,6 +114,9 @@ fn shell_menus(features: &FeatureSettings) -> Vec<(&'static str, Vec<ShellMenuAc
     }
     if features.enabled(FeatureKey::EServicesEnabled) {
         setup.push(ShellMenuAction::OpenEServices(EServicesTab::Channels));
+    }
+    if features.enabled(FeatureKey::ShowPreferences) {
+        setup.push(ShellMenuAction::OpenPreferences);
     }
     setup.push(ShellMenuAction::OpenSettings);
 
@@ -529,7 +534,12 @@ impl OdApp {
             }
             ShellMenuAction::OpenSettings => {
                 self.show_settings = true;
-                self.notice = Some("Feature toggles are per user on this workstation".into());
+                self.preferences.open = false;
+                self.notice = Some("Show Features toggles are per user on this workstation".into());
+            }
+            ShellMenuAction::OpenPreferences => {
+                preferences::open(self);
+                self.show_settings = false;
             }
             ShellMenuAction::SendMessage => {
                 if self.features.enabled(FeatureKey::EServicesEnabled) {
@@ -710,8 +720,10 @@ pub(super) fn patient_banner(app: &mut OdApp, ui: &mut Ui) {
                         {
                             action = Some(BannerAction::Recall);
                         }
-                        if app.features.enabled(FeatureKey::AsapListEnabled)
-                            && ui.button("ASAP").clicked()
+                        if ui
+                            .button("ASAP")
+                            .on_hover_text("Opens an unscheduled ASAP draft; press Save to apply.")
+                            .clicked()
                         {
                             action = Some(BannerAction::Asap);
                         }
@@ -884,7 +896,7 @@ pub(super) fn patient_picker_window(app: &mut OdApp, ctx: &egui::Context) {
     let mut new_patient = false;
     let mut cancel = false;
 
-    egui::Window::new("Select Patient")
+    theme::AppWindow::new("Select Patient")
         .open(&mut app.patient_picker_open)
         .resizable(true)
         .default_width(760.0)

@@ -208,7 +208,7 @@ impl OdApp {
         let is_new = edit.def_num == 0;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "New definition"
         } else {
             "Edit definition"
@@ -476,7 +476,7 @@ impl OdApp {
         let is_new = edit.display_field_num == 0;
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new(if is_new {
+        theme::AppWindow::new(if is_new {
             "New display field"
         } else {
             "Edit display field"
