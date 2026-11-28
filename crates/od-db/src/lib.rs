@@ -83,6 +83,19 @@ pub trait Store: Send + Sync {
     fn list_refattaches(&self) -> Result<Vec<RefAttach>, String>;
     /// All OD `procnote` rows, needed by the Procedure Notes report.
     fn list_proc_notes(&self) -> Result<Vec<ProcNote>, String>;
+    /// Append an OD `procnote` row. OD notes are immutable, so there is no
+    /// update or delete. Writes require the explicit OD-write opt-in.
+    fn append_proc_note(&self, _note: &ProcNote) -> Result<Id, String> {
+        Err("Procedure note writes are not supported by this store".into())
+    }
+    /// All port-local appointment call-log rows (confirmations and phone calls).
+    fn list_comm_logs(&self) -> Result<Vec<CommLog>, String> {
+        Ok(Vec::new())
+    }
+    /// Insert or update one port-local call log row. No OD-owned write is made.
+    fn upsert_comm_log(&self, _log: &CommLog) -> Result<Id, String> {
+        Err("Call log writes are not supported by this store".into())
+    }
     /// OD chart-of-accounts rows, needed by the three accounting reports.
     fn list_accounts(&self) -> Result<Vec<Account>, String>;
     /// All OD `journalentry` rows; the builders apply the date filters.
@@ -516,6 +529,24 @@ impl Store for Backend {
         match self {
             Backend::Demo(s) => s.list_proc_notes(),
             Backend::MySql(s) => s.list_proc_notes(),
+        }
+    }
+    fn append_proc_note(&self, note: &ProcNote) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.append_proc_note(note),
+            Backend::MySql(s) => s.append_proc_note(note),
+        }
+    }
+    fn list_comm_logs(&self) -> Result<Vec<CommLog>, String> {
+        match self {
+            Backend::Demo(s) => s.list_comm_logs(),
+            Backend::MySql(s) => s.list_comm_logs(),
+        }
+    }
+    fn upsert_comm_log(&self, log: &CommLog) -> Result<Id, String> {
+        match self {
+            Backend::Demo(s) => s.upsert_comm_log(log),
+            Backend::MySql(s) => s.upsert_comm_log(log),
         }
     }
     fn list_accounts(&self) -> Result<Vec<Account>, String> {

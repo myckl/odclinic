@@ -168,6 +168,8 @@ enum BoardAction {
     NextHoldColor(u64),
     EditHold(BoardHold),
     SendMessage,
+    SetConfirmed(Id, Id),
+    OpenCallLog(Id, Id),
 }
 
 #[derive(Clone)]
@@ -211,6 +213,11 @@ pub(crate) struct ScheduleBoard {
     hold_start_text: String,
     hold_len_text: String,
     hold_color_index: usize,
+    /// Visible ApptConfirmed definitions for the confirmation submenu.
+    confirmation_defs: Vec<Definition>,
+    /// Port-local call history shown in appointment hover cards.
+    comm_logs: Vec<CommLog>,
+    call_log_enabled: bool,
     /// Set when a blockout is converted into an appointment; the appointment
     /// editor's successful save consumes it.
     pub(crate) pending_hold_delete: Option<u64>,
@@ -240,6 +247,9 @@ impl ScheduleBoard {
             hold_start_text: "09:00".to_string(),
             hold_len_text: "30".to_string(),
             hold_color_index: 0,
+            confirmation_defs: Vec::new(),
+            comm_logs: Vec::new(),
+            call_log_enabled: false,
             pending_hold_delete: None,
         };
         board.load_prefs();
@@ -431,6 +441,16 @@ pub(crate) fn board_ui(app: &mut OdApp, ui: &mut Ui) {
     let mut actions = Vec::new();
     {
         let board = &mut app.board;
+        board.confirmation_defs = app
+            .definitions
+            .iter()
+            .filter(|def| {
+                def.category == DefinitionCategory::APPT_CONFIRMED && !def.is_hidden
+            })
+            .cloned()
+            .collect();
+        board.comm_logs = app.comm_logs.clone();
+        board.call_log_enabled = app.features.enabled(FeatureKey::AppointmentCallLog);
         board.toolbar(
             &patients,
             &providers,
@@ -840,6 +860,9 @@ impl ScheduleBoard {
             return;
         }
         self.column_rects.clear();
+        let confirmation_defs = self.confirmation_defs.clone();
+        let comm_logs = self.comm_logs.clone();
+        let call_log_enabled = self.call_log_enabled;
         let col_width = ((ui.available_width() - GUTTER_WIDTH) / cols.len() as f32).max(120.0);
         let grid_height = (DAY_END_MIN - DAY_START_MIN) as f32 * PIXELS_PER_MIN;
         let full_width = GUTTER_WIDTH + col_width * cols.len() as f32;
@@ -1139,6 +1162,8 @@ impl ScheduleBoard {
                         );
                         let hover_name = name.clone();
                         let hover_apt = apt.clone();
+                        let hover_logs = comm_logs.clone();
+                        let hover_defs = confirmation_defs.clone();
                         let response = response.on_hover_ui(move |ui| {
                             ui.strong(&hover_name);
                             ui.label(format!(
@@ -1149,6 +1174,34 @@ impl ScheduleBoard {
                             ));
                             ui.label(format!("Length: {} min", block.len));
                             ui.label(format!("Status: {}", hover_apt.apt_status.label()));
+                            let confirmed = hover_defs
+                                .iter()
+                                .find(|def| def.def_num == hover_apt.confirmed)
+                                .map(|def| def.item_name.clone())
+                                .unwrap_or_else(|| {
+                                    if hover_apt.confirmed == 0 {
+                                        "Not confirmed".into()
+                                    } else {
+                                        format!("Definition #{}", hover_apt.confirmed)
+                                    }
+                                });
+                            ui.label(format!("Confirmation: {confirmed}"));
+                            let recent: Vec<&CommLog> = hover_logs
+                                .iter()
+                                .filter(|log| log.apt_num == hover_apt.apt_num)
+                                .take(3)
+                                .collect();
+                            if !recent.is_empty() {
+                                ui.label("Recent calls");
+                                for log in recent {
+                                    ui.small(format!(
+                                        "{} · {} · {}",
+                                        log.comm_date_time.format("%b %d %H:%M"),
+                                        log.mode.label(),
+                                        log.note
+                                    ));
+                                }
+                            }
                             if !hover_apt.notes.is_empty() {
                                 ui.label("Notes");
                                 ui.label(&hover_apt.notes);
@@ -1250,6 +1303,21 @@ impl ScheduleBoard {
                                 }
                                 if ui.button("Reschedule…").clicked() {
                                     actions.push(BoardAction::OpenEdit(apt.apt_num));
+                                }
+                                if call_log_enabled && !confirmation_defs.is_empty() {
+                                    ui.menu_button("Mark confirmed", |ui| {
+                                        for def in &confirmation_defs {
+                                            if ui.button(&def.item_name).clicked() {
+                                                actions.push(BoardAction::SetConfirmed(
+                                                    apt.apt_num,
+                                                    def.def_num,
+                                                ));
+                                            }
+                                        }
+                                    });
+                                }
+                                if call_log_enabled && ui.button("Log call / confirmation…").clicked() {
+                                    actions.push(BoardAction::OpenCallLog(apt.apt_num, apt.pat_num));
                                 }
                                 if ui
                                     .button(if apt.priority == RecallPriority::Asap {
@@ -1924,6 +1992,26 @@ impl OdApp {
                 );
             }
             BoardAction::SendMessage => self.send_message_open = true,
+            BoardAction::SetConfirmed(apt_num, def_num) => {
+                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+                    return;
+                };
+                apt.confirmed = def_num;
+                let note = format!("Appointment {apt_num} confirmed from the board");
+                self.save_board_appointment(apt, &note);
+            }
+            BoardAction::OpenCallLog(apt_num, pat_num) => {
+                if !self.features.enabled(FeatureKey::AppointmentCallLog) {
+                    self.error = Some("Appointment call log is turned off in Settings".into());
+                    return;
+                }
+                self.comm_log_apt_num = apt_num;
+                self.comm_log_pat_num = pat_num;
+                self.comm_log_note.clear();
+                self.comm_log_mode = CommLogMode::Phone;
+                self.comm_log_direction = CommLogDirection::Received;
+                self.comm_log_open = true;
+            }
         }
     }
 

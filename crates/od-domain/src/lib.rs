@@ -145,6 +145,10 @@ pub enum FeatureKey {
     EServicesEnabled,
     RemindersEnabled,
     ConfirmationsEnabled,
+    PostTreatmentRemindersEnabled,
+    AppointmentCallLog,
+    PatientBadges,
+    ClinicalNotes,
     ReminderDryRun,
     AuditReminders,
     ShowDefinitions,
@@ -205,7 +209,7 @@ pub enum FeatureKey {
 }
 
 impl FeatureKey {
-    pub const ALL: [Self; 117] = [
+    pub const ALL: [Self; 121] = [
         Self::ModuleAppointments,
         Self::ModuleFamily,
         Self::ModuleAccount,
@@ -266,6 +270,10 @@ impl FeatureKey {
         Self::EServicesEnabled,
         Self::RemindersEnabled,
         Self::ConfirmationsEnabled,
+        Self::PostTreatmentRemindersEnabled,
+        Self::AppointmentCallLog,
+        Self::PatientBadges,
+        Self::ClinicalNotes,
         Self::ReminderDryRun,
         Self::AuditReminders,
         Self::ShowDefinitions,
@@ -387,6 +395,10 @@ impl FeatureKey {
             Self::EServicesEnabled => "eservices_enabled",
             Self::RemindersEnabled => "reminders_enabled",
             Self::ConfirmationsEnabled => "confirmations_enabled",
+            Self::PostTreatmentRemindersEnabled => "post_treatment_reminders",
+            Self::AppointmentCallLog => "appointment_call_log",
+            Self::PatientBadges => "patient_badges",
+            Self::ClinicalNotes => "clinical_notes",
             Self::ReminderDryRun => "reminder_dry_run",
             Self::AuditReminders => "audit_reminders",
             Self::ShowDefinitions => "show_definitions",
@@ -509,6 +521,10 @@ impl FeatureKey {
             Self::EServicesEnabled => "eServices (local reminders)",
             Self::RemindersEnabled => "Appointment reminders",
             Self::ConfirmationsEnabled => "Future-day confirmations",
+            Self::PostTreatmentRemindersEnabled => "72-hour post-treatment follow-up",
+            Self::AppointmentCallLog => "Confirmation and call log",
+            Self::PatientBadges => "New-patient and referral badges",
+            Self::ClinicalNotes => "Procedure notes in the registry",
             Self::ReminderDryRun => "Reminder dry-run mode",
             Self::AuditReminders => "Audit reminder sends",
             Self::ShowDefinitions => "Definitions in Setup",
@@ -633,6 +649,10 @@ impl FeatureKey {
             Self::EServicesEnabled => "Master switch for local appointment reminders. When off, no rules are evaluated and no messages are queued. Uses your own outbox and transports — never the Open Dental HQ servers.",
             Self::RemindersEnabled => "Evaluate reminder rules for upcoming appointments and queue messages to the local outbox.",
             Self::ConfirmationsEnabled => "Evaluate future-day confirmation rules (OD ApptReminderType.ConfirmationFutureDay).",
+            Self::PostTreatmentRemindersEnabled => "Send OD GeneralMessage rules after a procedure is completed. A 4320-minute rule sends a 72-hour post-treatment follow-up, deduplicated per appointment.",
+            Self::AppointmentCallLog => "Record confirmations and phone calls against an appointment in the port-local call log and show the latest entries on the board. Confirmation changes still write OD appointment.Confirmed and require ODCLINIC_ALLOW_OD_WRITES=1 on a configured database.",
+            Self::PatientBadges => "Show derived New patient and referral badges in the patient picker, family grid and registry overview. Read-only; no family or guarantor grouping.",
+            Self::ClinicalNotes => "Add and read procedure notes in the registry's Clinical tab. OD procnote rows are append-only and OD-owned writes require ODCLINIC_ALLOW_OD_WRITES=1.",
             Self::ReminderDryRun => "Render messages and write them to the outbox with Dry run status, but do not call any transport. On by default so nothing leaves the machine until you configure a channel.",
             Self::AuditReminders => "Write a securitylog entry when reminders are generated or delivered.",
             Self::ShowDefinitions => "Show the OD definition list editor in Setup (adjustment types, payment types, colours and other drop-downs). Requires the OD Definition Edit permission when enforcement is on.",
@@ -786,9 +806,12 @@ impl FeatureKey {
             Self::EServicesEnabled
             | Self::RemindersEnabled
             | Self::ConfirmationsEnabled
+            | Self::PostTreatmentRemindersEnabled
             | Self::ReminderDryRun
             | Self::AuditReminders => "eServices",
-            Self::ShowImagingNote | Self::ShowDatabaseLabel => "Display",
+            Self::AppointmentCallLog => "Appointments",
+            Self::ClinicalNotes => "Chart",
+            Self::PatientBadges | Self::ShowImagingNote | Self::ShowDatabaseLabel => "Display",
             Self::ShowPreferences
             | Self::ShowUsers
             | Self::ShowPermissions
@@ -1311,6 +1334,11 @@ pub struct Appointment {
     /// the unscheduled list — this port's waitlist. It lets a clinic classify
     /// why a patient is waiting without changing the appointment status.
     pub waitlist_status: Id,
+    /// OD `appointment.Confirmed`: FK to `definition.DefNum` in DefCat
+    /// `ApptConfirmed` (2). Zero means the appointment is not confirmed.
+    pub confirmed: Id,
+    /// OD `appointment.IsNewPatient`. Feeds the read-only new-patient badge.
+    pub is_new_patient: bool,
 }
 
 /// A snapshot of an appointment, mapping to OD's `histappointment` table.
@@ -1547,6 +1575,9 @@ pub struct Procedure {
     /// FK to price the `Sched` column.
     pub apt_num: Id,
     pub proc_date: NaiveDate,
+    /// OD `procedurelog.DateComplete`, the timestamp used as the anchor for
+    /// post-treatment (GeneralMessage) rules. `set_procedure_complete` fills it.
+    pub date_complete: Option<NaiveDateTime>,
     pub proc_status: ProcedureStatus,
     pub tooth_num: String,
     pub provider_num: Id,
@@ -1566,6 +1597,102 @@ pub struct Procedure {
     /// OD `procedurelog.SnomedBodySite` — SNOMED body-site code (sealant measure).
     pub snomed_body_site: String,
     pub description_override: String,
+}
+
+/// OD `commlog.Mode_`: the channel used for a patient communication.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CommLogMode {
+    #[default]
+    None = 0,
+    Email = 1,
+    Mail = 2,
+    Phone = 3,
+    InPerson = 4,
+    Text = 5,
+}
+
+impl CommLogMode {
+    pub const ALL: [Self; 6] = [
+        Self::None,
+        Self::Email,
+        Self::Mail,
+        Self::Phone,
+        Self::InPerson,
+        Self::Text,
+    ];
+
+    pub fn from_od(value: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|mode| *mode as u8 == value)
+            .unwrap_or_default()
+    }
+
+    pub fn as_od(self) -> u8 {
+        self as u8
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Not recorded",
+            Self::Email => "Email",
+            Self::Mail => "Mail",
+            Self::Phone => "Phone",
+            Self::InPerson => "In person",
+            Self::Text => "Text",
+        }
+    }
+}
+
+/// OD `commlog.SentOrReceived`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum CommLogDirection {
+    #[default]
+    Neither = 0,
+    Sent = 1,
+    Received = 2,
+}
+
+impl CommLogDirection {
+    pub const ALL: [Self; 3] = [Self::Neither, Self::Sent, Self::Received];
+
+    pub fn from_od(value: u8) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|direction| *direction as u8 == value)
+            .unwrap_or_default()
+    }
+
+    pub fn as_od(self) -> u8 {
+        self as u8
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Neither => "Note",
+            Self::Sent => "Sent",
+            Self::Received => "Received",
+        }
+    }
+}
+
+/// One OD `commlog` row: a phone call, message, letter or in-person contact.
+/// `comm_type` is a FK to `definition.DefNum` in DefCat `CommLogTypes` (27).
+#[derive(Clone, Debug, Default)]
+pub struct CommLog {
+    pub comm_log_num: Id,
+    /// Port-local link to the appointment this call or confirmation belongs to.
+    /// OD `commlog` has no appointment FK, so the link lives in the side table.
+    pub apt_num: Id,
+    pub pat_num: Id,
+    pub comm_date_time: NaiveDateTime,
+    pub comm_type: Id,
+    pub mode: CommLogMode,
+    pub sent_or_received: CommLogDirection,
+    pub note: String,
+    pub user_num: Id,
 }
 
 /// A referring doctor or source (OD `referral`). The name and address fields

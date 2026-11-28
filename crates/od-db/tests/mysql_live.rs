@@ -54,10 +54,10 @@ use od_domain::reports::{
 };
 use od_domain::{
     Account, Adjustment, Appointment, AppointmentChange, AppointmentChangeAction, AppointmentStatus,
-    DiscountPlan, DiscountPlanSub, Gender, JournalEntry, LabCase, LabCaseStage, Patient,
-    PatientCorrection, PayPlan, PayPlanCharge, PayPlanChargeType, Payment, PaymentAllocation,
-    PaymentTarget, PaySplit, Pref, Procedure, ProcedureStatus, Recall, RecallPriority, Statement,
-    SupplyDispense, TreatPlan, TreatPlanLine, TreatPlanStatus,
+    CommLog, CommLogDirection, CommLogMode, DiscountPlan, DiscountPlanSub, Gender, JournalEntry,
+    LabCase, LabCaseStage, Patient, PatientCorrection, PayPlan, PayPlanCharge, PayPlanChargeType,
+    Payment, PaymentAllocation, PaymentTarget, PaySplit, Pref, Procedure, ProcedureStatus, ProcNote,
+    Recall, RecallPriority, Statement, SupplyDispense, TreatPlan, TreatPlanLine, TreatPlanStatus,
 };
 
 fn live_db_pool(url: &str) -> mysql::Pool {
@@ -5781,4 +5781,250 @@ fn mysql_wave1_payment_plans_force_patient_guarantor() {
     assert!(!wrong_patient_plans, "plan leaked into another patient's account");
     assert!(!wrong_patient_charges, "plan charge leaked into another patient's account");
     println!("live plan/charge guarantor scoping passed and fixtures were removed");
+}
+
+/// Wave 2 gate: an explicit ApptConfirmed definition survives a store update,
+/// and procedurelog.DateComplete is read back through `list_procedures`. This
+/// is the OD-owned state the confirmation menu and 72-hour follow-up rely on.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes temporary fixtures"]
+fn mysql_wave2_confirmation_and_completion_round_trip() {
+    let url = live_url();
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+
+    let pat_num: i64 = conn
+        .query_first("SELECT MIN(PatNum) FROM patient")
+        .expect("could not read patients")
+        .expect("no patient rows in the demo database");
+    let pat_num = pat_num as u32;
+    let prov_num: u32 = conn
+        .query_first("SELECT MIN(ProvNum) FROM provider WHERE IsHidden = 0")
+        .expect("could not read providers")
+        .unwrap_or(0) as u32;
+    let code_num: u32 = conn
+        .query_first("SELECT MIN(CodeNum) FROM procedurecode")
+        .expect("could not read procedure codes")
+        .unwrap_or(0) as u32;
+    let defs: Vec<i64> = conn
+        .query(
+            "SELECT DefNum FROM definition WHERE Category = 2 AND IsHidden = 0 \
+             ORDER BY DefNum LIMIT 2",
+        )
+        .expect("could not read confirmation definitions")
+        .into_iter()
+        .map(|row| {
+            let (num,): (i64,) = mysql::from_row(row);
+            num
+        })
+        .collect();
+    assert!(!defs.is_empty(), "no visible ApptConfirmed definitions");
+    let first_def = defs[0] as u32;
+    let second_def = defs.get(1).copied().unwrap_or(defs[0]) as u32;
+
+    let apt_num = high_fixture_num(40);
+    let proc_num = high_fixture_num(41);
+    conn.exec_drop("DELETE FROM procedurelog WHERE ProcNum = ?", (proc_num,))
+        .expect("could not clean old procedure fixture");
+    conn.exec_drop("DELETE FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("could not clean old appointment fixture");
+
+    let mut appointment = Appointment::default();
+    appointment.apt_num = apt_num;
+    appointment.pat_num = pat_num;
+    appointment.apt_datetime = chrono::NaiveDate::from_ymd_opt(2099, 1, 1)
+        .unwrap()
+        .and_hms_opt(9, 0, 0)
+        .unwrap();
+    appointment.apt_status = AppointmentStatus::Scheduled;
+    appointment.notes = "ODCLINIC_WAVE2".into();
+    appointment.pattern = "XX".into();
+    appointment.confirmed = first_def;
+    store
+        .upsert_appointment(&appointment)
+        .expect("appointment write failed under AllowOdWrites");
+
+    let stored = store
+        .get_appointment(apt_num)
+        .expect("appointment read-back failed")
+        .expect("inserted appointment missing");
+    let db_first: Option<i64> = conn
+        .exec_first("SELECT Confirmed FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("confirmation read-back failed");
+    assert_eq!(stored.confirmed, first_def, "store lost the confirmation FK");
+    assert_eq!(db_first.unwrap_or(-1), first_def as i64);
+
+    let mut changed = stored.clone();
+    changed.confirmed = second_def;
+    store
+        .upsert_appointment(&changed)
+        .expect("confirmation update failed");
+    let db_second: Option<i64> = conn
+        .exec_first("SELECT Confirmed FROM appointment WHERE AptNum = ?", (apt_num,))
+        .expect("confirmation update read-back failed");
+    assert_eq!(db_second.unwrap_or(-1), second_def as i64);
+
+    let completed = "2099-01-01 10:30:00";
+    conn.exec_drop(
+        "INSERT INTO procedurelog \
+         (ProcNum,PatNum,AptNum,ProvNum,CodeNum,ProcDate,ProcFee,ProcStatus,DateComplete) \
+         VALUES (?,?,?,?,?,'2099-01-01',0,2,?)",
+        (
+            proc_num,
+            pat_num,
+            apt_num,
+            prov_num,
+            code_num,
+            completed,
+        ),
+    )
+    .expect("procedure fixture insert failed");
+    let procedure = store
+        .list_procedures(pat_num)
+        .expect("procedure read-back failed")
+        .into_iter()
+        .find(|proc| proc.proc_num == proc_num)
+        .expect("inserted procedure missing from store read");
+    let read_apt_num = procedure.apt_num;
+    let read_complete = procedure
+        .date_complete
+        .map(|stamp| stamp.format("%Y-%m-%d %H:%M:%S").to_string());
+    // OD 24_3 declares procedurelog.DateComplete as a DATE, so a full datetime
+    // fixture is truncated to the date on a genuine schema. The store must read
+    // either shape without inventing a time.
+    let date_complete_type: String = conn
+        .query_first(
+            "SELECT DATA_TYPE FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'procedurelog' \
+             AND COLUMN_NAME = 'DateComplete'",
+        )
+        .expect("could not inspect DateComplete column type")
+        .expect("DateComplete column type missing");
+    let expected_complete = if date_complete_type.eq_ignore_ascii_case("date") {
+        // The store maps an OD DATE to midnight, matching DateTime.MinValue
+        // handling for unset values but preserving the calendar day.
+        "2099-01-01 00:00:00"
+    } else {
+        completed
+    };
+
+    // MyISAM ignores ROLLBACK, so clean up before the assertions.
+    let proc_cleanup = conn.exec_drop("DELETE FROM procedurelog WHERE ProcNum = ?", (proc_num,));
+    let apt_cleanup = conn.exec_drop("DELETE FROM appointment WHERE AptNum = ?", (apt_num,));
+    assert!(proc_cleanup.is_ok(), "procedure fixture was not removed");
+    assert!(apt_cleanup.is_ok(), "appointment fixture was not removed");
+
+    assert_eq!(read_apt_num, apt_num);
+    assert_eq!(
+        read_complete.as_deref(),
+        Some(expected_complete),
+        "DateComplete was not read from OD procedurelog (got {read_complete:?})"
+    );
+    println!("live confirmation/DateComplete round trip passed and fixtures were removed");
+}
+
+/// Wave 2 gate: OD `procnote` writes obey the default deny gate and, when
+/// allowed, produce an OD-shaped row. Notes are append-only and cleaned up by
+/// primary key afterwards.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; writes temporary fixtures"]
+fn mysql_wave2_proc_note_append_is_gated_and_od_shaped() {
+    let url = live_url();
+    let deny_store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::DenyOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let pat_num: u32 = {
+        let pool = live_db_pool(&url);
+        let mut conn = pool.get_conn().expect("MySQL connect failed");
+        let first: i64 = conn
+            .query_first("SELECT MIN(PatNum) FROM patient")
+            .expect("could not read patients")
+            .expect("no patient rows in the demo database");
+        first as u32
+    };
+
+    let mut note = ProcNote {
+        pat_num,
+        proc_num: 0,
+        note: "ODCLINIC_WAVE2_DENY".into(),
+        ..Default::default()
+    };
+    let denied = deny_store
+        .append_proc_note(&note)
+        .expect_err("procnote write succeeded while DenyOdWrites was active");
+    assert!(
+        denied.contains("OD writes are disabled"),
+        "unexpected gate error: {denied}"
+    );
+
+    let pool = live_db_pool(&url);
+    let mut conn = pool.get_conn().expect("MySQL connect failed");
+    let denied_rows: Option<i64> = conn
+        .exec_first("SELECT COUNT(*) FROM procnote WHERE Note = ?", ("ODCLINIC_WAVE2_DENY",))
+        .expect("could not verify denied note left no row");
+    assert_eq!(denied_rows.unwrap_or(0), 0, "denied procnote write still inserted a row");
+
+    let store = MySqlStore::with_policy(&url, SchemaMode::Strict, WritePolicy::AllowOdWrites)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    note.note = "ODCLINIC_WAVE2".into();
+    note.signature = "ODClinic test".into();
+    let note_num = store
+        .append_proc_note(&note)
+        .expect("procnote write failed under AllowOdWrites");
+
+    let read: Option<(i64, i32, i64, String)> = conn
+        .exec_first(
+            "SELECT PatNum,UserNum,ProcNum,Note FROM procnote WHERE ProcNoteNum = ?",
+            (note_num,),
+        )
+        .expect("procnote read-back failed");
+    let cleanup = conn.exec_drop("DELETE FROM procnote WHERE ProcNoteNum = ?", (note_num,));
+    assert!(cleanup.is_ok(), "procnote fixture was not removed");
+
+    let (read_pat, read_user, read_proc, read_note) =
+        read.expect("inserted procnote missing on read-back");
+    assert_eq!(read_pat as u32, pat_num);
+    assert!(read_user > 0, "OD audit user was not supplied");
+    assert_eq!(read_note, "ODCLINIC_WAVE2");
+    assert_eq!(read_proc, 0);
+    println!("live procnote gate/write passed and fixture was removed");
+}
+
+/// Wave 2 gate: in strict mode the local call-log side table is not created.
+/// Reads degrade to empty and writes fail closed with a bootstrap hint.
+#[test]
+#[ignore = "requires a real OD 24_3 ODCLINIC_DB_URL; read-only on a strict schema"]
+fn mysql_wave2_call_log_is_absent_in_strict_mode() {
+    let url = live_url();
+    let store = MySqlStore::with_mode(&url, SchemaMode::Strict)
+        .expect("strict startup rejected a genuine OD 24_3 schema");
+    let logs = store
+        .list_comm_logs()
+        .expect("missing call log table should read as empty");
+    assert!(logs.is_empty(), "strict mode should not expose a call log");
+
+    let pat_num: u32 = {
+        let pool = live_db_pool(&url);
+        let mut conn = pool.get_conn().expect("MySQL connect failed");
+        let first: i64 = conn
+            .query_first("SELECT MIN(PatNum) FROM patient")
+            .expect("could not read patients")
+            .expect("no patient rows in the demo database");
+        first as u32
+    };
+    let error = store
+        .upsert_comm_log(&CommLog {
+            pat_num,
+            mode: CommLogMode::Phone,
+            sent_or_received: CommLogDirection::Received,
+            note: "ODCLINIC_WAVE2_STRICT".into(),
+            ..Default::default()
+        })
+        .expect_err("call log write succeeded without a side table");
+    assert!(
+        error.contains("bootstrap"),
+        "unexpected missing-table error: {error}"
+    );
+    println!("live call-log absence behaviour passed without changing the schema");
 }

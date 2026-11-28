@@ -24,29 +24,35 @@ pub enum ReminderType {
     #[default]
     Reminder = 0,
     ConfirmationFutureDay = 1,
+    ScheduleThankYou = 4,
     Arrival = 5,
     Birthday = 6,
     GeneralMessage = 7,
     WebSchedRecall = 8,
+    NewPatientThankYou = 9,
 }
 
 impl ReminderType {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::Reminder,
         Self::ConfirmationFutureDay,
+        Self::ScheduleThankYou,
         Self::Arrival,
         Self::Birthday,
         Self::GeneralMessage,
         Self::WebSchedRecall,
+        Self::NewPatientThankYou,
     ];
 
     pub fn from_od(value: i8) -> Self {
         match value {
             1 => Self::ConfirmationFutureDay,
+            4 => Self::ScheduleThankYou,
             5 => Self::Arrival,
             6 => Self::Birthday,
             7 => Self::GeneralMessage,
             8 => Self::WebSchedRecall,
+            9 => Self::NewPatientThankYou,
             _ => Self::Reminder,
         }
     }
@@ -59,10 +65,12 @@ impl ReminderType {
         match self {
             Self::Reminder => "Appointment reminder",
             Self::ConfirmationFutureDay => "Future-day confirmation",
+            Self::ScheduleThankYou => "Automated thank-you",
             Self::Arrival => "Arrival message",
             Self::Birthday => "Birthday message",
-            Self::GeneralMessage => "General message",
+            Self::GeneralMessage => "Post-treatment follow-up",
             Self::WebSchedRecall => "WebSched recall",
+            Self::NewPatientThankYou => "New patient thank-you",
         }
     }
 }
@@ -485,9 +493,11 @@ mod tests {
     fn od_enum_values_match_source() {
         assert_eq!(ReminderType::Reminder.as_od(), 0);
         assert_eq!(ReminderType::ConfirmationFutureDay.as_od(), 1);
+        assert_eq!(ReminderType::ScheduleThankYou.as_od(), 4);
         assert_eq!(ReminderType::Arrival.as_od(), 5);
         assert_eq!(ReminderType::GeneralMessage.as_od(), 7);
         assert_eq!(ReminderType::from_od(8), ReminderType::WebSchedRecall);
+        assert_eq!(ReminderType::from_od(9), ReminderType::NewPatientThankYou);
         assert_eq!(CommType::Preferred.as_od(), 0);
         assert_eq!(CommType::from_od(3), CommType::SecureEmail);
         assert_eq!(OutboxStatus::from_od(4), OutboxStatus::DryRun);

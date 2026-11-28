@@ -6,12 +6,18 @@
 
 use chrono::{Datelike, NaiveDateTime};
 use od_domain::eservices::*;
-use od_domain::{Appointment, AppointmentStatus, Clinic, Id, Operatory, Patient, Provider};
+use od_domain::{
+    Appointment, AppointmentStatus, Clinic, Id, Operatory, Patient, Procedure, ProcedureStatus,
+    Provider,
+};
 
 /// Everything the rule engine needs, gathered once by the caller.
 pub struct ReminderContext<'a> {
     pub rules: &'a [ReminderRule],
     pub appointments: &'a [Appointment],
+    /// Completed procedures are the time anchor for OD GeneralMessage
+    /// post-treatment follow-ups.
+    pub procedures: &'a [Procedure],
     pub patients: &'a [Patient],
     pub contacts: &'a [PatientContact],
     pub providers: &'a [Provider],
@@ -131,12 +137,132 @@ fn fallback_body(rule: &ReminderRule) -> &'static str {
     match rule.type_cur {
         ReminderType::ConfirmationFutureDay => "Please confirm your upcoming appointment at {Clinic} on {DateTime}. Reply to this message to confirm.",
         ReminderType::Arrival => "You have an appointment at {Clinic} today at {Time}. Please let us know when you arrive.",
+        ReminderType::ScheduleThankYou | ReminderType::NewPatientThankYou | ReminderType::GeneralMessage => {
+            "Thank you for visiting {Clinic} on {DateTime}. We hope you have a smooth recovery."
+        }
         _ => "This is a reminder for your appointment at {Clinic} on {DateTime}.",
     }
 }
 
+fn default_subject(rule: &ReminderRule) -> &'static str {
+    match rule.type_cur {
+        ReminderType::ConfirmationFutureDay => "Appointment confirmation",
+        ReminderType::ScheduleThankYou
+        | ReminderType::NewPatientThankYou
+        | ReminderType::GeneralMessage => "Thank you",
+        _ => "Appointment reminder",
+    }
+}
+
+/// Shared recipient/template selection for both the upcoming-appointment rules
+/// and the completed-procedure follow-up rules.
+fn candidate_message(
+    rule: &ReminderRule,
+    patient: &Patient,
+    appointment: &Appointment,
+    ctx: &ReminderContext<'_>,
+) -> Option<OutboxMessage> {
+    let contact = ctx
+        .contacts
+        .iter()
+        .find(|c| c.pat_num == patient.pat_num)
+        .cloned()
+        .unwrap_or_else(|| PatientContact {
+            pat_num: patient.pat_num,
+            ..Default::default()
+        });
+    if contact.opt_out_email && contact.opt_out_telegram {
+        return None;
+    }
+
+    let effective_email = if contact.email_override.trim().is_empty() {
+        patient.email.trim()
+    } else {
+        contact.email_override.trim()
+    };
+    let transport = resolve_transport(
+        rule.comm_type,
+        Some(effective_email),
+        &contact.telegram_chat_id,
+        Some(&patient.home_phone),
+        ctx.config,
+    )?;
+    if transport.is_email() && contact.opt_out_email {
+        return None;
+    }
+    if is_text_transport(transport) && contact.opt_out_telegram {
+        return None;
+    }
+
+    let recipient = match transport {
+        TransportKind::Smtp => effective_email.to_string(),
+        TransportKind::Telegram => contact.telegram_chat_id.trim().to_string(),
+        TransportKind::AfricasTalking => patient.home_phone.trim().to_string(),
+        _ => String::new(),
+    };
+    if recipient.is_empty() {
+        return None;
+    }
+
+    let template = if transport.is_email() {
+        &rule.email_body
+    } else {
+        &rule.sms_template
+    };
+    let chosen = if template.trim().is_empty() {
+        fallback_body(rule)
+    } else {
+        template.as_str()
+    };
+    let body = render_template(
+        chosen,
+        patient,
+        appointment,
+        ctx.providers,
+        ctx.clinics,
+        ctx.operatories,
+        ctx.now,
+    );
+    let subject = render_template(
+        if rule.email_subject.trim().is_empty() {
+            default_subject(rule)
+        } else {
+            &rule.email_subject
+        },
+        patient,
+        appointment,
+        ctx.providers,
+        ctx.clinics,
+        ctx.operatories,
+        ctx.now,
+    );
+
+    Some(OutboxMessage {
+        message_num: 0,
+        pat_num: patient.pat_num,
+        apt_num: appointment.apt_num,
+        rule_num: rule.rule_num,
+        reminder_type: rule.type_cur,
+        transport,
+        recipient,
+        subject,
+        body,
+        status: if ctx.dry_run {
+            OutboxStatus::DryRun
+        } else {
+            OutboxStatus::Pending
+        },
+        attempts: 0,
+        created_at: ctx.now,
+        sent_at: None,
+        last_error: String::new(),
+    })
+}
+
 /// Generate candidate outbox rows. `is_sent(rule_num, apt_num)` is supplied by
-/// the DB layer and implements the OD `apptremindersent` dedupe check.
+/// the DB layer and implements the OD dedupe check. Upcoming rules use
+/// appointment time; post-treatment `GeneralMessage` rules use the procedure's
+/// `DateComplete` and a positive `TSPrior` measured in minutes after treatment.
 pub fn due_messages(
     ctx: &ReminderContext<'_>,
     is_sent: impl Fn(Id, Id) -> bool,
@@ -147,14 +273,60 @@ pub fn due_messages(
         if !rule.is_enabled || !ctx.allow_types.contains(&rule.type_cur) {
             continue;
         }
-        // General messages and portal/birthday rules are created manually or
-        // need data this slice does not own. They stay in the enum and GUI.
+        // ScheduleThankYou/NewPatientThankYou need OD's appointment-completion
+        // flags; they stay in the editor but are not generated here. Birthday,
+        // WebSched and portal rules are HQ-owned or need data this port lacks.
         if !matches!(
             rule.type_cur,
             ReminderType::Reminder
                 | ReminderType::ConfirmationFutureDay
                 | ReminderType::Arrival
+                | ReminderType::GeneralMessage
         ) {
+            continue;
+        }
+
+        if rule.type_cur == ReminderType::GeneralMessage {
+            for procedure in ctx.procedures {
+                if procedure.proc_status != ProcedureStatus::Complete
+                    || procedure.apt_num == 0
+                    || is_sent(rule.rule_num, procedure.apt_num)
+                {
+                    continue;
+                }
+                let Some(completed) = procedure.date_complete else {
+                    continue;
+                };
+                let elapsed = (ctx.now - completed).num_minutes();
+                if elapsed < rule.minutes_prior as i64
+                    || (rule.do_not_send_within_minutes > 0
+                        && elapsed < rule.do_not_send_within_minutes as i64)
+                {
+                    continue;
+                }
+                let Some(patient) = ctx
+                    .patients
+                    .iter()
+                    .find(|p| p.pat_num == procedure.pat_num)
+                else {
+                    continue;
+                };
+                let appointment = ctx
+                    .appointments
+                    .iter()
+                    .find(|a| a.apt_num == procedure.apt_num)
+                    .cloned()
+                    .unwrap_or_else(|| Appointment {
+                        apt_num: procedure.apt_num,
+                        pat_num: procedure.pat_num,
+                        apt_datetime: completed,
+                        provider_num: procedure.provider_num,
+                        ..Default::default()
+                    });
+                if let Some(message) = candidate_message(rule, patient, &appointment, ctx) {
+                    messages.push(message);
+                }
+            }
             continue;
         }
 
@@ -183,103 +355,9 @@ pub fn due_messages(
             else {
                 continue;
             };
-            let contact = ctx
-                .contacts
-                .iter()
-                .find(|c| c.pat_num == patient.pat_num)
-                .cloned()
-                .unwrap_or_else(|| PatientContact {
-                    pat_num: patient.pat_num,
-                    ..Default::default()
-                });
-            if contact.opt_out_email && contact.opt_out_telegram {
-                continue;
+            if let Some(message) = candidate_message(rule, patient, appointment, ctx) {
+                messages.push(message);
             }
-
-            let effective_email = if contact.email_override.trim().is_empty() {
-                patient.email.trim()
-            } else {
-                contact.email_override.trim()
-            };
-            let Some(transport) = resolve_transport(
-                rule.comm_type,
-                Some(effective_email),
-                &contact.telegram_chat_id,
-                Some(&patient.home_phone),
-                ctx.config,
-            ) else {
-                continue;
-            };
-            if transport.is_email() && contact.opt_out_email {
-                continue;
-            }
-            if is_text_transport(transport) && contact.opt_out_telegram {
-                continue;
-            }
-
-            let recipient = match transport {
-                TransportKind::Smtp => effective_email.to_string(),
-                TransportKind::Telegram => contact.telegram_chat_id.trim().to_string(),
-                TransportKind::AfricasTalking => patient.home_phone.trim().to_string(),
-                _ => String::new(),
-            };
-            if recipient.is_empty() {
-                continue;
-            }
-
-            let (template, default_subject) = if transport.is_email() {
-                (&rule.email_body, "Appointment reminder")
-            } else {
-                (&rule.sms_template, "Appointment reminder")
-            };
-            let chosen = if template.trim().is_empty() {
-                fallback_body(rule)
-            } else {
-                template.as_str()
-            };
-            let body = render_template(
-                chosen,
-                patient,
-                appointment,
-                ctx.providers,
-                ctx.clinics,
-                ctx.operatories,
-                ctx.now,
-            );
-            let subject = render_template(
-                if rule.email_subject.trim().is_empty() {
-                    default_subject
-                } else {
-                    &rule.email_subject
-                },
-                patient,
-                appointment,
-                ctx.providers,
-                ctx.clinics,
-                ctx.operatories,
-                ctx.now,
-            );
-
-            messages.push(OutboxMessage {
-                message_num: 0,
-                pat_num: patient.pat_num,
-                apt_num: appointment.apt_num,
-                rule_num: rule.rule_num,
-                reminder_type: rule.type_cur,
-                transport,
-                recipient,
-                subject,
-                body,
-                status: if ctx.dry_run {
-                    OutboxStatus::DryRun
-                } else {
-                    OutboxStatus::Pending
-                },
-                attempts: 0,
-                created_at: ctx.now,
-                sent_at: None,
-                last_error: String::new(),
-            });
         }
     }
 
@@ -405,9 +483,34 @@ mod tests {
         dry_run: bool,
         allow: &'a [ReminderType],
     ) -> ReminderContext<'a> {
+        context_with_procedures(
+            rules,
+            appointments,
+            &[],
+            patients,
+            contacts,
+            config,
+            now,
+            dry_run,
+            allow,
+        )
+    }
+
+    fn context_with_procedures<'a>(
+        rules: &'a [ReminderRule],
+        appointments: &'a [Appointment],
+        procedures: &'a [Procedure],
+        patients: &'a [Patient],
+        contacts: &'a [PatientContact],
+        config: &'a EServicesConfig,
+        now: NaiveDateTime,
+        dry_run: bool,
+        allow: &'a [ReminderType],
+    ) -> ReminderContext<'a> {
         ReminderContext {
             rules,
             appointments,
+            procedures,
             patients,
             contacts,
             providers: &[],
@@ -479,6 +582,75 @@ mod tests {
         assert_eq!(rows[0].recipient, "marta@example.test");
         assert_eq!(rows[0].status, OutboxStatus::Pending);
         assert!(rows[0].body.contains("Marta Alvarez"));
+    }
+
+    #[test]
+    fn general_message_waits_72_hours_after_completion_and_dedupes() {
+        let now = test_timestamp();
+        let rule = ReminderRule {
+            rule_num: 4,
+            type_cur: ReminderType::GeneralMessage,
+            minutes_prior: 4320,
+            comm_type: CommType::Email,
+            email_body: "Thanks {PatientName} for your visit on {Date}".into(),
+            ..Default::default()
+        };
+        let patients = vec![patient(1)];
+        let contacts = vec![PatientContact {
+            pat_num: 1,
+            ..Default::default()
+        }];
+        let mut config = EServicesConfig::default();
+        config.set_enabled(TransportKind::Smtp, true);
+        let appointments = vec![appointment(9, 1, now - Duration::days(3))];
+        let procedures = vec![
+            Procedure {
+                proc_num: 1,
+                pat_num: 1,
+                apt_num: 9,
+                proc_status: ProcedureStatus::Complete,
+                date_complete: Some(now - Duration::minutes(4320)),
+                provider_num: 3,
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 2,
+                pat_num: 1,
+                apt_num: 10,
+                proc_status: ProcedureStatus::Complete,
+                date_complete: Some(now - Duration::minutes(4319)),
+                ..Default::default()
+            },
+            Procedure {
+                proc_num: 3,
+                pat_num: 1,
+                apt_num: 11,
+                proc_status: ProcedureStatus::TreatmentPlanned,
+                date_complete: Some(now - Duration::days(10)),
+                ..Default::default()
+            },
+        ];
+        let rules = [rule];
+        let ctx = context_with_procedures(
+            &rules,
+            &appointments,
+            &procedures,
+            &patients,
+            &contacts,
+            &config,
+            now,
+            false,
+            &[ReminderType::GeneralMessage],
+        );
+        let rows = due_messages(&ctx, |_, _| false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].apt_num, 9);
+        assert_eq!(rows[0].reminder_type, ReminderType::GeneralMessage);
+        assert!(rows[0].body.contains("Marta Alvarez"));
+        assert_eq!(
+            due_messages(&ctx, |rule, apt| rule == 4 && apt == 9).len(),
+            0
+        );
     }
 
     #[test]

@@ -51,9 +51,16 @@ fn demo_store_seeds_all_reference_tables() {
     assert_eq!(waitlist.len(), 2);
     assert!(waitlist.iter().all(|a| a.apt_status == AppointmentStatus::UnschedList));
     assert!(waitlist.iter().all(|a| a.waitlist_status != 0));
-    // eServices slice: three OD-style rules, one contact per patient and an
-    // empty outbox/dedupe log.
-    assert_eq!(store.list_reminder_rules().unwrap().len(), 3);
+    // eServices slice: three OD-style rules plus the 4320-minute post-treatment
+    // follow-up, one contact per patient and an empty outbox/dedupe log.
+    let rules = store.list_reminder_rules().unwrap();
+    assert_eq!(rules.len(), 4);
+    let follow_up = rules
+        .iter()
+        .find(|rule| rule.type_cur == ReminderType::GeneralMessage)
+        .expect("post-treatment rule should be seeded");
+    assert_eq!(follow_up.minutes_prior, 4320);
+    assert!(follow_up.is_enabled);
     assert_eq!(store.list_patient_contacts().unwrap().len(), 6);
     assert!(store.list_reminder_sent().unwrap().is_empty());
     assert!(store.list_outbox(50).unwrap().is_empty());
@@ -889,7 +896,7 @@ fn eservices_rules_and_contacts_round_trip() {
     let rule_num = backend.upsert_reminder_rule(&new_rule).unwrap();
     assert!(rule_num > 0);
     let rules = backend.list_reminder_rules().unwrap();
-    assert_eq!(rules.len(), 4);
+    assert_eq!(rules.len(), 5);
     let stored = rules.iter().find(|r| r.rule_num == rule_num).unwrap();
     assert_eq!(stored.type_cur, ReminderType::Birthday);
     assert_eq!(stored.minutes_prior, 10_080);
@@ -1305,4 +1312,65 @@ fn demo_store_payment_plans_are_patient_only() {
         .unwrap();
     assert_eq!(charge.guarantor, 4);
     assert!(store.list_pay_plan_charges(9).unwrap().is_empty());
+}
+
+#[test]
+fn demo_store_wave2_call_log_and_proc_note_round_trip() {
+    let store = seeded();
+    assert!(store.list_comm_logs().unwrap().is_empty());
+
+    let num = store
+        .upsert_comm_log(&CommLog {
+            comm_log_num: 0,
+            apt_num: 1,
+            pat_num: 3,
+            comm_date_time: at(2026, 3, 1, 9, 0),
+            comm_type: 11,
+            mode: CommLogMode::Phone,
+            sent_or_received: CommLogDirection::Received,
+            note: " Confirmed by phone".into(),
+            user_num: 1,
+        })
+        .unwrap();
+    assert!(num > 0);
+    let logs = store.list_comm_logs().unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].apt_num, 1);
+    assert_eq!(logs[0].mode, CommLogMode::Phone);
+
+    let mut updated = logs[0].clone();
+    updated.note = "Confirmed, voicemail left".into();
+    store.upsert_comm_log(&updated).unwrap();
+    let logs = store.list_comm_logs().unwrap();
+    assert_eq!(logs.len(), 1, "upsert must not duplicate a call log row");
+    assert_eq!(logs[0].note, "Confirmed, voicemail left");
+
+    let note_num = store
+        .append_proc_note(&ProcNote {
+            pat_num: 3,
+            proc_num: 1,
+            note: "Review".into(),
+            signature: "Dr. Smith".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(note_num > 0);
+    assert!(store
+        .list_proc_notes()
+        .unwrap()
+        .iter()
+        .any(|note| note.proc_note_num == note_num && note.note == "Review"));
+
+    let appointment = store.get_appointment(2).unwrap().unwrap();
+    assert_ne!(appointment.confirmed, 0, "seeded confirmation should be readable");
+    let procedure = store
+        .list_procedures(3)
+        .unwrap()
+        .into_iter()
+        .find(|proc| proc.proc_num == 1)
+        .unwrap();
+    assert!(
+        procedure.date_complete.is_some(),
+        "seeded completion timestamp should feed the 72-hour rule"
+    );
 }

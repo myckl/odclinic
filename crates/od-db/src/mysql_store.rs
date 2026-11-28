@@ -322,6 +322,20 @@ fn ensure_port_local_tables(conn: &mut PooledConn) -> Result<(), String> {
     )
     .map_err(|e| format!("could not create reminder dedupe table: {e}"))?;
     conn.query_drop(
+        "CREATE TABLE IF NOT EXISTS odclinic_appointment_call_log (\
+         CallLogNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
+         AptNum bigint NOT NULL DEFAULT 0,\
+         PatNum bigint NOT NULL DEFAULT 0,\
+         CommDateTime datetime NOT NULL,\
+         CommType bigint NOT NULL DEFAULT 0,\
+         CommMode tinyint NOT NULL DEFAULT 0,\
+         SentOrReceived tinyint NOT NULL DEFAULT 0,\
+         Note text NOT NULL,\
+         UserNum bigint NOT NULL DEFAULT 0,\
+         KEY (AptNum), KEY (PatNum))",
+    )
+    .map_err(|e| format!("could not create appointment call log table: {e}"))?;
+    conn.query_drop(
         "CREATE TABLE IF NOT EXISTS odclinic_patient_correction (\
          CorrectionNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,\
          PatNum bigint NOT NULL DEFAULT 0,\
@@ -606,10 +620,6 @@ fn time(value: Option<String>) -> NaiveTime {
 // Open Dental `patient` has `Title` but no `Suffix`, and `DateTStamp` rather
 // than `DateCreated`. `Birthdate` is the exact OD spelling.
 const PATIENT_COLUMNS: &str = "PatNum,LName,FName,MiddleI,Title,CAST(Birthdate AS CHAR),Gender,HmPhone,WirelessPhone,Email,Address,City,State,Zip,ClinicNum,PriProv,CAST(DateTStamp AS CHAR),Address2,WkPhone,BillingType,ChartNumber,SSN,MedicaidID,PatStatus,COALESCE(County,''),SiteNum,GradeLevel,Urgency,PlannedIsDone,COALESCE(Guarantor,0)";
-
-/// The subset of OD `appointment` columns this port reads and writes.
-/// `UnschedStatus` is the waitlist status definition FK (DefCat 13).
-const APPOINTMENT_COLUMNS: &str = "AptNum,PatNum,CAST(AptDateTime AS CHAR),AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,TimeLocked,Priority,UnschedStatus";
 
 /// The subset of OD `histappointment` columns needed to restore an appointment.
 const HIST_APPOINTMENT_COLUMNS: &str = "HistApptNum,HistUserNum,CAST(HistDateTStamp AS CHAR),HistApptAction,AptNum,PatNum,AptStatus,Pattern,TimeLocked,Op,Note,ProvNum,ClinicNum,CAST(AptDateTime AS CHAR),UnschedStatus,Priority";
@@ -998,50 +1008,45 @@ fn pattern_minutes(pattern: &str, fallback: u32) -> u32 {
     }
 }
 
+/// OD added `Confirmed` and `IsNewPatient` after older 24_3 installs; a reduced
+/// schema may omit either. The extra columns are selected as literal zeros in
+/// that case so the row shape stays stable.
+fn appointment_select(conn: &mut PooledConn) -> Result<String, String> {
+    let confirmed = if column_exists(conn, "appointment", "Confirmed")? {
+        "COALESCE(Confirmed,0)"
+    } else {
+        "0"
+    };
+    let is_new = if column_exists(conn, "appointment", "IsNewPatient")? {
+        "COALESCE(IsNewPatient,0)"
+    } else {
+        "0"
+    };
+    Ok(format!(
+        "AptNum,PatNum,CAST(AptDateTime AS CHAR),AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,\
+         TimeLocked,Priority,UnschedStatus,{confirmed},{is_new}"
+    ))
+}
+
 fn map_appointment(row: mysql::Row) -> Appointment {
-    let (
-        apt_num,
-        pat_num,
-        apt_datetime,
-        apt_status,
-        operatory_num,
-        provider_num,
-        clinic_num,
-        note,
-        pattern,
-        time_locked,
-        priority,
-        unsched_status,
-    ): (
-        u32,
-        u32,
-        Option<String>,
-        i8,
-        u32,
-        u32,
-        u32,
-        Option<String>,
-        Option<String>,
-        i8,
-        i8,
-        Option<i64>,
-    ) = from_row(row);
-    let pattern = s(pattern);
+    let pattern = s(cell_text(&row, 8));
     let apt_length = pattern_minutes(&pattern, 30);
     Appointment {
-        apt_num,
-        pat_num,
-        apt_datetime: datetime(apt_datetime).unwrap_or_default(),
+        apt_num: cell_u32(&row, 0),
+        pat_num: cell_u32(&row, 1),
+        apt_datetime: datetime(cell_text(&row, 2)).unwrap_or_default(),
         apt_length,
-        apt_status: AppointmentStatus::from_od(apt_status),
-        operatory_num,
-        provider_num,
-        clinic_num,
-        notes: s(note),
+        apt_status: AppointmentStatus::from_od(cell_i16(&row, 3) as i8),
+        operatory_num: cell_u32(&row, 4),
+        provider_num: cell_u32(&row, 5),
+        clinic_num: cell_u32(&row, 6),
+        notes: s(cell_text(&row, 7)),
         pattern,
-        is_time_locked: time_locked != 0,
-        priority: RecallPriority::from_od(priority),
-        waitlist_status: unsched_status.unwrap_or(0) as Id,
+        is_time_locked: cell_bool(&row, 9),
+        priority: RecallPriority::from_od(cell_i16(&row, 10) as i8),
+        waitlist_status: cell_u32(&row, 11),
+        confirmed: cell_u32(&row, 12),
+        is_new_patient: cell_bool(&row, 13),
     }
 }
 
@@ -1061,6 +1066,8 @@ fn map_appointment_change(row: mysql::Row) -> AppointmentChange {
         is_time_locked: cell_bool(&row, 8),
         priority: RecallPriority::from_od(cell_i16(&row, 15) as i8),
         waitlist_status: cell_u32(&row, 14),
+        confirmed: 0,
+        is_new_patient: false,
     };
     AppointmentChange {
         change_num: cell_u32(&row, 0),
@@ -1347,10 +1354,13 @@ impl Store for MySqlStore {
         to: NaiveDateTime,
     ) -> Result<Vec<Appointment>, String> {
         let mut conn = self.conn()?;
+        let columns = appointment_select(&mut conn)?;
+        let query = format!(
+            "SELECT {columns} FROM appointment WHERE AptDateTime >= ? AND AptDateTime < ? ORDER BY AptDateTime,Op"
+        );
         let rows: Vec<mysql::Row> = conn
             .exec(
-                "SELECT AptNum,PatNum,CAST(AptDateTime AS CHAR),AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,TimeLocked,Priority,UnschedStatus \
-                 FROM appointment WHERE AptDateTime >= ? AND AptDateTime < ? ORDER BY AptDateTime,Op",
+                query,
                 (
                     Value::from(from.format("%Y-%m-%d %H:%M:%S").to_string()),
                     Value::from(to.format("%Y-%m-%d %H:%M:%S").to_string()),
@@ -1362,11 +1372,10 @@ impl Store for MySqlStore {
 
     fn get_appointment(&self, apt_num: Id) -> Result<Option<Appointment>, String> {
         let mut conn = self.conn()?;
+        let columns = appointment_select(&mut conn)?;
+        let query = format!("SELECT {columns} FROM appointment WHERE AptNum = ?");
         let rows: Vec<mysql::Row> = conn
-            .exec(
-                "SELECT AptNum,PatNum,CAST(AptDateTime AS CHAR),AptStatus,Op,ProvNum,ClinicNum,Note,Pattern,TimeLocked,Priority,UnschedStatus FROM appointment WHERE AptNum = ?",
-                (Value::from(apt_num),),
-            )
+            .exec(query, (Value::from(apt_num),))
             .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(map_appointment).next())
     }
@@ -1394,7 +1403,14 @@ impl Store for MySqlStore {
             apt.pattern.clone()
         };
         let clinic_num = write_clinic_num(&mut conn, apt.clinic_num, apt.pat_num)?;
-        let confirmed = first_visible_definition(&mut conn, 2)?;
+        // A zero keeps the previous compatibility behaviour (OD's first visible
+        // confirmation definition); an explicit definition is the user's choice
+        // from the board. Never clear a stored confirmation implicitly.
+        let confirmed = if apt.confirmed == 0 {
+            first_visible_definition(&mut conn, 2)?
+        } else {
+            apt.confirmed
+        };
         let audit_user = audit_user_num(&mut conn, self.current_user())?;
         let mut params: Vec<Value> = vec![
             Value::from(num),
@@ -1422,6 +1438,19 @@ impl Store for MySqlStore {
         )?;
         if has_confirmed {
             update.push_str(",Confirmed=VALUES(Confirmed)");
+        }
+        let has_is_new = column_exists(&mut conn, "appointment", "IsNewPatient")?;
+        append_optional_column(
+            &mut conn,
+            "appointment",
+            "IsNewPatient",
+            &mut columns,
+            &mut placeholders,
+            &mut params,
+            Value::from(i8::from(apt.is_new_patient)),
+        )?;
+        if has_is_new {
+            update.push_str(",IsNewPatient=VALUES(IsNewPatient)");
         }
         append_optional_column(
             &mut conn,
@@ -1471,8 +1500,9 @@ impl Store for MySqlStore {
 
     fn list_waitlist_appointments(&self) -> Result<Vec<Appointment>, String> {
         let mut conn = self.conn()?;
+        let columns = appointment_select(&mut conn)?;
         let sql = format!(
-            "SELECT {APPOINTMENT_COLUMNS} FROM appointment \
+            "SELECT {columns} FROM appointment \
              WHERE AptStatus = 3 ORDER BY AptDateTime,PatNum,AptNum"
         );
         let rows: Vec<mysql::Row> = conn
@@ -1649,12 +1679,13 @@ impl Store for MySqlStore {
         // The numeric set is unchanged between OD 24.3 and the REA-verified
         // 25.3 enum: Scheduled=1, Complete=2, UnschedList=3, Planned=6.
         // (The old 24.3 comment swapped the labels for 3 and 6.)
+        let columns = appointment_select(&mut conn)?;
+        let query = format!(
+            "SELECT {columns} FROM appointment \
+             WHERE Priority = 1 AND AptStatus IN (1,6,3,2) ORDER BY AptDateTime"
+        );
         let rows: Vec<mysql::Row> = conn
-            .query(
-                "SELECT AptNum,PatNum,CAST(AptDateTime AS CHAR),AptStatus,Op,ProvNum,ClinicNum,\
-                 Note,Pattern,TimeLocked,Priority,UnschedStatus FROM appointment \
-                 WHERE Priority = 1 AND AptStatus IN (1,6,3,2) ORDER BY AptDateTime",
-            )
+            .query(query.as_str())
             .map_err(|e| e.to_string())?;
         Ok(rows.into_iter().map(map_appointment).collect())
     }
@@ -1721,14 +1752,19 @@ impl Store for MySqlStore {
 
     fn list_procedures(&self, pat_num: Id) -> Result<Vec<Procedure>, String> {
         let mut conn = self.conn()?;
+        let date_complete = if column_exists(&mut conn, "procedurelog", "DateComplete")? {
+            "CAST(DateComplete AS CHAR)"
+        } else {
+            "NULL"
+        };
+        let query = format!(
+            "SELECT ProcNum,PatNum,CodeNum,COALESCE(AptNum,0),CAST(ProcDate AS CHAR),{date_complete},ProcStatus,ToothNum,ProvNum,ProcFee, \
+             CAST(COALESCE(UnitQty,0) AS DOUBLE),CAST(COALESCE(BaseUnits,0) AS DOUBLE), \
+             COALESCE(Surf,''),COALESCE(ToothRange,''),COALESCE(MedicalCode,''),COALESCE(SnomedBodySite,'') \
+             FROM procedurelog WHERE ? = 0 OR PatNum = ? ORDER BY ProcDate DESC"
+        );
         let rows: Vec<mysql::Row> = conn
-            .exec(
-                "SELECT ProcNum,PatNum,CodeNum,COALESCE(AptNum,0),CAST(ProcDate AS CHAR),ProcStatus,ToothNum,ProvNum,ProcFee, \
-                 CAST(COALESCE(UnitQty,0) AS DOUBLE),CAST(COALESCE(BaseUnits,0) AS DOUBLE), \
-                 COALESCE(Surf,''),COALESCE(ToothRange,''),COALESCE(MedicalCode,''),COALESCE(SnomedBodySite,'') \
-                 FROM procedurelog WHERE PatNum = ? ORDER BY ProcDate DESC",
-                (Value::from(pat_num),),
-            )
+            .exec(query, (Value::from(pat_num), Value::from(pat_num)))
             .map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
@@ -1738,16 +1774,17 @@ impl Store for MySqlStore {
                 code_num: cell_u32(&row, 2),
                 apt_num: cell_u32(&row, 3),
                 proc_date: date(cell_text(&row, 4)).unwrap_or_default(),
-                proc_status: ProcedureStatus::from_od(cell_i16(&row, 5) as i8),
-                tooth_num: s(cell_text(&row, 6)),
-                provider_num: cell_u32(&row, 7),
-                fee: cell_f64(&row, 8),
-                unit_qty: cell_f64(&row, 9),
-                base_units: cell_f64(&row, 10),
-                surf: s(cell_text(&row, 11)),
-                tooth_range: s(cell_text(&row, 12)),
-                medical_code: s(cell_text(&row, 13)),
-                snomed_body_site: s(cell_text(&row, 14)),
+                date_complete: od_datetime(cell_text(&row, 5)),
+                proc_status: ProcedureStatus::from_od(cell_i16(&row, 6) as i8),
+                tooth_num: s(cell_text(&row, 7)),
+                provider_num: cell_u32(&row, 8),
+                fee: cell_f64(&row, 9),
+                unit_qty: cell_f64(&row, 10),
+                base_units: cell_f64(&row, 11),
+                surf: s(cell_text(&row, 12)),
+                tooth_range: s(cell_text(&row, 13)),
+                medical_code: s(cell_text(&row, 14)),
+                snomed_body_site: s(cell_text(&row, 15)),
                 description_override: String::new(),
             })
             .collect())
@@ -2022,6 +2059,110 @@ impl Store for MySqlStore {
                 }
             })
             .collect())
+    }
+
+    fn append_proc_note(&self, note: &ProcNote) -> Result<Id, String> {
+        self.ensure_od_writes_allowed()?;
+        let mut conn = self.conn()?;
+        let user = audit_user_num(&mut conn, note.user_num.max(self.current_user()))?;
+        let stamp = if note.entry_datetime == Default::default() {
+            Local::now().naive_local()
+        } else {
+            note.entry_datetime
+        };
+        conn.exec_drop(
+            "INSERT INTO procnote (PatNum,ProcNum,EntryDateTime,UserNum,Note,Signature) \
+             VALUES (?,?,?,?,?,?)",
+            (
+                Value::from(note.pat_num),
+                Value::from(note.proc_num),
+                Value::from(stamp.format("%Y-%m-%d %H:%M:%S").to_string()),
+                Value::from(user),
+                Value::from(note.note.clone()),
+                Value::from(note.signature.clone()),
+            ),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_id() as Id)
+    }
+
+    fn list_comm_logs(&self) -> Result<Vec<CommLog>, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "odclinic_appointment_call_log")? {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<mysql::Row> = conn
+            .query(
+                "SELECT CallLogNum,AptNum,PatNum,CAST(CommDateTime AS CHAR),CommType,CommMode,\
+                 SentOrReceived,Note,UserNum FROM odclinic_appointment_call_log \
+                 ORDER BY AptNum,CommDateTime",
+            )
+            .map_err(|e| e.to_string())?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CommLog {
+                comm_log_num: cell_u32(&row, 0),
+                apt_num: cell_u32(&row, 1),
+                pat_num: cell_u32(&row, 2),
+                comm_date_time: datetime(cell_text(&row, 3)).unwrap_or_default(),
+                comm_type: cell_u32(&row, 4),
+                mode: CommLogMode::from_od(cell_i16(&row, 5) as u8),
+                sent_or_received: CommLogDirection::from_od(cell_i16(&row, 6) as u8),
+                note: s(cell_text(&row, 7)),
+                user_num: cell_u32(&row, 8),
+            })
+            .collect())
+    }
+
+    fn upsert_comm_log(&self, log: &CommLog) -> Result<Id, String> {
+        let mut conn = self.conn()?;
+        if !table_exists(&mut conn, "odclinic_appointment_call_log")? {
+            return Err("This database has no appointment call log table. Enable port-local schema bootstrap first.".into());
+        }
+        let user = audit_user_num(&mut conn, log.user_num.max(self.current_user()))?;
+        let stamp = if log.comm_date_time == Default::default() {
+            Local::now().naive_local()
+        } else {
+            log.comm_date_time
+        };
+        let params = (
+            Value::from(log.apt_num),
+            Value::from(log.pat_num),
+            Value::from(stamp.format("%Y-%m-%d %H:%M:%S").to_string()),
+            Value::from(log.comm_type),
+            Value::from(log.mode.as_od()),
+            Value::from(log.sent_or_received.as_od()),
+            Value::from(log.note.clone()),
+            Value::from(user),
+        );
+        if log.comm_log_num == 0 {
+            conn.exec_drop(
+                "INSERT INTO odclinic_appointment_call_log \
+                 (AptNum,PatNum,CommDateTime,CommType,CommMode,SentOrReceived,Note,UserNum) \
+                 VALUES (?,?,?,?,?,?,?,?)",
+                params,
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(conn.last_insert_id() as Id)
+        } else {
+            conn.exec_drop(
+                "UPDATE odclinic_appointment_call_log SET AptNum=?,PatNum=?,CommDateTime=?,\
+                 CommType=?,CommMode=?,SentOrReceived=?,Note=?,UserNum=? WHERE CallLogNum=?",
+                (
+                    params.0,
+                    params.1,
+                    params.2,
+                    params.3,
+                    params.4,
+                    params.5,
+                    params.6,
+                    params.7,
+                    Value::from(log.comm_log_num),
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(log.comm_log_num)
+        }
     }
 
     fn list_accounts(&self) -> Result<Vec<Account>, String> {

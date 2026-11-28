@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS appointment (
   Note text NOT NULL,
   TimeLocked tinyint NOT NULL DEFAULT 0,
   IsNewPatient tinyint NOT NULL DEFAULT 0,
+  -- FK to definition.DefNum in DefCat.ApptConfirmed (2). Zero = unconfirmed.
+  Confirmed bigint NOT NULL DEFAULT 0,
   ProcDescript varchar(255) NOT NULL DEFAULT '',
   DateTimeArrived datetime NOT NULL DEFAULT '0001-01-01',
   DateTimeSeated datetime NOT NULL DEFAULT '0001-01-01',
@@ -254,8 +256,10 @@ CREATE TABLE IF NOT EXISTS procedurelog (
   UnitQty double NOT NULL DEFAULT 0,
   BaseUnits double NOT NULL DEFAULT 0,
   -- OD's Procedure.Insert sets DateComplete and stores the booked discount so
-  -- GetDiscountPlanProc can total it without re-reading adjustments.
-  DateComplete datetime NOT NULL DEFAULT '0001-01-01',
+  -- GetDiscountPlanProc can total it without re-reading adjustments. OD 24_3
+  -- declares DateComplete as a DATE; the store also parses a datetime when a
+  -- non-OD schema supplies one.
+  DateComplete date NOT NULL DEFAULT '0001-01-01',
   DiscountPlanAmt double NOT NULL DEFAULT 0,
   KEY (PatNum), KEY (ProcDate)
 );
@@ -701,6 +705,21 @@ CREATE TABLE IF NOT EXISTS odclinic_clinic_card (
   Note varchar(500) NOT NULL DEFAULT '',
   IsActive tinyint NOT NULL DEFAULT 1,
   KEY (PatNum)
+);
+
+-- Port-local appointment call log. OD commlog has no appointment FK, so the
+-- confirmation/call history stays in this side table and never mutates OD rows.
+CREATE TABLE IF NOT EXISTS odclinic_appointment_call_log (
+  CallLogNum bigint NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  AptNum bigint NOT NULL DEFAULT 0,
+  PatNum bigint NOT NULL DEFAULT 0,
+  CommDateTime datetime NOT NULL,
+  CommType bigint NOT NULL DEFAULT 0,
+  CommMode tinyint NOT NULL DEFAULT 0,
+  SentOrReceived tinyint NOT NULL DEFAULT 0,
+  Note text NOT NULL,
+  UserNum bigint NOT NULL DEFAULT 0,
+  KEY (AptNum), KEY (PatNum)
 );
 
 CREATE TABLE IF NOT EXISTS odclinic_message_outbox (

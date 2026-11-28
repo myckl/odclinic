@@ -46,6 +46,8 @@ struct Data {
     refattaches: Vec<RefAttach>,
     /// OD `procnote` rows for the Procedure Notes report.
     proc_notes: Vec<ProcNote>,
+    /// Port-local appointment confirmations and phone calls.
+    comm_logs: Vec<CommLog>,
     /// OD chart-of-accounts rows for the accounting reports.
     accounts: Vec<Account>,
     /// OD `journalentry` rows for the accounting reports.
@@ -307,6 +309,9 @@ fn seed(today: NaiveDate) -> Data {
             } else {
                 0
             },
+            // Definition 11 = "Confirmed" in DefCat.ApptConfirmed.
+            confirmed: if *num % 2 == 0 { 11 } else { 0 },
+            is_new_patient: *pat == 6,
         })
         .collect();
 
@@ -390,6 +395,20 @@ fn seed(today: NaiveDate) -> Data {
             email_subject: "Arrival".into(),
             email_body: String::new(),
         },
+        // OD GeneralMessage rules are anchored to procedurelog.DateComplete.
+        // 4320 minutes is the 72-hour post-treatment follow-up.
+        ReminderRule {
+            rule_num: 4,
+            type_cur: ReminderType::GeneralMessage,
+            minutes_prior: 4320,
+            do_not_send_within_minutes: 0,
+            send_order: "2,0,1".into(),
+            is_enabled: true,
+            comm_type: CommType::Email,
+            sms_template: "Thanks for visiting {Clinic}, {FirstName}. We hope you are well.".into(),
+            email_subject: "Thank you for your visit".into(),
+            email_body: "Hello {FirstName} {LastName},\n\nThank you for visiting {Clinic} on {Date}. We hope your recovery is going well.".into(),
+        },
     ];
     let patient_contacts: Vec<PatientContact> = people
         .iter()
@@ -409,7 +428,10 @@ fn seed(today: NaiveDate) -> Data {
             proc_num: 1,
             pat_num: 3,
             code_num: 1,
+            apt_num: 1,
             proc_date: today - Duration::days(1),
+            // Completed 84 hours ago so the 4320-minute follow-up is due.
+            date_complete: Some(at(today - Duration::days(4), 12, 0)),
             proc_status: ProcedureStatus::Complete,
             tooth_num: "14".into(),
             provider_num: 3,
@@ -1199,6 +1221,7 @@ fn seed(today: NaiveDate) -> Data {
         referrals,
         refattaches,
         proc_notes,
+        comm_logs: Vec::new(),
         accounts,
         journal_entries,
         schedules,
@@ -1496,7 +1519,7 @@ impl Store for DemoStore {
             .unwrap()
             .procedures
             .iter()
-            .filter(|p| p.pat_num == pat_num)
+            .filter(|p| pat_num == 0 || p.pat_num == pat_num)
             .cloned()
             .collect())
     }
@@ -1517,6 +1540,7 @@ impl Store for DemoStore {
             .find(|p| p.proc_num == proc_num)
             .ok_or_else(|| format!("Procedure {proc_num} not found"))?;
         proc.proc_status = ProcedureStatus::Complete;
+        proc.date_complete = Some(Local::now().naive_local());
         data.procedure_discounts.insert(proc_num, discount_amount);
         Ok(())
     }
@@ -1628,6 +1652,45 @@ impl Store for DemoStore {
         let mut rows = self.data.lock().unwrap().proc_notes.clone();
         rows.sort_by_key(|note| (note.proc_num, note.entry_datetime));
         Ok(rows)
+    }
+    fn append_proc_note(&self, note: &ProcNote) -> Result<Id, String> {
+        let mut data = self.data.lock().unwrap();
+        let num = data.proc_notes.iter().map(|n| n.proc_note_num).max().unwrap_or(0) + 1;
+        let mut stored = note.clone();
+        stored.proc_note_num = num;
+        if stored.entry_datetime == Default::default() {
+            stored.entry_datetime = Local::now().naive_local();
+        }
+        data.proc_notes.push(stored);
+        Ok(num)
+    }
+    fn list_comm_logs(&self) -> Result<Vec<CommLog>, String> {
+        let mut rows = self.data.lock().unwrap().comm_logs.clone();
+        rows.sort_by_key(|log| (log.apt_num, log.comm_date_time));
+        Ok(rows)
+    }
+    fn upsert_comm_log(&self, log: &CommLog) -> Result<Id, String> {
+        let mut data = self.data.lock().unwrap();
+        let num = if log.comm_log_num == 0 {
+            data.comm_logs.iter().map(|l| l.comm_log_num).max().unwrap_or(0) + 1
+        } else {
+            log.comm_log_num
+        };
+        let mut stored = log.clone();
+        stored.comm_log_num = num;
+        if stored.comm_date_time == Default::default() {
+            stored.comm_date_time = Local::now().naive_local();
+        }
+        if let Some(existing) = data
+            .comm_logs
+            .iter_mut()
+            .find(|l| l.comm_log_num == num)
+        {
+            *existing = stored;
+        } else {
+            data.comm_logs.push(stored);
+        }
+        Ok(num)
     }
     fn list_accounts(&self) -> Result<Vec<Account>, String> {
         let mut rows = self.data.lock().unwrap().accounts.clone();

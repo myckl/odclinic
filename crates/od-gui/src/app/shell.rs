@@ -73,6 +73,7 @@ enum BannerAction {
     Asap,
     Waitlist,
     Message,
+    LogCall,
     Chart,
     Account,
     OpenNext,
@@ -618,6 +619,13 @@ pub(super) fn patient_banner(app: &mut OdApp, ui: &mut Ui) {
                                     .color(theme::ink()),
                             );
                             ui.label(RichText::new(format!("#{}", patient.pat_num)).weak());
+                            if app.features.enabled(FeatureKey::PatientBadges) {
+                                if let Some(badge) = app.badges.get(&patient.pat_num) {
+                                    for label in &badge.labels {
+                                        ui.label(RichText::new(label).small().color(theme::teal()));
+                                    }
+                                }
+                            }
                             ui.separator();
                             ui.label(
                                 RichText::new(format!(
@@ -733,12 +741,24 @@ pub(super) fn patient_banner(app: &mut OdApp, ui: &mut Ui) {
                         action = Some(BannerAction::OpenNext);
                     }
                     if patient.is_some()
+                        && app.features.enabled(FeatureKey::AppointmentCallLog)
+                        && next.is_some()
+                        && ui
+                            .button("Log call")
+                            .on_hover_text(
+                                "Record a confirmation or phone call against the next appointment.",
+                            )
+                            .clicked()
+                    {
+                        action = Some(BannerAction::LogCall);
+                    }
+                    if patient.is_some()
                         && app.features.enabled(FeatureKey::EServicesEnabled)
                         && app.can(Permission::APPOINTMENT_EDIT)
                         && ui
                             .button("Call / message")
                             .on_hover_text(
-                                "Queues a manual message to the local outbox. OD commlog is not part of this port.",
+                                "Queues a manual message to the local outbox. Use Log call for appointment contact history.",
                             )
                             .clicked()
                     {
@@ -829,6 +849,17 @@ pub(super) fn patient_banner(app: &mut OdApp, ui: &mut Ui) {
                             app.send_message_open = true;
                             "Message composer opened"
                         }
+                        BannerAction::LogCall => {
+                            if let (Some(patient), Some(apt)) = (&patient, &next) {
+                                app.comm_log_apt_num = apt.apt_num;
+                                app.comm_log_pat_num = patient.pat_num;
+                                app.comm_log_note.clear();
+                                app.comm_log_mode = CommLogMode::Phone;
+                                app.comm_log_direction = CommLogDirection::Received;
+                                app.comm_log_open = true;
+                            }
+                            "Call log opened"
+                        }
                     };
                     app.notice = Some(notice.into());
                 }
@@ -884,8 +915,9 @@ pub(super) fn patient_picker_window(app: &mut OdApp, ctx: &egui::Context) {
                 .stroke(egui::Stroke::new(1.0, theme::line()))
                 .corner_radius(egui::CornerRadius::same(6))
                 .show(ui, |ui| {
+                    let show_badges = app.features.enabled(FeatureKey::PatientBadges);
                     egui::Grid::new("od_patient_picker_grid")
-                        .num_columns(6)
+                        .num_columns(if show_badges { 7 } else { 6 })
                         .striped(true)
                         .spacing([10.0, 4.0])
                         .show(ui, |ui| {
@@ -895,6 +927,9 @@ pub(super) fn patient_picker_window(app: &mut OdApp, ctx: &egui::Context) {
                             OdApp::table_header(ui, "DOB");
                             OdApp::table_header(ui, "Phone");
                             OdApp::table_header(ui, "Provider");
+                            if show_badges {
+                                OdApp::table_header(ui, "Flags");
+                            }
                             ui.end_row();
                             for patient in &rows {
                                 ui.label(patient.pat_num.to_string());
@@ -916,6 +951,14 @@ pub(super) fn patient_picker_window(app: &mut OdApp, ctx: &egui::Context) {
                                         .map(|p| p.abbreviation.clone())
                                         .unwrap_or_default(),
                                 );
+                                if show_badges {
+                                    ui.label(
+                                        app.badges
+                                            .get(&patient.pat_num)
+                                            .map(|badge| badge.labels.join(", "))
+                                            .unwrap_or_default(),
+                                    );
+                                }
                                 ui.end_row();
                             }
                             if rows.is_empty() {
@@ -925,6 +968,9 @@ pub(super) fn patient_picker_window(app: &mut OdApp, ctx: &egui::Context) {
                                 ui.label("");
                                 ui.label("");
                                 ui.label("");
+                                if show_badges {
+                                    ui.label("");
+                                }
                                 ui.end_row();
                             }
                         });

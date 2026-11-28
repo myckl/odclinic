@@ -40,7 +40,8 @@ use od_core::{
     journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
     ledger_tie_out_report, month_bounds, new_patient_report, next_definition_order,
     next_journal_transaction_num, parse_appointment_datetime, parse_appointment_length,
-    patient_balance, patient_change_note, patient_label_addresses,
+    patient_badges_on_date, patient_balance, patient_change_note, patient_label_addresses,
+    PatientBadge,
     patient_portion_uncollected_report, patients_report, pattern_for_length,
     pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report,
     payment_journal_memo_with_note, payment_plan_report, period_close_history_report_filtered,
@@ -1759,6 +1760,14 @@ struct OdApp {
     providers: Vec<Provider>,
     operatories: Vec<Operatory>,
     appointments: Vec<Appointment>,
+    /// All procedures, needed by post-treatment reminder generation and badges.
+    /// `list_procedures(0)` means every patient, not patient number zero.
+    procedures: Vec<Procedure>,
+    /// Read-only referral sources and attachments behind patient badges.
+    referrals: Vec<Referral>,
+    refattaches: Vec<RefAttach>,
+    /// Derived new-patient/referral labels keyed by patient number.
+    badges: HashMap<Id, PatientBadge>,
     appt_tab: ApptTab,
     recalls: Vec<Recall>,
     asap_appointments: Vec<Appointment>,
@@ -1818,6 +1827,15 @@ struct OdApp {
     apt_edit_open: bool,
     apt_text: String,
     apt_len_text: String,
+
+    // Appointment confirmation and call log (Appointments module).
+    comm_logs: Vec<CommLog>,
+    comm_log_open: bool,
+    comm_log_apt_num: Id,
+    comm_log_pat_num: Id,
+    comm_log_mode: CommLogMode,
+    comm_log_direction: CommLogDirection,
+    comm_log_note: String,
 
     // Account/billing entry state.
     adj_edit: Option<Adjustment>,
@@ -1915,6 +1933,13 @@ struct OdApp {
     proc_fee_text: String,
     proc_tooth_text: String,
     proc_units_text: String,
+
+    // Append-only OD procnote rows shown in the registry Clinical tab.
+    proc_notes: Vec<ProcNote>,
+    proc_note_open: bool,
+    proc_note_proc_num: Id,
+    proc_note_pat_num: Id,
+    proc_note_text: String,
 
     // Lab cases (Chart) and supplies (Setup) use OD-owned optional tables.
     // Empty lists mean the table is absent, never a startup failure.
@@ -2141,6 +2166,10 @@ impl OdApp {
             providers: Vec::new(),
             operatories: Vec::new(),
             appointments: Vec::new(),
+            procedures: Vec::new(),
+            referrals: Vec::new(),
+            refattaches: Vec::new(),
+            badges: HashMap::new(),
             appt_tab: ApptTab::Schedule,
             recalls: Vec::new(),
             asap_appointments: Vec::new(),
@@ -2189,6 +2218,13 @@ impl OdApp {
             apt_edit_open: false,
             apt_text: String::new(),
             apt_len_text: String::new(),
+            comm_logs: Vec::new(),
+            comm_log_open: false,
+            comm_log_apt_num: 0,
+            comm_log_pat_num: 0,
+            comm_log_mode: CommLogMode::Phone,
+            comm_log_direction: CommLogDirection::Received,
+            comm_log_note: String::new(),
             adj_edit: None,
             adj_edit_open: false,
             adj_date_text: String::new(),
@@ -2263,6 +2299,11 @@ impl OdApp {
             proc_fee_text: String::new(),
             proc_tooth_text: String::new(),
             proc_units_text: "1".into(),
+            proc_notes: Vec::new(),
+            proc_note_open: false,
+            proc_note_proc_num: 0,
+            proc_note_pat_num: 0,
+            proc_note_text: String::new(),
             laboratories: Vec::new(),
             lab_cases: Vec::new(),
             lab_case_edit: None,
@@ -2420,6 +2461,35 @@ impl OdApp {
         match self.store.list_appointments(from, to) {
             Ok(rows) => self.appointments = rows,
             Err(e) => self.error = Some(e),
+        }
+        if let Ok(rows) = self.store.list_procedures(0) {
+            self.procedures = rows;
+        }
+        if let Ok(rows) = self.store.list_referrals() {
+            self.referrals = rows;
+        }
+        if let Ok(rows) = self.store.list_refattaches() {
+            self.refattaches = rows;
+        }
+        if self.features.enabled(FeatureKey::PatientBadges) {
+            self.badges = patient_badges_on_date(
+                &self.patients,
+                &self.appointments,
+                &self.procedures,
+                &self.refattaches,
+                &self.referrals,
+                Local::now().date_naive(),
+            );
+        } else {
+            self.badges.clear();
+        }
+        if let Ok(rows) = self.store.list_proc_notes() {
+            self.proc_notes = rows;
+        }
+        // Call logs live in an odclinic_* side table; a missing table simply
+        // leaves the board without call history.
+        if let Ok(rows) = self.store.list_comm_logs() {
+            self.comm_logs = rows;
         }
         if let Ok(rows) = self.store.list_recalls() {
             self.recalls = rows;
@@ -3177,6 +3247,8 @@ impl OdApp {
         self.treat_plan_line_window(&ctx);
         self.send_message_window(&ctx);
         self.rule_window(&ctx);
+        self.comm_log_window(&ctx);
+        self.proc_note_window(&ctx);
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
@@ -3844,9 +3916,15 @@ impl OdApp {
         };
         let filtered = self.store.find_patients(query).unwrap_or_default();
         let provider_names = self.providers.clone();
+        let show_badges = self.features.enabled(FeatureKey::PatientBadges);
+        let badges = if show_badges {
+            self.badges.clone()
+        } else {
+            HashMap::new()
+        };
 
         egui::Grid::new("patient_grid")
-            .num_columns(6)
+            .num_columns(if show_badges { 7 } else { 6 })
             .striped(true)
             .show(ui, |ui| {
                 ui.strong("Num");
@@ -3855,6 +3933,9 @@ impl OdApp {
                 ui.strong("Birth date");
                 ui.strong("Phone");
                 ui.strong("Provider");
+                if show_badges {
+                    ui.strong("Flags");
+                }
                 ui.end_row();
 
                 for p in &filtered {
@@ -3877,6 +3958,14 @@ impl OdApp {
                             .map(|provider| provider.abbreviation.clone())
                             .unwrap_or_default(),
                     );
+                    if show_badges {
+                        ui.label(
+                            badges
+                                .get(&p.pat_num)
+                                .map(|badge| badge.labels.join(", "))
+                                .unwrap_or_default(),
+                        );
+                    }
                     ui.end_row();
                 }
             });
@@ -4146,6 +4235,16 @@ impl OdApp {
                                     ui.strong("Chart #");
                                     ui.label(patient.pat_num.to_string());
                                     ui.end_row();
+                                    if self.features.enabled(FeatureKey::PatientBadges) {
+                                        ui.strong("Flags");
+                                        ui.label(
+                                            self.badges
+                                                .get(&patient.pat_num)
+                                                .map(|badge| badge.labels.join(", "))
+                                                .unwrap_or_else(|| "—".into()),
+                                        );
+                                        ui.end_row();
+                                    }
                                     ui.strong("Phone");
                                     ui.label(&patient.home_phone);
                                     ui.end_row();
@@ -4227,6 +4326,59 @@ impl OdApp {
                             }
                         } else {
                             ui.label("No patient note (OD patientnote).");
+                        }
+                        ui.separator();
+                        ui.heading("Procedure notes");
+                        if !self.features.enabled(FeatureKey::ClinicalNotes) {
+                            ui.label("Procedure notes are turned off in Settings.");
+                        } else {
+                            let notes: Vec<&ProcNote> = self
+                                .proc_notes
+                                .iter()
+                                .filter(|note| note.pat_num == pat_num)
+                                .collect();
+                            egui::Grid::new("registry_proc_notes")
+                                .num_columns(4)
+                                .striped(true)
+                                .show(ui, |ui| {
+                                    ui.strong("When");
+                                    ui.strong("Procedure");
+                                    ui.strong("Note");
+                                    ui.strong("By");
+                                    ui.end_row();
+                                    for note in &notes {
+                                        ui.label(
+                                            note.entry_datetime
+                                                .format("%Y-%m-%d %H:%M")
+                                                .to_string(),
+                                        );
+                                        ui.label(
+                                            self.registry_treatments
+                                                .iter()
+                                                .find(|t| t.proc_num == note.proc_num)
+                                                .map(|t| t.description.clone())
+                                                .unwrap_or_else(|| {
+                                                    format!("Procedure #{}", note.proc_num)
+                                                }),
+                                        );
+                                        ui.label(&note.note);
+                                        ui.label(&note.signature);
+                                        ui.end_row();
+                                    }
+                                });
+                            if notes.is_empty() {
+                                ui.label("No procedure notes (OD procnote).");
+                            }
+                            if ui.button("Add procedure note…").clicked() {
+                                self.proc_note_pat_num = pat_num;
+                                self.proc_note_proc_num = self
+                                    .registry_treatments
+                                    .first()
+                                    .map(|t| t.proc_num)
+                                    .unwrap_or(0);
+                                self.proc_note_text.clear();
+                                self.proc_note_open = true;
+                            }
                         }
                     }
                     RegistryTab::Card => {
@@ -13667,6 +13819,216 @@ impl OdApp {
             }
         }
     }
+
+    /// Port-local confirmation / phone-call history for one appointment. No OD
+    /// `commlog` row is written; confirmation state stays on the OD appointment.
+    fn comm_log_window(&mut self, ctx: &egui::Context) {
+        if !self.comm_log_open || !self.features.enabled(FeatureKey::AppointmentCallLog) {
+            return;
+        }
+        let apt_num = self.comm_log_apt_num;
+        let pat_num = self.comm_log_pat_num;
+        let logs: Vec<CommLog> = self
+            .comm_logs
+            .iter()
+            .filter(|log| log.apt_num == apt_num)
+            .cloned()
+            .collect();
+        let comm_types: Vec<Definition> = self
+            .definitions
+            .iter()
+            .filter(|def| def.category == DefinitionCategory::COMM_LOG_TYPES && !def.is_hidden)
+            .cloned()
+            .collect();
+        let patient = patient_name(&self.patients, pat_num);
+        let mut save = false;
+
+        egui::Window::new("Appointment — Call log")
+            .open(&mut self.comm_log_open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{patient} · appointment #{apt_num}"));
+                ui.label(
+                    egui::RichText::new("Calls are stored in the port-local call log; confirmation state is saved on the OD appointment.")
+                        .small()
+                        .color(theme::muted()),
+                );
+                ui.separator();
+                egui::Grid::new("comm_log_history")
+                    .num_columns(3)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("When");
+                        ui.strong("Mode");
+                        ui.strong("Note");
+                        ui.end_row();
+                        for log in &logs {
+                            ui.label(log.comm_date_time.format("%Y-%m-%d %H:%M").to_string());
+                            ui.label(format!(
+                                "{} · {}",
+                                log.mode.label(),
+                                log.sent_or_received.label()
+                            ));
+                            ui.label(&log.note);
+                            ui.end_row();
+                        }
+                    });
+                if logs.is_empty() {
+                    ui.label("No calls recorded for this appointment.");
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Mode");
+                    egui::ComboBox::from_id_salt("comm_log_mode")
+                        .selected_text(self.comm_log_mode.label())
+                        .show_ui(ui, |ui| {
+                            for mode in CommLogMode::ALL {
+                                ui.selectable_value(&mut self.comm_log_mode, mode, mode.label());
+                            }
+                        });
+                    ui.label("Direction");
+                    egui::ComboBox::from_id_salt("comm_log_direction")
+                        .selected_text(self.comm_log_direction.label())
+                        .show_ui(ui, |ui| {
+                            for direction in CommLogDirection::ALL {
+                                ui.selectable_value(
+                                    &mut self.comm_log_direction,
+                                    direction,
+                                    direction.label(),
+                                );
+                            }
+                        });
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.comm_log_note)
+                        .desired_rows(3)
+                        .hint_text("Call outcome, who spoke, follow-up needed…"),
+                );
+                if ui.button("Save call").clicked() {
+                    save = true;
+                }
+            });
+
+        if save {
+            if self.comm_log_note.trim().is_empty() {
+                self.error = Some("Enter a note before saving the call.".into());
+                return;
+            }
+            let user = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
+            let log = CommLog {
+                comm_log_num: 0,
+                apt_num,
+                pat_num,
+                comm_date_time: Local::now().naive_local(),
+                comm_type: comm_types.first().map(|def| def.def_num).unwrap_or(0),
+                mode: self.comm_log_mode,
+                sent_or_received: self.comm_log_direction,
+                note: self.comm_log_note.trim().to_string(),
+                user_num: user,
+            };
+            match self.store.upsert_comm_log(&log) {
+                Ok(_) => {
+                    self.comm_log_note.clear();
+                    self.notice = Some("Call saved".into());
+                    self.error = None;
+                    self.refresh();
+                }
+                Err(err) => self.error = Some(err),
+            }
+        }
+    }
+
+    /// Append-only OD `procnote` entry from the registry's Clinical tab. Writes
+    /// go through the store, so a configured database requires the OD-write
+    /// opt-in and a demo store stays local.
+    fn proc_note_window(&mut self, ctx: &egui::Context) {
+        if !self.proc_note_open || !self.features.enabled(FeatureKey::ClinicalNotes) {
+            return;
+        }
+        let pat_num = self.proc_note_pat_num;
+        let procedures: Vec<Procedure> = self
+            .procedures
+            .iter()
+            .filter(|proc| proc.pat_num == pat_num)
+            .cloned()
+            .collect();
+        let patient = patient_name(&self.patients, pat_num);
+        let user = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
+        let signature = self
+            .users
+            .iter()
+            .find(|u| u.user_num == user)
+            .map(|u| u.user_name.clone())
+            .unwrap_or_default();
+        let mut save = false;
+        let mut cancel = false;
+
+        egui::Window::new("Procedure note — New")
+            .open(&mut self.proc_note_open)
+            .resizable(true)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                ui.label(format!("{patient} · chart #{pat_num}"));
+                ui.horizontal(|ui| {
+                    ui.label("Procedure");
+                    egui::ComboBox::from_id_salt("proc_note_proc")
+                        .selected_text(format!("#{}", self.proc_note_proc_num))
+                        .show_ui(ui, |ui| {
+                            for proc in &procedures {
+                                ui.selectable_value(
+                                    &mut self.proc_note_proc_num,
+                                    proc.proc_num,
+                                    format!("#{} · {}", proc.proc_num, proc.proc_date),
+                                );
+                            }
+                        });
+                });
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.proc_note_text)
+                        .desired_rows(5)
+                        .hint_text("Clinical note for this procedure…"),
+                );
+                ui.horizontal(|ui| {
+                    save = ui.button("Save note").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+
+        if cancel {
+            self.proc_note_open = false;
+            self.proc_note_text.clear();
+        }
+        if save {
+            if self.proc_note_proc_num == 0 {
+                self.error = Some("Select a procedure before saving the note.".into());
+                return;
+            }
+            if self.proc_note_text.trim().is_empty() {
+                self.error = Some("Enter a note before saving.".into());
+                return;
+            }
+            let note = ProcNote {
+                proc_note_num: 0,
+                pat_num,
+                proc_num: self.proc_note_proc_num,
+                entry_datetime: Local::now().naive_local(),
+                user_num: user,
+                note: self.proc_note_text.trim().to_string(),
+                signature,
+            };
+            match self.store.append_proc_note(&note) {
+                Ok(_) => {
+                    self.proc_note_text.clear();
+                    self.proc_note_open = false;
+                    self.notice = Some("Procedure note saved".into());
+                    self.error = None;
+                    self.refresh();
+                }
+                Err(err) => self.error = Some(err),
+            }
+        }
+    }
 }
 
 fn patient_name(patients: &[Patient], pat_num: Id) -> String {
@@ -15335,7 +15697,9 @@ mod tests {
         );
         assert!(app.waitlist.iter().all(|a| is_waitlist(a)));
         assert_eq!(app.appt_tab, ApptTab::Schedule);
-        assert_eq!(app.reminder_rules.len(), 3, "eServices rules should load");
+        assert_eq!(app.reminder_rules.len(), 4, "eServices rules should load");
+        assert!(app.procedures.iter().any(|proc| proc.date_complete.is_some()));
+        assert!(!app.badges.is_empty(), "patient badges should be derived");
         assert_eq!(app.patient_contacts.len(), app.patients.len());
         assert_eq!(app.eservices_tab, EServicesTab::Channels);
         assert!(!app.definitions.is_empty(), "definitions should load");

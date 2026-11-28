@@ -275,8 +275,11 @@ impl OdApp {
         if self.features.enabled(FeatureKey::ConfirmationsEnabled) {
             allow.push(ReminderType::ConfirmationFutureDay);
         }
+        if self.features.enabled(FeatureKey::PostTreatmentRemindersEnabled) {
+            allow.push(ReminderType::GeneralMessage);
+        }
         if allow.is_empty() {
-            self.error = Some("Enable appointment reminders or future-day confirmations in Settings".into());
+            self.error = Some("Enable appointment reminders, confirmations or post-treatment follow-ups in Settings".into());
             return;
         }
 
@@ -291,6 +294,7 @@ impl OdApp {
             let ctx = ReminderContext {
                 rules: &self.reminder_rules,
                 appointments: &self.appointments,
+                procedures: &self.procedures,
                 patients: &self.patients,
                 contacts: &self.patient_contacts,
                 providers: &self.providers,
@@ -665,7 +669,11 @@ impl OdApp {
             ui.horizontal(|ui| {
                 ui.label("Lead    ");
                 ui.text_edit_singleline(&mut self.rule_minutes_text);
-                ui.label("minutes before the appointment");
+                ui.label(if rule_type == ReminderType::GeneralMessage {
+                    "minutes after procedure completion (4320 = 72 hours)"
+                } else {
+                    "minutes before the appointment"
+                });
             });
             ui.horizontal(|ui| {
                 ui.label("Minimum");

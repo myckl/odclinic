@@ -6,6 +6,7 @@ pub mod definitions;
 pub mod discount;
 pub mod dynamic_payment_plan;
 pub mod journal;
+pub mod patient_badges;
 pub mod patient_form;
 pub mod payment_plan;
 pub mod period_close;
@@ -64,6 +65,7 @@ pub use period_close::{
     period_close_events, period_close_history_report, period_close_history_report_filtered,
     reopen_audit_text, tie_out_ready,
 };
+pub use patient_badges::{patient_badges, patient_badges_on_date, PatientBadge};
 pub use patient_form::{
     build_patient_form_document, render_patient_form_html, PatientFormDocument, PatientFormProblem,
 };
