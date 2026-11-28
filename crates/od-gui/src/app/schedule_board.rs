@@ -8,7 +8,9 @@
 
 use super::*;
 use chrono::{Datelike, NaiveTime, Timelike};
-use egui::{Align, Align2, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2};
+use egui::{
+    Align, Align2, Color32, Layout, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Ui, Vec2,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -79,10 +81,10 @@ impl BoardStage {
 
     fn color(self) -> Color32 {
         match self {
-            Self::Arrived => Color32::from_rgb(47, 111, 237),
-            Self::InRoom => Color32::from_rgb(142, 68, 173),
-            Self::Checkout => Color32::from_rgb(224, 121, 27),
-            Self::Complete => Color32::from_rgb(31, 157, 85),
+            Self::Arrived => theme::info(),
+            Self::InRoom => Color32::from_rgb(112, 84, 145),
+            Self::Checkout => Color32::from_rgb(160, 106, 40),
+            Self::Complete => theme::success(),
         }
     }
 
@@ -154,6 +156,7 @@ enum BoardAction {
     OpenEdit(Id),
     SaveAppointment(Appointment, String),
     DeleteAppointment(Id),
+    CancelVisit(Id),
     SetStage(Id, Option<BoardStage>),
     ToggleAsap(Id),
     ToWaitlist(Id),
@@ -243,9 +246,16 @@ impl ScheduleBoard {
         board
     }
 
-    pub(crate) fn appointment_range(&self, day: NaiveDate) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
-        let from = (day - Duration::days(21)).and_hms_opt(0, 0, 0).unwrap_or_default();
-        let to = (day + Duration::days(22)).and_hms_opt(0, 0, 0).unwrap_or_default();
+    pub(crate) fn appointment_range(
+        &self,
+        day: NaiveDate,
+    ) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+        let from = (day - Duration::days(21))
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default();
+        let to = (day + Duration::days(22))
+            .and_hms_opt(0, 0, 0)
+            .unwrap_or_default();
         (from, to)
     }
 
@@ -259,7 +269,9 @@ impl ScheduleBoard {
 
     fn load_prefs(&mut self) {
         let Some(path) = prefs_path() else { return };
-        let Ok(text) = fs::read_to_string(path) else { return };
+        let Ok(text) = fs::read_to_string(path) else {
+            return;
+        };
         for line in text.lines() {
             let parts: Vec<&str> = line.split('|').collect();
             match parts.as_slice() {
@@ -278,7 +290,9 @@ impl ScheduleBoard {
                         len.parse::<i32>(),
                         op.parse::<Id>(),
                     );
-                    let (Ok(hold_num), Ok(date), Ok(start), Ok(len), Ok(op)) = parsed else { continue };
+                    let (Ok(hold_num), Ok(date), Ok(start), Ok(len), Ok(op)) = parsed else {
+                        continue;
+                    };
                     self.holds.push(BoardHold {
                         hold_num,
                         date,
@@ -292,7 +306,9 @@ impl ScheduleBoard {
                 }
                 ["stage", apt, stage, since] => {
                     let parsed = (apt.parse::<Id>(), since.parse::<i64>());
-                    let (Ok(apt_num), Ok(since)) = parsed else { continue };
+                    let (Ok(apt_num), Ok(since)) = parsed else {
+                        continue;
+                    };
                     if let Some(stage) = BoardStage::from_text(stage) {
                         if let Some(dt) = chrono::DateTime::from_timestamp(since, 0) {
                             self.stages.insert(apt_num, (stage, dt.naive_utc()));
@@ -377,8 +393,7 @@ impl ScheduleBoard {
         self.holds
             .iter()
             .filter(|hold| {
-                hold.date == col.date
-                    && col.operatory_num.is_none_or(|op| hold.operatory_num == op)
+                hold.date == col.date && col.operatory_num.is_none_or(|op| hold.operatory_num == op)
             })
             .cloned()
             .collect()
@@ -404,8 +419,8 @@ pub(crate) fn board_ui(app: &mut OdApp, ui: &mut Ui) {
     let recalls = app.recalls.clone();
     let can_create = app.features.enabled(FeatureKey::AppointmentCreate)
         && app.can(Permission::APPOINTMENT_CREATE);
-    let can_edit = app.features.enabled(FeatureKey::AppointmentEdit)
-        && app.can(Permission::APPOINTMENT_EDIT);
+    let can_edit =
+        app.features.enabled(FeatureKey::AppointmentEdit) && app.can(Permission::APPOINTMENT_EDIT);
     let can_delete = app.features.enabled(FeatureKey::AppointmentDelete)
         && app.can(Permission::APPOINTMENT_DELETE);
     let can_hold = can_create;
@@ -460,130 +475,151 @@ impl ScheduleBoard {
         ui: &mut Ui,
         actions: &mut Vec<BoardAction>,
     ) {
-        ui.horizontal_wrapped(|ui| {
-            let step = match self.view {
-                BoardView::Day => 1,
-                BoardView::Week => 7,
-            };
-            if ui.small_button("‹").clicked() {
-                actions.push(BoardAction::SetAnchor(self.anchor - Duration::days(step)));
-            }
-            if ui.button("Today").clicked() {
-                actions.push(BoardAction::SetAnchor(Local::now().date_naive()));
-            }
-            if ui.small_button("›").clicked() {
-                actions.push(BoardAction::SetAnchor(self.anchor + Duration::days(step)));
-            }
-            let label = match self.view {
-                BoardView::Day => self.anchor.format("%a, %b %d, %Y").to_string(),
-                BoardView::Week => {
-                    let days = days_of_week(self.anchor);
-                    format!(
-                        "{} {} – {} {}",
-                        days[0].format("%b %d"),
-                        days[0].year(),
-                        days[6].format("%b %d"),
-                        days[6].year()
-                    )
-                }
-            };
-            ui.strong(label);
-            ui.separator();
-            for view in [BoardView::Day, BoardView::Week] {
-                if ui.selectable_label(self.view == view, view.label()).clicked() {
-                    actions.push(BoardAction::SetView(view));
-                }
-            }
-            ui.separator();
-            let search_response = ui.add(
-                egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Search patient…")
-                    .desired_width(170.0),
-            );
-            if !self.search.trim().is_empty() {
-                let query = self.search.trim().to_lowercase();
-                let matches: Vec<&Patient> = patients
-                    .iter()
-                    .filter(|p| {
-                        p.display_name().to_lowercase().contains(&query)
-                            || p.chart_number.to_lowercase().contains(&query)
-                            || p.home_phone.contains(&query)
-                            || p.wireless_phone.contains(&query)
-                            || p.wk_phone.contains(&query)
-                    })
-                    .take(8)
-                    .collect();
-                if !matches.is_empty() {
-                    let ctx = ui.ctx().clone();
-                    let action_target = &mut *actions;
-                    egui::Window::new("board_patient_search")
-                        .anchor(
-                            Align2::LEFT_TOP,
-                            Vec2::new(
-                                search_response.rect.left_bottom().x,
-                                search_response.rect.left_bottom().y + 3.0,
-                            ),
-                        )
-                        .resizable(false)
-                        .collapsible(false)
-                        .title_bar(false)
-                        .show(&ctx, |ui| {
-                            for patient in matches {
-                                let note = if patient.chart_number.is_empty() {
-                                    patient.home_phone.clone()
-                                } else {
-                                    format!("Chart #{} · {}", patient.chart_number, patient.home_phone)
-                                };
-                                if ui
-                                    .button(format!("{}  ·  {}", patient.display_name(), note))
-                                    .clicked()
-                                {
-                                    action_target.push(BoardAction::JumpTo(patient.pat_num));
-                                    self.search.clear();
-                                }
-                            }
+        egui::Frame::new()
+            .fill(theme::panel())
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let step = match self.view {
+                        BoardView::Day => 1,
+                        BoardView::Week => 7,
+                    };
+                    if ui.small_button("‹").clicked() {
+                        actions.push(BoardAction::SetAnchor(self.anchor - Duration::days(step)));
+                    }
+                    if ui.button("Today").clicked() {
+                        actions.push(BoardAction::SetAnchor(Local::now().date_naive()));
+                    }
+                    if ui.small_button("›").clicked() {
+                        actions.push(BoardAction::SetAnchor(self.anchor + Duration::days(step)));
+                    }
+                    let label = match self.view {
+                        BoardView::Day => self.anchor.format("%a, %b %d, %Y").to_string(),
+                        BoardView::Week => {
+                            let days = days_of_week(self.anchor);
+                            format!(
+                                "{} {} – {} {}",
+                                days[0].format("%b %d"),
+                                days[0].year(),
+                                days[6].format("%b %d"),
+                                days[6].year()
+                            )
+                        }
+                    };
+                    ui.label(RichText::new(label).strong().size(15.0).color(theme::ink()));
+                    ui.add_space(8.0);
+                    for view in [BoardView::Day, BoardView::Week] {
+                        if ui
+                            .selectable_label(self.view == view, view.label())
+                            .clicked()
+                        {
+                            actions.push(BoardAction::SetView(view));
+                        }
+                    }
+                    ui.separator();
+                    let search_response = ui.add(
+                        egui::TextEdit::singleline(&mut self.search)
+                            .hint_text("Search patient…")
+                            .desired_width(170.0),
+                    );
+                    if !self.search.trim().is_empty() {
+                        let query = self.search.trim().to_lowercase();
+                        let matches: Vec<&Patient> = patients
+                            .iter()
+                            .filter(|p| {
+                                p.display_name().to_lowercase().contains(&query)
+                                    || p.chart_number.to_lowercase().contains(&query)
+                                    || p.home_phone.contains(&query)
+                                    || p.wireless_phone.contains(&query)
+                                    || p.wk_phone.contains(&query)
+                            })
+                            .take(8)
+                            .collect();
+                        if !matches.is_empty() {
+                            let ctx = ui.ctx().clone();
+                            let action_target = &mut *actions;
+                            egui::Window::new("board_patient_search")
+                                .anchor(
+                                    Align2::LEFT_TOP,
+                                    Vec2::new(
+                                        search_response.rect.left_bottom().x,
+                                        search_response.rect.left_bottom().y + 3.0,
+                                    ),
+                                )
+                                .resizable(false)
+                                .collapsible(false)
+                                .title_bar(false)
+                                .show(&ctx, |ui| {
+                                    for patient in matches {
+                                        let note = if patient.chart_number.is_empty() {
+                                            patient.home_phone.clone()
+                                        } else {
+                                            format!(
+                                                "Chart #{} · {}",
+                                                patient.chart_number, patient.home_phone
+                                            )
+                                        };
+                                        if ui
+                                            .button(format!(
+                                                "{}  ·  {}",
+                                                patient.display_name(),
+                                                note
+                                            ))
+                                            .clicked()
+                                        {
+                                            action_target
+                                                .push(BoardAction::JumpTo(patient.pat_num));
+                                            self.search.clear();
+                                        }
+                                    }
+                                });
+                        }
+                    }
+                    ui.separator();
+                    let palette = provider_palette();
+                    for (index, provider) in providers.iter().take(6).enumerate() {
+                        let color = palette[index % palette.len()];
+                        ui.horizontal(|ui| {
+                            ui.painter().circle_filled(
+                                ui.cursor().min + Vec2::new(4.0, 6.0),
+                                4.0,
+                                color,
+                            );
+                            ui.add_space(9.0);
+                            ui.label(
+                                RichText::new(&provider.abbreviation)
+                                    .small()
+                                    .color(theme::muted()),
+                            );
                         });
-                }
-            }
-            ui.separator();
-            let palette = provider_palette();
-            for (index, provider) in providers.iter().take(6).enumerate() {
-                let color = palette[index % palette.len()];
-                ui.horizontal(|ui| {
-                    ui.painter()
-                        .circle_filled(ui.cursor().min + Vec2::new(4.0, 6.0), 4.0, color);
-                    ui.add_space(9.0);
-                    ui.small(&provider.abbreviation);
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.show_sidebar, "Calendar & Recalls");
+                    if can_hold && ui.button("Blockout").clicked() {
+                        self.open_hold_editor(
+                            None,
+                            self.anchor,
+                            9 * 60,
+                            providers.first().map(|p| p.provider_num).unwrap_or(0),
+                        );
+                    }
+                    if can_create && ui.button("+ New appt").clicked() {
+                        actions.push(BoardAction::OpenNew {
+                            date: self.anchor,
+                            start_min: 9 * 60,
+                            operatory_num: 0,
+                            provider_num: providers.first().map(|p| p.provider_num).unwrap_or(0),
+                            pat_num: None,
+                            hold_id: None,
+                        });
+                    }
+                    if can_message && ui.button("Send message").clicked() {
+                        actions.push(BoardAction::SendMessage);
+                    }
                 });
-            }
-            ui.separator();
-            ui.checkbox(&mut self.show_sidebar, "Calendar & Recalls");
-            if can_hold
-                && ui
-                    .button("Blockout")
-                    .clicked()
-            {
-                self.open_hold_editor(
-                    None,
-                    self.anchor,
-                    9 * 60,
-                    providers.first().map(|p| p.provider_num).unwrap_or(0),
-                );
-            }
-            if can_create && ui.button("+ New appt").clicked() {
-                actions.push(BoardAction::OpenNew {
-                    date: self.anchor,
-                    start_min: 9 * 60,
-                    operatory_num: 0,
-                    provider_num: providers.first().map(|p| p.provider_num).unwrap_or(0),
-                    pat_num: None,
-                    hold_id: None,
-                });
-            }
-            if can_message && ui.button("Send message").clicked() {
-                actions.push(BoardAction::SendMessage);
-            }
-        });
+            });
+        ui.add_space(8.0);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -616,7 +652,16 @@ impl ScheduleBoard {
                 Vec2::new(pin_width, available_height),
                 Layout::top_down(Align::Min),
                 |ui| {
-                    self.pinboard_ui(patients, waitlist, cols, first_operatory, can_create, can_edit, ui, actions);
+                    self.pinboard_ui(
+                        patients,
+                        waitlist,
+                        cols,
+                        first_operatory,
+                        can_create,
+                        can_edit,
+                        ui,
+                        actions,
+                    );
                 },
             );
             ui.add_space(6.0);
@@ -694,7 +739,8 @@ impl ScheduleBoard {
                     for apt in waitlist {
                         let name = patient_name(patients, apt.pat_num);
                         let response = ui.add(
-                            egui::Button::new(RichText::new(&name).strong()).sense(Sense::click_and_drag()),
+                            egui::Button::new(RichText::new(&name).strong())
+                                .sense(Sense::click_and_drag()),
                         );
                         let response = response.on_hover_ui(|ui| {
                             ui.strong(&name);
@@ -717,7 +763,8 @@ impl ScheduleBoard {
                             });
                         }
                         if let Some(drag) = self.drag.as_mut() {
-                            if drag.kind == BoardDragKind::Waitlist && drag.id == apt.apt_num as u64 {
+                            if drag.kind == BoardDragKind::Waitlist && drag.id == apt.apt_num as u64
+                            {
                                 if let Some(pointer) = ui.ctx().pointer_latest_pos() {
                                     drag.target_col = self
                                         .column_rects
@@ -882,10 +929,7 @@ impl ScheduleBoard {
                         [col_rect.right_top(), col_rect.right_bottom()],
                         Stroke::new(
                             1.0,
-                            faded(
-                                ui.visuals().widgets.noninteractive.bg_stroke.color,
-                                0.7,
-                            ),
+                            faded(ui.visuals().widgets.noninteractive.bg_stroke.color, 0.7),
                         ),
                     );
 
@@ -916,12 +960,20 @@ impl ScheduleBoard {
                     }
 
                     for hold in self.holds_for_column(col) {
-                        let top = body.top() + (hold.start_min - DAY_START_MIN) as f32 * PIXELS_PER_MIN;
+                        let top =
+                            body.top() + (hold.start_min - DAY_START_MIN) as f32 * PIXELS_PER_MIN;
                         let rect = Rect::from_min_size(
                             Pos2::new(x + 4.0, top),
-                            Vec2::new(col_width - 8.0, (hold.len as f32 * PIXELS_PER_MIN).max(20.0)),
+                            Vec2::new(
+                                col_width - 8.0,
+                                (hold.len as f32 * PIXELS_PER_MIN).max(20.0),
+                            ),
                         );
-                        let text = if hold.text.is_empty() { "Hold" } else { &hold.text };
+                        let text = if hold.text.is_empty() {
+                            "Hold"
+                        } else {
+                            &hold.text
+                        };
                         let response = ui.put(
                             rect,
                             egui::Button::new(RichText::new(text).small())
@@ -961,7 +1013,8 @@ impl ScheduleBoard {
                                 let mut updated = hold.clone();
                                 updated.start_min = drag.preview_start;
                                 updated.date = target.date;
-                                updated.operatory_num = target.operatory_num.unwrap_or(first_operatory);
+                                updated.operatory_num =
+                                    target.operatory_num.unwrap_or(first_operatory);
                                 actions.push(BoardAction::UpdateHold(updated));
                             }
                         }
@@ -1034,13 +1087,10 @@ impl ScheduleBoard {
                     for block in lane_blocks(in_column) {
                         let apt = block.apt;
                         let lane_width = (col_width - 6.0) / block.lanes as f32;
-                        let top = body.top()
-                            + (block.start_min - DAY_START_MIN) as f32 * PIXELS_PER_MIN;
+                        let top =
+                            body.top() + (block.start_min - DAY_START_MIN) as f32 * PIXELS_PER_MIN;
                         let rect = Rect::from_min_size(
-                            Pos2::new(
-                                x + 3.0 + block.lane as f32 * lane_width,
-                                top,
-                            ),
+                            Pos2::new(x + 3.0 + block.lane as f32 * lane_width, top),
                             Vec2::new(
                                 lane_width - 1.0,
                                 (block.len as f32 * PIXELS_PER_MIN).max(20.0),
@@ -1124,7 +1174,9 @@ impl ScheduleBoard {
                             });
                         }
                         if let Some(drag) = self.drag.as_mut() {
-                            if drag.kind == BoardDragKind::Appointment && drag.id == apt.apt_num as u64 {
+                            if drag.kind == BoardDragKind::Appointment
+                                && drag.id == apt.apt_num as u64
+                            {
                                 let delta = response.drag_delta();
                                 drag.preview_start = snap_minute(
                                     drag.start_min + (delta.y / PIXELS_PER_MIN).round() as i32,
@@ -1173,16 +1225,25 @@ impl ScheduleBoard {
                                 match stage {
                                     None => {
                                         if ui.button("Arrived — add to waiting list").clicked() {
-                                            actions.push(BoardAction::SetStage(apt.apt_num, Some(BoardStage::Arrived)));
+                                            actions.push(BoardAction::SetStage(
+                                                apt.apt_num,
+                                                Some(BoardStage::Arrived),
+                                            ));
                                         }
                                     }
                                     Some(current) => {
                                         if let Some(next) = current.next() {
                                             if ui.button(next.label()).clicked() {
-                                                actions.push(BoardAction::SetStage(apt.apt_num, Some(next)));
+                                                actions.push(BoardAction::SetStage(
+                                                    apt.apt_num,
+                                                    Some(next),
+                                                ));
                                             }
                                         }
-                                        if ui.button(format!("Cancel {}", current.label())).clicked() {
+                                        if ui
+                                            .button(format!("Cancel {}", current.label()))
+                                            .clicked()
+                                        {
                                             actions.push(BoardAction::SetStage(apt.apt_num, None));
                                         }
                                     }
@@ -1190,11 +1251,14 @@ impl ScheduleBoard {
                                 if ui.button("Reschedule…").clicked() {
                                     actions.push(BoardAction::OpenEdit(apt.apt_num));
                                 }
-                                if ui.button(if apt.priority == RecallPriority::Asap {
-                                    "Clear ASAP"
-                                } else {
-                                    "Toggle ASAP"
-                                }).clicked() {
+                                if ui
+                                    .button(if apt.priority == RecallPriority::Asap {
+                                        "Clear ASAP"
+                                    } else {
+                                        "Toggle ASAP"
+                                    })
+                                    .clicked()
+                                {
                                     actions.push(BoardAction::ToggleAsap(apt.apt_num));
                                 }
                                 let longer = apt.clone();
@@ -1210,7 +1274,8 @@ impl ScheduleBoard {
                                 let shorter = apt.clone();
                                 if ui.button("−15 min").clicked() {
                                     let mut shorter = shorter;
-                                    shorter.apt_length = shorter.apt_length.saturating_sub(15).max(15);
+                                    shorter.apt_length =
+                                        shorter.apt_length.saturating_sub(15).max(15);
                                     shorter.pattern = pattern_for_length(shorter.apt_length);
                                     actions.push(BoardAction::SaveAppointment(
                                         shorter,
@@ -1219,6 +1284,16 @@ impl ScheduleBoard {
                                 }
                                 if ui.button("Send to pin board").clicked() {
                                     actions.push(BoardAction::ToWaitlist(apt.apt_num));
+                                }
+                                if apt.apt_status != AppointmentStatus::Broken
+                                    && ui
+                                        .button("Cancel visit (Broken)")
+                                        .on_hover_text(
+                                            "OD has no Cancelled status; this saves AptStatus = Broken and keeps the history.",
+                                        )
+                                        .clicked()
+                                {
+                                    actions.push(BoardAction::CancelVisit(apt.apt_num));
                                 }
                                 ui.separator();
                                 if ui.button("Edit…").clicked() {
@@ -1266,7 +1341,10 @@ impl ScheduleBoard {
                                 updated.pattern = pattern_for_length(updated.apt_length);
                                 actions.push(BoardAction::SaveAppointment(
                                     updated,
-                                    format!("Appointment {} length changed on the board", apt.apt_num),
+                                    format!(
+                                        "Appointment {} length changed on the board",
+                                        apt.apt_num
+                                    ),
                                 ));
                             }
                         }
@@ -1322,7 +1400,8 @@ impl ScheduleBoard {
                         }
                         ui.end_row();
                         let first = self.cal_month.with_day(1).unwrap_or(self.cal_month);
-                        let start = first - Duration::days(first.weekday().num_days_from_sunday() as i64);
+                        let start =
+                            first - Duration::days(first.weekday().num_days_from_sunday() as i64);
                         for index in 0..42 {
                             let date = start + Duration::days(index);
                             let other = date.month() != self.cal_month.month();
@@ -1343,7 +1422,7 @@ impl ScheduleBoard {
                                 ui.painter().rect_filled(
                                     response.rect,
                                     2.0,
-                                    Color32::from_rgba_unmultiplied(128, 128, 128, 18),
+                                    faded(theme::muted(), 0.12),
                                 );
                             }
                             if selected || today {
@@ -1395,7 +1474,9 @@ impl ScheduleBoard {
                     let elapsed = self
                         .arrived_at(apt.apt_num)
                         .map(|since| {
-                            let mins = (chrono::Local::now().naive_local() - since).num_minutes().max(0);
+                            let mins = (chrono::Local::now().naive_local() - since)
+                                .num_minutes()
+                                .max(0);
                             if mins < 60 {
                                 format!("{mins}m")
                             } else {
@@ -1403,23 +1484,39 @@ impl ScheduleBoard {
                             }
                         })
                         .unwrap_or_default();
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.strong(&name);
-                            ui.small(format!("{provider} · {} · {elapsed}", format_hhmm(apt_time_minute(apt))));
+                    egui::Frame::new()
+                        .fill(theme::paper())
+                        .stroke(egui::Stroke::new(1.0, theme::line()))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::same(7))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.strong(&name);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{provider} · {} · {elapsed}",
+                                            format_hhmm(apt_time_minute(apt))
+                                        ))
+                                        .small()
+                                        .color(theme::muted()),
+                                    );
+                                });
+                                ui.colored_label(stage.color(), stage.label());
+                            });
+                            ui.horizontal(|ui| {
+                                if let Some(next) = stage.next() {
+                                    if ui.small_button(next.label()).clicked() {
+                                        actions
+                                            .push(BoardAction::SetStage(apt.apt_num, Some(next)));
+                                    }
+                                }
+                                if ui.small_button("Clear").clicked() {
+                                    actions.push(BoardAction::SetStage(apt.apt_num, None));
+                                }
+                            });
                         });
-                        ui.colored_label(stage.color(), stage.label());
-                    });
-                    ui.horizontal(|ui| {
-                        if let Some(next) = stage.next() {
-                            if ui.small_button(next.label()).clicked() {
-                                actions.push(BoardAction::SetStage(apt.apt_num, Some(next)));
-                            }
-                        }
-                        if ui.small_button("Clear").clicked() {
-                            actions.push(BoardAction::SetStage(apt.apt_num, None));
-                        }
-                    });
+                    ui.add_space(4.0);
                 }
                 ui.separator();
 
@@ -1434,23 +1531,38 @@ impl ScheduleBoard {
                     for recall in due.into_iter().take(8) {
                         let state = recall_due_state(recall, today);
                         let name = patient_name(patients, recall.pat_num);
-                        ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.strong(&name);
-                                ui.small(format!("Patient #{}", recall.pat_num));
-                            });
-                            ui.colored_label(state_color(state), state.label());
-                            if can_create && ui.small_button("Schedule").clicked() {
-                                actions.push(BoardAction::OpenNew {
-                                    date: recall_due_date(recall).unwrap_or(today),
-                                    start_min: 9 * 60,
-                                    operatory_num: 0,
-                                    provider_num: providers.first().map(|p| p.provider_num).unwrap_or(0),
-                                    pat_num: Some(recall.pat_num),
-                                    hold_id: None,
+                        egui::Frame::new()
+                            .fill(theme::paper())
+                            .stroke(egui::Stroke::new(1.0, theme::line()))
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::same(7))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.strong(&name);
+                                        ui.label(
+                                            RichText::new(format!("Patient #{}", recall.pat_num))
+                                                .small()
+                                                .color(theme::muted()),
+                                        );
+                                    });
+                                    ui.colored_label(state_color(state), state.label());
+                                    if can_create && ui.small_button("Schedule").clicked() {
+                                        actions.push(BoardAction::OpenNew {
+                                            date: recall_due_date(recall).unwrap_or(today),
+                                            start_min: 9 * 60,
+                                            operatory_num: 0,
+                                            provider_num: providers
+                                                .first()
+                                                .map(|p| p.provider_num)
+                                                .unwrap_or(0),
+                                            pat_num: Some(recall.pat_num),
+                                            hold_id: None,
+                                        });
+                                    }
                                 });
-                            }
-                        });
+                            });
+                        ui.add_space(4.0);
                     }
                 }
             });
@@ -1489,57 +1601,69 @@ pub(crate) fn hold_window(app: &mut OdApp, ctx: &egui::Context) {
     if !app.board.hold_edit_open {
         return;
     }
-    let Some(hold) = app.board.hold_edit.clone() else { return };
+    let Some(hold) = app.board.hold_edit.clone() else {
+        return;
+    };
     let is_edit = hold.hold_num != 0;
     let mut save = false;
     let mut delete = false;
     let mut cancel = false;
-    egui::Window::new(if is_edit { "Edit blockout" } else { "New blockout" })
-        .open(&mut app.board.hold_edit_open)
-        .resizable(false)
-        .default_width(420.0)
-        .show(ctx, |ui| {
-            ui.weak("Free-text hold — reserve a slot for a call-in or a patient not yet on the schedule.");
-            ui.label("Text");
-            ui.text_edit_singleline(&mut app.board.hold_text);
-            ui.horizontal(|ui| {
-                ui.label("Date");
-                ui.text_edit_singleline(&mut app.board.hold_date_text);
-                ui.label("Start");
-                ui.text_edit_singleline(&mut app.board.hold_start_text);
-                ui.label("Minutes");
-                ui.text_edit_singleline(&mut app.board.hold_len_text);
-            });
-            ui.label("Colour");
-            ui.horizontal(|ui| {
-                for (index, color) in hold_colors().iter().enumerate() {
-                    if ui
-                        .add(
-                            egui::Button::new(" ")
-                                .fill(*color)
-                                .min_size(Vec2::new(28.0, 22.0))
-                                .stroke(Stroke::new(
-                                    if index == app.board.hold_color_index { 2.5 } else { 0.5 },
-                                    if index == app.board.hold_color_index {
-                                        ui.visuals().text_color()
-                                    } else {
-                                        faded(*color, 0.5)
-                                    },
-                                )),
-                        )
-                        .clicked()
-                    {
-                        app.board.hold_color_index = index;
-                    }
-                }
-            });
-            ui.separator();
-            ui.horizontal(|ui| {
-                save = ui.button("Save").clicked();
-                cancel = ui.button("Cancel").clicked();
-                delete = is_edit && ui.button("Delete").clicked();
-            });
+    egui::Window::new(if is_edit {
+        "Edit blockout"
+    } else {
+        "New blockout"
+    })
+    .open(&mut app.board.hold_edit_open)
+    .resizable(false)
+    .default_width(420.0)
+    .show(ctx, |ui| {
+        ui.weak(
+            "Free-text hold — reserve a slot for a call-in or a patient not yet on the schedule.",
+        );
+        ui.label("Text");
+        ui.text_edit_singleline(&mut app.board.hold_text);
+        ui.horizontal(|ui| {
+            ui.label("Date");
+            ui.text_edit_singleline(&mut app.board.hold_date_text);
+            ui.label("Start");
+            ui.text_edit_singleline(&mut app.board.hold_start_text);
+            ui.label("Minutes");
+            ui.text_edit_singleline(&mut app.board.hold_len_text);
         });
+        ui.label("Colour");
+        ui.horizontal(|ui| {
+            for (index, color) in hold_colors().iter().enumerate() {
+                if ui
+                    .add(
+                        egui::Button::new(" ")
+                            .fill(*color)
+                            .min_size(Vec2::new(28.0, 22.0))
+                            .stroke(Stroke::new(
+                                if index == app.board.hold_color_index {
+                                    2.5
+                                } else {
+                                    0.5
+                                },
+                                if index == app.board.hold_color_index {
+                                    ui.visuals().text_color()
+                                } else {
+                                    faded(*color, 0.5)
+                                },
+                            )),
+                    )
+                    .clicked()
+                {
+                    app.board.hold_color_index = index;
+                }
+            }
+        });
+        ui.separator();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            save = ui.button("Save").clicked();
+            cancel = ui.button("Cancel").clicked();
+            delete = is_edit && ui.button("Delete").clicked();
+        });
+    });
 
     if delete {
         app.board.remove_hold(hold.hold_num);
@@ -1601,7 +1725,12 @@ impl OdApp {
                 self.refresh();
             }
             BoardAction::JumpTo(apt_num) => {
-                if let Some(apt) = self.appointments.iter().find(|a| a.apt_num == apt_num).cloned() {
+                if let Some(apt) = self
+                    .appointments
+                    .iter()
+                    .find(|a| a.apt_num == apt_num)
+                    .cloned()
+                {
                     self.schedule_day = apt.apt_datetime.date();
                     self.board.anchor = self.schedule_day;
                     self.board.view = BoardView::Day;
@@ -1611,7 +1740,8 @@ impl OdApp {
                     self.board.save_prefs();
                     self.refresh();
                 } else if self.waitlist.iter().any(|a| a.apt_num == apt_num) {
-                    self.notice = Some("That patient is on the pin board. Schedule the card first.".into());
+                    self.notice =
+                        Some("That patient is on the pin board. Schedule the card first.".into());
                 } else {
                     self.error = Some("No appointment found for that patient.".into());
                 }
@@ -1635,7 +1765,11 @@ impl OdApp {
                         .unwrap_or_default(),
                     apt_length: 30,
                     apt_status: AppointmentStatus::Scheduled,
-                    operatory_num: if operatory_num == 0 { default_op } else { operatory_num },
+                    operatory_num: if operatory_num == 0 {
+                        default_op
+                    } else {
+                        operatory_num
+                    },
                     provider_num: if provider_num == 0 {
                         self.providers.first().map(|p| p.provider_num).unwrap_or(0)
                     } else {
@@ -1672,8 +1806,21 @@ impl OdApp {
             }
             BoardAction::SaveAppointment(apt, note) => self.save_board_appointment(apt, &note),
             BoardAction::DeleteAppointment(apt_num) => self.delete_board_appointment(apt_num),
+            BoardAction::CancelVisit(apt_num) => {
+                if let Some(apt) = self
+                    .appointments
+                    .iter()
+                    .find(|a| a.apt_num == apt_num)
+                    .cloned()
+                {
+                    self.cancel_visit(apt);
+                    self.board.set_stage(apt_num, None);
+                }
+            }
             BoardAction::SetStage(apt_num, stage) => {
-                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else { return };
+                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+                    return;
+                };
                 if stage == Some(BoardStage::Complete) {
                     apt.apt_status = AppointmentStatus::Complete;
                 } else if apt.apt_status == AppointmentStatus::Complete {
@@ -1687,22 +1834,34 @@ impl OdApp {
                 self.board.set_stage(apt_num, stage);
             }
             BoardAction::ToggleAsap(apt_num) => {
-                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else { return };
+                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+                    return;
+                };
                 apt.priority = if apt.priority == RecallPriority::Asap {
                     RecallPriority::Normal
                 } else {
                     RecallPriority::Asap
                 };
-                self.save_board_appointment(apt, &format!("Appointment {apt_num} ASAP priority toggled"));
+                self.save_board_appointment(
+                    apt,
+                    &format!("Appointment {apt_num} ASAP priority toggled"),
+                );
             }
             BoardAction::ToWaitlist(apt_num) => {
-                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else { return };
+                let Some(mut apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+                    return;
+                };
                 apt.apt_status = AppointmentStatus::UnschedList;
                 self.board.set_stage(apt_num, None);
-                self.save_board_appointment(apt, &format!("Appointment {apt_num} moved to the pin board"));
+                self.save_board_appointment(
+                    apt,
+                    &format!("Appointment {apt_num} moved to the pin board"),
+                );
             }
             BoardAction::FromWaitlist(apt_num, date, start_min, operatory_num) => {
-                let Some(apt) = self.waitlist.iter().find(|a| a.apt_num == apt_num).cloned() else { return };
+                let Some(apt) = self.waitlist.iter().find(|a| a.apt_num == apt_num).cloned() else {
+                    return;
+                };
                 let when = date
                     .and_hms_opt((start_min / 60) as u32, (start_min % 60) as u32, 0)
                     .unwrap_or_default();
@@ -1724,7 +1883,12 @@ impl OdApp {
                 self.notice = Some("Blockout added".into());
             }
             BoardAction::UpdateHold(hold) => {
-                if let Some(existing) = self.board.holds.iter_mut().find(|h| h.hold_num == hold.hold_num) {
+                if let Some(existing) = self
+                    .board
+                    .holds
+                    .iter_mut()
+                    .find(|h| h.hold_num == hold.hold_num)
+                {
                     *existing = hold;
                 }
                 self.board.save_prefs();
@@ -1793,9 +1957,12 @@ impl OdApp {
     }
 
     fn delete_board_appointment(&mut self, apt_num: Id) {
-        let Some(apt) = self.store.get_appointment(apt_num).ok().flatten() else { return };
+        let Some(apt) = self.store.get_appointment(apt_num).ok().flatten() else {
+            return;
+        };
         if self.features.enabled(FeatureKey::AppointmentHistory) {
-            let mut change = AppointmentChange::from_snapshot(&apt, AppointmentChangeAction::Deleted);
+            let mut change =
+                AppointmentChange::from_snapshot(&apt, AppointmentChangeAction::Deleted);
             change.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
             if let Err(e) = self.store.append_appointment_change(&change) {
                 self.error = Some(e);
@@ -1847,8 +2014,7 @@ fn apt_time_minute(apt: &Appointment) -> i32 {
 
 fn snap_minute(minute: i32) -> i32 {
     let clamped = minute.max(DAY_START_MIN).min(DAY_END_MIN - SNAP_MIN);
-    let snapped = ((clamped - DAY_START_MIN + SNAP_MIN / 2) / SNAP_MIN) * SNAP_MIN
-        + DAY_START_MIN;
+    let snapped = ((clamped - DAY_START_MIN + SNAP_MIN / 2) / SNAP_MIN) * SNAP_MIN + DAY_START_MIN;
     snapped.min(DAY_END_MIN - SNAP_MIN)
 }
 
@@ -2014,10 +2180,10 @@ fn palette_color(providers: &[Provider], provider_num: Id, fallback_index: usize
 
 fn state_color(state: RecallDueState) -> Color32 {
     match state {
-        RecallDueState::Overdue(_) => Color32::from_rgb(190, 60, 60),
-        RecallDueState::DueToday => Color32::from_rgb(190, 120, 20),
-        RecallDueState::Disabled | RecallDueState::NoDate => Color32::GRAY,
-        _ => Color32::from_rgb(30, 110, 50),
+        RecallDueState::Overdue(_) => theme::danger(),
+        RecallDueState::DueToday => theme::warning(),
+        RecallDueState::Disabled | RecallDueState::NoDate => theme::muted(),
+        _ => theme::success(),
     }
 }
 
@@ -2036,25 +2202,11 @@ fn first_operatory(operatories: &[Operatory]) -> Id {
 }
 
 fn provider_palette() -> Vec<Color32> {
-    vec![
-        Color32::from_rgb(47, 111, 237),
-        Color32::from_rgb(37, 163, 90),
-        Color32::from_rgb(224, 121, 27),
-        Color32::from_rgb(142, 68, 173),
-        Color32::from_rgb(22, 160, 133),
-        Color32::from_rgb(192, 57, 43),
-    ]
+    theme::provider_palette().to_vec()
 }
 
 fn hold_colors() -> Vec<Color32> {
-    vec![
-        Color32::from_rgb(246, 195, 68),
-        Color32::from_rgb(169, 199, 240),
-        Color32::from_rgb(183, 224, 168),
-        Color32::from_rgb(243, 166, 192),
-        Color32::from_rgb(127, 209, 193),
-        Color32::from_rgb(215, 215, 215),
-    ]
+    theme::hold_palette().to_vec()
 }
 
 fn faded(color: Color32, alpha: f32) -> Color32 {
@@ -2080,9 +2232,15 @@ fn color_to_hex(color: Color32) -> String {
 
 fn color_from_hex(value: &str) -> Color32 {
     if value.len() == 6 {
-        let Ok(r) = u8::from_str_radix(&value[0..2], 16) else { return hold_colors()[0] };
-        let Ok(g) = u8::from_str_radix(&value[2..4], 16) else { return hold_colors()[0] };
-        let Ok(b) = u8::from_str_radix(&value[4..6], 16) else { return hold_colors()[0] };
+        let Ok(r) = u8::from_str_radix(&value[0..2], 16) else {
+            return hold_colors()[0];
+        };
+        let Ok(g) = u8::from_str_radix(&value[2..4], 16) else {
+            return hold_colors()[0];
+        };
+        let Ok(b) = u8::from_str_radix(&value[4..6], 16) else {
+            return hold_colors()[0];
+        };
         Color32::from_rgb(r, g, b)
     } else {
         hold_colors()[0]

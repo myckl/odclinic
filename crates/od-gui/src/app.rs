@@ -7,76 +7,74 @@
 mod definitions;
 mod eservices;
 mod schedule_board;
+mod shell;
 
+use crate::theme;
 use definitions::DefinitionsTab;
 use eservices::EServicesTab;
 use schedule_board::ScheduleBoard;
+use shell::PatientPickerTarget;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{Datelike, Duration, Local, NaiveDate};
 use egui::{Color32, Ui};
 use od_core::{
+    AppointmentDateBasis, CLOSED_PERIODS_PREF, ClosedPeriods, CollectionsAgingBucket,
+    CollectionsRow, DiscountInput, DiscountPlanSubscription, FrequencyCodeSets, LabelAddress,
+    PaySheetGroupBy, PeriodCloseActionFilter, PeriodCloseHistoryFilter, PostingAccountDefaults,
+    PostingSourceKind, ProdIncMode, PublicHealthRow, RecallDueState, ReportRow, ReportTable,
     account_summary, account_summary_without_insurance, active_patient_report, adj_sheet_report,
-    aging_report, appointments_report, appointment_change_note, asap_report, balance_sheet_report,
-    adjustment_journal_memo_with_note, birthday_report, broken_appointments_report,
-    collections_bucket_totals, collections_worklist, filter_collections_rows,
-    CollectionsAgingBucket, CollectionsRow,
-    build_adjustment_journal, build_invoice_document, build_journal_batches,
-    build_patient_credit_application, build_patient_form_document, build_payment_journal,
-    build_posting_batch_plan_with_closed,
-    build_refund_transfer_receipt, build_statement_document,
-    compact_display_field_orders, confirmation_report, custom_aging_report,
-    carrier_label_addresses, dental_sealant_measure_report, display_fields_for, discount_plan_report,
-    discount_amount, annual_bucket, DiscountInput, FrequencyCodeSets,
-    dpp_overcharged_report, finance_charge_report, general_ledger_report, hidden_pay_splits_report,
-    close_audit_text, is_adjustment_posted, is_payment_posted, is_waitlist,
-    journal_posting_audit_report, journal_transaction_for_adjustment,
-    journal_transaction_for_payment, laser_labels_report, ledger_tie_out_report, month_bounds,
-    new_patient_report, period_close_history_report_filtered, PeriodCloseActionFilter,
-    PeriodCloseHistoryFilter, reopen_audit_text, tie_out_ready,
-    next_definition_order, next_journal_transaction_num, patient_label_addresses,
-    patient_portion_uncollected_report, pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report, patient_balance,
-    patient_change_note, treatment_finder_report,
-    parse_appointment_datetime, parse_appointment_length, pattern_for_length, payment_plan_report,
-    patients_report, ph_raw_population_report, ph_raw_screen_report,
-    presented_treatment_production_report, prescriptions_report, print_preview_report,
-    proc_note_report, proc_overpaid_report, procedure_codes_report, prod_inc_report,
-    procedure_sheet_report, profit_loss_report, production_goal_report, production_by_provider,
-    provider_payroll_report, recall_due_date, recall_due_state, recall_fields_report, recall_report,
+    adjustment_journal_memo_with_note, aging_report, annual_bucket, appointment_change_note,
+    appointments_report, asap_report, balance_sheet_report, birthday_report,
+    broken_appointments_report, build_adjustment_journal, build_invoice_document,
+    build_journal_batches, build_patient_credit_application, build_patient_form_document,
+    build_payment_journal, build_posting_batch_plan_with_closed, build_refund_transfer_receipt,
+    build_statement_document, carrier_label_addresses, close_audit_text, collections_bucket_totals,
+    collections_worklist, compact_display_field_orders, confirmation_report, custom_aging_report,
+    dental_sealant_measure_report, discount_amount, discount_plan_report, display_fields_for,
+    dpp_overcharged_report, filter_collections_rows, finance_charge_report, format_interval,
+    general_ledger_report, hidden_pay_splits_report, interval_from_parts, interval_parts,
+    is_adjustment_posted, is_payment_posted, is_waitlist, journal_posting_audit_report,
+    journal_transaction_for_adjustment, journal_transaction_for_payment, laser_labels_report,
+    ledger_tie_out_report, month_bounds, new_patient_report, next_definition_order,
+    next_journal_transaction_num, parse_appointment_datetime, parse_appointment_length,
+    patient_balance, patient_change_note, patient_label_addresses,
+    patient_portion_uncollected_report, patients_report, pattern_for_length,
+    pay_plan_charge_applications_report, pay_plan_detail_report, pay_sheet_report,
+    payment_journal_memo_with_note, payment_plan_report, period_close_history_report_filtered,
+    ph_raw_population_report, ph_raw_screen_report, prescriptions_report,
+    presented_treatment_production_report, print_preview_report, proc_note_report,
+    proc_overpaid_report, procedure_codes_report, procedure_sheet_report, prod_inc_report,
+    production_by_provider, production_goal_report, profit_loss_report, provider_payroll_report,
+    recall_due_date, recall_due_state, recall_fields_report, recall_report,
     receivables_breakdown_report, referral_analysis_report, referrals_report, render_invoice_pdf,
     render_patient_form_html, render_patient_form_pdf, render_refund_transfer_receipt_html,
     render_refund_transfer_receipt_pdf, render_report_csv, render_report_html,
-    render_statement_html, render_statement_pdf,
-    restore_appointment, routing_slips_report, schedule_from_waitlist, format_interval,
-    interval_from_parts, interval_parts, schedule_conflicts, service_date_view_report,
-    payment_journal_memo_with_note, suggest_ledger_accounts, suggest_payment_ledger_accounts,
-    validate_balanced_journal,
-    sorted_definitions, statement_report, treatment_plan_report,
-    treat_plan_presentation_statistics_report, unearned_income_report,
+    render_statement_html, render_statement_pdf, reopen_audit_text, restore_appointment,
+    routing_slips_report, schedule_conflicts, schedule_from_waitlist, service_date_view_report,
+    sorted_definitions, statement_report, suggest_ledger_accounts, suggest_payment_ledger_accounts,
+    tie_out_ready, treat_plan_presentation_statistics_report, treatment_finder_report,
+    treatment_plan_report, unearned_income_report, validate_balanced_journal,
     validate_clinic_card_issue, validate_definition, validate_display_fields,
     validate_payment_allocations, waitlist_status_definitions, waitlist_status_name,
-    AppointmentDateBasis, CLOSED_PERIODS_PREF, ClosedPeriods, DiscountPlanSubscription,
-    LabelAddress, PostingAccountDefaults, PostingSourceKind, PaySheetGroupBy, ProdIncMode,
-    PublicHealthRow, RecallDueState, ReportRow, ReportTable,
 };
 use od_db::{Backend, DemoStore, MySqlStore, SchemaMode, Store};
 use od_domain::definitions::{
-    default_display_fields, Definition, DefinitionCategory, DisplayField, DisplayFieldCategory,
+    Definition, DefinitionCategory, DisplayField, DisplayFieldCategory, default_display_fields,
 };
 use od_domain::eservices::*;
-use od_domain::reports_ext::{LaserInsMode, LaserLabelTab, ProcNoteGroup, UnearnedIncomeTab};
 use od_domain::reports::{
     AgingAgeFilter, AgingFamilyGrouping, BrokenAppointmentMode, BrokenProcedureOption,
-    CollectionsAgingBand, CustomAgingNegative, CustomAgingWriteoffDate, PeriodCloseHistoryView,
-    PlanTypeFilter,
-    ProcedureSheetMode, ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition,
-    ReportPreferences, ReportSortState, EXPORT_KEY_ACCOUNT_AUDIT, EXPORT_KEY_ACCOUNT_LEDGER,
-    EXPORT_KEY_COLLECTIONS_STATEMENTS, EXPORT_KEY_PAY_PLAN_AUDIT, EXPORT_KEY_SECURITY_LOG,
-    CONFIRMATION_OTHER_FIELDS,
-    CONFIRMATION_STANDARD_FIELDS, PATIENT_REPORT_FIELDS, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS,
-    REFERRAL_REPORT_FIELDS,
+    CONFIRMATION_OTHER_FIELDS, CONFIRMATION_STANDARD_FIELDS, CollectionsAgingBand,
+    CustomAgingNegative, CustomAgingWriteoffDate, EXPORT_KEY_ACCOUNT_AUDIT,
+    EXPORT_KEY_ACCOUNT_LEDGER, EXPORT_KEY_COLLECTIONS_STATEMENTS, EXPORT_KEY_PAY_PLAN_AUDIT,
+    EXPORT_KEY_SECURITY_LOG, PATIENT_REPORT_FIELDS, PeriodCloseHistoryView, PlanTypeFilter,
+    ProcedureSheetMode, RECALL_OTHER_FIELDS, RECALL_STANDARD_FIELDS, REFERRAL_REPORT_FIELDS,
+    ReferralFilter, ReportDateRange, ReportFilter, ReportFilterCondition, ReportPreferences,
+    ReportSortState,
 };
+use od_domain::reports_ext::{LaserInsMode, LaserLabelTab, ProcNoteGroup, UnearnedIncomeTab};
 use od_domain::*;
 
 /// One allocation row in the Record payment dialog.
@@ -300,7 +298,10 @@ fn gather_pay_plan_charges(store: &dyn Store, patients: &[Patient]) -> Vec<PayPl
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for patient in patients {
-        for charge in store.list_pay_plan_charges(patient.pat_num).unwrap_or_default() {
+        for charge in store
+            .list_pay_plan_charges(patient.pat_num)
+            .unwrap_or_default()
+        {
             if seen.insert(charge.pay_plan_charge_num) {
                 out.push(charge);
             }
@@ -341,7 +342,10 @@ fn gather_treat_plan_lines(store: &dyn Store, plans: &[TreatPlan]) -> Vec<TreatP
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for plan in plans {
-        for line in store.list_treat_plan_lines(plan.treat_plan_num).unwrap_or_default() {
+        for line in store
+            .list_treat_plan_lines(plan.treat_plan_num)
+            .unwrap_or_default()
+        {
             if seen.insert(line.line_num) {
                 out.push(line);
             }
@@ -617,7 +621,9 @@ fn default_refund_transfer_receipt_pdf_path(pat_num: Id, pay_num: Id) -> String 
         .map(std::path::PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("Documents")
-        .join(format!("odclinic-refund-transfer-receipt-{pat_num}-{pay_num}.pdf"))
+        .join(format!(
+            "odclinic-refund-transfer-receipt-{pat_num}-{pay_num}.pdf"
+        ))
         .to_string_lossy()
         .into_owned()
 }
@@ -758,14 +764,7 @@ fn security_log_export_path_for(
 /// as its own column so a stale-resolution row can be filed against the right
 /// patient/account record outside this app.
 fn security_log_export_table(log: &[&SecurityEvent]) -> ReportTable {
-    let mut table = ReportTable::new(&[
-        "Log #",
-        "Time",
-        "User",
-        "Type",
-        "Patient",
-        "Details",
-    ]);
+    let mut table = ReportTable::new(&["Log #", "Time", "User", "Type", "Patient", "Details"]);
     for event in log {
         let log_num = event.security_log_num.to_string();
         let time = event.log_datetime.format("%Y-%m-%d %H:%M:%S").to_string();
@@ -965,9 +964,7 @@ fn build_account_ledger_rows(
         let is_refund_transfer = sp.split_amount < -0.005;
         let transfer_target = if is_refund_transfer && sp.pay_plan_num != 0 {
             let counterpart = splits.iter().find(|o| {
-                o.pay_num == sp.pay_num
-                    && o.split_num != sp.split_num
-                    && o.split_amount > 0.005
+                o.pay_num == sp.pay_num && o.split_num != sp.split_num && o.split_amount > 0.005
             });
             Some(
                 counterpart
@@ -1004,12 +1001,18 @@ fn build_account_ledger_rows(
                     let target = match transfer_target.unwrap_or(PaymentTarget::Unallocated) {
                         PaymentTarget::Procedure(pn) => format!("procedure #{}", pn),
                         PaymentTarget::PayPlan(pn) => format!("plan #{}", pn),
-                        PaymentTarget::PayPlanCharge { plan_num, charge_num } => {
+                        PaymentTarget::PayPlanCharge {
+                            plan_num,
+                            charge_num,
+                        } => {
                             format!("plan #{} charge #{}", plan_num, charge_num)
                         }
                         PaymentTarget::Unallocated => "patient account (unallocated)".to_string(),
                     };
-                    format!("Payment plan #{} (credit moved/refund -> {})", sp.pay_plan_num, target)
+                    format!(
+                        "Payment plan #{} (credit moved/refund -> {})",
+                        sp.pay_plan_num, target
+                    )
                 } else {
                     format!("Payment plan #{} (unapplied to charge)", sp.pay_plan_num)
                 }
@@ -1028,7 +1031,11 @@ fn build_account_ledger_rows(
             transfer_target,
             pay_num: sp.pay_num,
             adj_num: 0,
-            note: payments.iter().find(|p| p.pay_num == sp.pay_num).map(|p| p.note.clone()).unwrap_or_default(),
+            note: payments
+                .iter()
+                .find(|p| p.pay_num == sp.pay_num)
+                .map(|p| p.note.clone())
+                .unwrap_or_default(),
         }
     }));
     rows
@@ -1070,7 +1077,15 @@ fn filter_account_ledger_rows(
 }
 
 fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
-    let mut table = ReportTable::new(&["Date", "Type", "Description", "Charge", "Credit", "Payment #", "Note"]);
+    let mut table = ReportTable::new(&[
+        "Date",
+        "Type",
+        "Description",
+        "Charge",
+        "Credit",
+        "Payment #",
+        "Note",
+    ]);
     for r in rows {
         table.push(&[
             &r.date.to_string(),
@@ -1078,7 +1093,11 @@ fn account_ledger_export_table(rows: &[LedgerRow]) -> ReportTable {
             &r.description,
             &format!("{:.2}", r.charge),
             &format!("{:.2}", r.credit),
-            &if r.pay_num == 0 { String::new() } else { r.pay_num.to_string() },
+            &if r.pay_num == 0 {
+                String::new()
+            } else {
+                r.pay_num.to_string()
+            },
             &r.note,
         ]);
     }
@@ -1108,13 +1127,7 @@ fn account_audit_export_table(
     log: &[SecurityEvent],
 ) -> ReportTable {
     let mut table = ReportTable::new(&[
-        "Section",
-        "When",
-        "Patient",
-        "Plan #",
-        "Source #",
-        "User",
-        "Details",
+        "Section", "When", "Patient", "Plan #", "Source #", "User", "Details",
     ]);
     let patient = format!("{} (#{pat_num})", patient_name);
     for charge in charges
@@ -1258,7 +1271,13 @@ pub fn run() -> eframe::Result<()> {
     eframe::run_native(
         "odclinic — Open Dental Rust port",
         options,
-        Box::new(|_cc| Ok(Box::new(OdApp::new()))),
+        Box::new(|cc| {
+            theme::apply(&cc.egui_ctx);
+            let app = OdApp::try_new().map_err(|err| {
+                Box::<dyn std::error::Error + Send + Sync>::from(std::io::Error::other(err))
+            })?;
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -1284,6 +1303,17 @@ impl ApptTab {
             ApptTab::Recalls => "Recalls",
             ApptTab::Asap => "ASAP list",
             ApptTab::Waitlist => "Waitlist",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            ApptTab::Schedule => {
+                "Day and week board · drag a visit to reschedule, drop on the pin board to unschedule"
+            }
+            ApptTab::Recalls => "Due recalls, sorted with the most urgent first",
+            ApptTab::Asap => "Patients waiting for the next available opening",
+            ApptTab::Waitlist => "Unscheduled patients held for a future slot",
         }
     }
 
@@ -1481,7 +1511,9 @@ impl ReportKind {
             ReportKind::HiddenPaySplits => "Hidden pay splits (FormRpHiddenPaySplits)",
             ReportKind::UnearnedIncome => "Unearned income (FormRpUnearnedIncome)",
             ReportKind::ProcOverpaid => "Overpaid procedures (FormRpProcOverpaid)",
-            ReportKind::ReceivablesBreakdown => "Receivables breakdown (FormRpReceivablesBreakdown)",
+            ReportKind::ReceivablesBreakdown => {
+                "Receivables breakdown (FormRpReceivablesBreakdown)"
+            }
             ReportKind::ServiceDateView => "Service-date view (FormRpServiceDateView)",
             ReportKind::ProcNote => "Incomplete procedure notes (FormRpProcNote)",
             ReportKind::DentalSealant => "Dental sealant measure (FormRpDentalSealantMeasure)",
@@ -1499,8 +1531,12 @@ impl ReportKind {
             ReportKind::Statement => "Statements (FormRpStatement)",
             ReportKind::ProdGoal => "Production goal (FormRpProdGoal)",
             ReportKind::ProviderPayroll => "Provider payroll (FormRpProviderPayroll)",
-            ReportKind::PresentedTreatment => "Presented treatment production (FormRpPresentedTreatmentProduction)",
-            ReportKind::TpPresentationStats => "Plan presentation statistics (FormRpTreatPlanPresentationStatistics)",
+            ReportKind::PresentedTreatment => {
+                "Presented treatment production (FormRpPresentedTreatmentProduction)"
+            }
+            ReportKind::TpPresentationStats => {
+                "Plan presentation statistics (FormRpTreatPlanPresentationStatistics)"
+            }
         }
     }
 
@@ -1740,6 +1776,10 @@ struct OdApp {
 
     search: String,
     selected_patient: Option<Id>,
+    /// OD-style Select Patient dialog shared by the shell and daily loop.
+    patient_picker_open: bool,
+    patient_picker_query: String,
+    patient_picker_target: PatientPickerTarget,
     schedule_day: NaiveDate,
     /// Day/week board state: view, stage quick-actions, holds and drag preview.
     board: ScheduleBoard,
@@ -2007,6 +2047,7 @@ struct OdApp {
 }
 
 impl OdApp {
+    #[cfg(test)]
     fn new() -> Self {
         Self::try_new().unwrap_or_else(|err| panic!("odclinic startup failed: {err}"))
     }
@@ -2082,6 +2123,9 @@ impl OdApp {
             recall_status_text: String::new(),
             search: String::new(),
             selected_patient: None,
+            patient_picker_open: false,
+            patient_picker_query: String::new(),
+            patient_picker_target: PatientPickerTarget::Global,
             schedule_day: today,
             board: ScheduleBoard::load(today),
             patient_edit: None,
@@ -2240,7 +2284,11 @@ impl OdApp {
             selected_tooth: None,
             notice: None,
             error: None,
-            session: if login_required { None } else { Some(Session::local()) },
+            session: if login_required {
+                None
+            } else {
+                Some(Session::local())
+            },
             users,
             group_permissions,
             group_attaches,
@@ -2290,11 +2338,12 @@ impl OdApp {
         app.load_period_close_history_filters();
         app.load_report_user_view();
         app.refresh();
-        app
+        Ok(app)
     }
 
     fn refresh(&mut self) {
-        self.closed_periods = ClosedPeriods::from_prefs(&self.store.list_prefs().unwrap_or_default());
+        self.closed_periods =
+            ClosedPeriods::from_prefs(&self.store.list_prefs().unwrap_or_default());
         match self.store.list_patients() {
             Ok(rows) => self.patients = rows,
             Err(e) => self.error = Some(e),
@@ -2408,7 +2457,10 @@ impl OdApp {
         let view = PeriodCloseHistoryView {
             user: self.period_close_history_user_filter.clone(),
             month: self.period_close_history_month_filter.clone(),
-            action: self.period_close_history_action_filter.storage_key().to_string(),
+            action: self
+                .period_close_history_action_filter
+                .storage_key()
+                .to_string(),
         };
         if self.report_prefs.period_close_history_view(&key) == Some(&view) {
             return;
@@ -2441,7 +2493,11 @@ impl OdApp {
                 self.show_report_dates(from, to);
             }
         }
-        if let Some(stem) = self.report_prefs.selected_report_kind(&key).map(str::to_string) {
+        if let Some(stem) = self
+            .report_prefs
+            .selected_report_kind(&key)
+            .map(str::to_string)
+        {
             if let Some(kind) = ReportKind::from_file_stem(&stem)
                 .filter(|kind| self.features.enabled(kind.feature_key()))
             {
@@ -2495,7 +2551,8 @@ impl OdApp {
         if self.report_prefs.report_sort(&user_key, report_key) == sort {
             return;
         }
-        self.report_prefs.set_report_sort(user_key, report_key, sort);
+        self.report_prefs
+            .set_report_sort(user_key, report_key, sort);
         if let Err(err) = self.save_report_prefs() {
             self.error = Some(format!("Could not save report sort preference: {err}"));
         }
@@ -2520,7 +2577,9 @@ impl OdApp {
             return;
         }
         if let Err(err) = self.save_report_prefs() {
-            self.error = Some(format!("Could not save Collections aging band preference: {err}"));
+            self.error = Some(format!(
+                "Could not save Collections aging band preference: {err}"
+            ));
         }
     }
 
@@ -2650,13 +2709,7 @@ impl OdApp {
         }
     }
 
-    fn audit_if(
-        &mut self,
-        key: FeatureKey,
-        permission: Permission,
-        pat_num: Id,
-        log_text: String,
-    ) {
+    fn audit_if(&mut self, key: FeatureKey, permission: Permission, pat_num: Id, log_text: String) {
         if self.features.enabled(key) {
             self.audit(permission, pat_num, log_text);
         }
@@ -2679,13 +2732,29 @@ impl OdApp {
             if !p.is_dynamic {
                 continue;
             }
-            let p_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == p.pay_plan_num).cloned().collect();
+            let p_links: Vec<PayPlanLink> = plan_links
+                .iter()
+                .filter(|l| l.pay_plan_num == p.pay_plan_num)
+                .cloned()
+                .collect();
             if let Some(reason) = od_core::issuance_block(p, &p_links) {
                 errors.push(format!("Plan #{}: {}", p.pay_plan_num, reason));
                 continue;
             }
-            let existing: Vec<PayPlanCharge> = plan_charges.iter().filter(|c| c.pay_plan_num == p.pay_plan_num).cloned().collect();
-            let due = od_core::issue_charges_due(p, &p_links, procedures, adjustments, splits, &existing, as_of);
+            let existing: Vec<PayPlanCharge> = plan_charges
+                .iter()
+                .filter(|c| c.pay_plan_num == p.pay_plan_num)
+                .cloned()
+                .collect();
+            let due = od_core::issue_charges_due(
+                p,
+                &p_links,
+                procedures,
+                adjustments,
+                splits,
+                &existing,
+                as_of,
+            );
             if due.is_empty() {
                 continue;
             }
@@ -2694,7 +2763,10 @@ impl OdApp {
             for charge in due {
                 match self.store.upsert_pay_plan_charge(&charge) {
                     Ok(_) => issued += 1,
-                    Err(e) => { plan_error = Some(e); break; }
+                    Err(e) => {
+                        plan_error = Some(e);
+                        break;
+                    }
                 }
             }
             if let Some(e) = plan_error {
@@ -2707,7 +2779,10 @@ impl OdApp {
                     FeatureKey::AuditBillingChanges,
                     Permission::BILLING,
                     p.pat_num,
-                    format!("Issued {} dynamic charge(s) for plan {} (portfolio reconcile as of {})", issued, p.pay_plan_num, as_of),
+                    format!(
+                        "Issued {} dynamic charge(s) for plan {} (portfolio reconcile as of {})",
+                        issued, p.pay_plan_num, as_of
+                    ),
                 );
             }
         }
@@ -2719,7 +2794,13 @@ impl OdApp {
                 format!("Issued {total_issued} charge(s) across {plans_touched} plan(s)")
             });
         } else {
-            self.notice = if total_issued > 0 { Some(format!("Issued {total_issued} charge(s) across {plans_touched} plan(s); some plans had errors")) } else { None };
+            self.notice = if total_issued > 0 {
+                Some(format!(
+                    "Issued {total_issued} charge(s) across {plans_touched} plan(s); some plans had errors"
+                ))
+            } else {
+                None
+            };
             self.error = Some(errors.join("; "));
         }
     }
@@ -2741,7 +2822,15 @@ impl OdApp {
             self.error = Some("Enter a resolution reason before resolving stale charges.".into());
             return;
         }
-        let (_own, _due, _full, stale) = od_core::reconciliation_detail(plan, own_links, procedures, adjustments, splits, plan_charges, as_of);
+        let (_own, _due, _full, stale) = od_core::reconciliation_detail(
+            plan,
+            own_links,
+            procedures,
+            adjustments,
+            splits,
+            plan_charges,
+            as_of,
+        );
         if stale.is_empty() {
             self.notice = Some("No stale dynamic charges to resolve".into());
             return;
@@ -2767,12 +2856,20 @@ impl OdApp {
             self.error = None;
             let blocked = res.blocked_with_splits.len();
             self.notice = Some(if blocked > 0 {
-                format!("Resolved {resolved} stale charge(s); {blocked} blocked because splits are applied")
+                format!(
+                    "Resolved {resolved} stale charge(s); {blocked} blocked because splits are applied"
+                )
             } else {
                 format!("Resolved {resolved} stale charge(s)")
             });
         } else {
-            self.notice = if resolved > 0 { Some(format!("Resolved {resolved} stale charge(s); some updates failed")) } else { None };
+            self.notice = if resolved > 0 {
+                Some(format!(
+                    "Resolved {resolved} stale charge(s); some updates failed"
+                ))
+            } else {
+                None
+            };
             self.error = Some(errors.join("; "));
         }
     }
@@ -2792,8 +2889,11 @@ impl OdApp {
             self.login_error = Some("Incorrect password".into());
             return;
         }
-        let permissions =
-            od_core::auth::resolve_permissions(&user, &self.group_attaches, &self.group_permissions);
+        let permissions = od_core::auth::resolve_permissions(
+            &user,
+            &self.group_attaches,
+            &self.group_permissions,
+        );
         let user_name = user.user_name.clone();
         let user_num = user.user_num;
         let previous_user_key = self.period_close_history_user_key();
@@ -2803,6 +2903,7 @@ impl OdApp {
             user_name: user_name.clone(),
             permissions,
         });
+        self.sync_store_user();
         self.load_period_close_history_filters();
         self.switch_report_user_view(&previous_user_key);
         self.login_error = None;
@@ -2819,58 +2920,83 @@ impl OdApp {
     fn logout(&mut self) {
         if let Some(session) = &self.session {
             let text = format!("User: {} has logged off.", session.user_name);
-            self.audit_if(FeatureKey::AuditLogins, Permission::USER_LOG_ON_OFF, 0, text);
+            self.audit_if(
+                FeatureKey::AuditLogins,
+                Permission::USER_LOG_ON_OFF,
+                0,
+                text,
+            );
         }
         let previous_user_key = self.period_close_history_user_key();
         self.persist_report_date_range();
         self.session = None;
+        self.sync_store_user();
         self.load_period_close_history_filters();
         self.switch_report_user_view(&previous_user_key);
     }
 
+    /// Keep OD audit/user columns tied to the active session. A local session
+    /// has UserNum 0, which is the port's explicit "no OD user" sentinel.
+    fn sync_store_user(&self) {
+        self.store
+            .set_current_user(self.session.as_ref().map_or(0, |s| s.user_num));
+    }
+
     fn login_ui(&mut self, ui: &mut Ui) {
-        ui.heading("odclinic — Log in");
-        ui.label("Authenticate against the Open Dental userod table, or use the built-in demo users.");
-        if let Some(err) = self.login_error.clone() {
-            ui.colored_label(Color32::from_rgb(200, 60, 60), err);
-        }
-        ui.add_space(8.0);
-        egui::Grid::new("login_grid")
-            .num_columns(2)
-            .spacing([8.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("User name");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.login_name)
-                        .desired_width(220.0)
-                        .hint_text("userod.UserName"),
-                );
-                ui.end_row();
-                ui.label("Password");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.login_pass)
-                        .password(true)
-                        .desired_width(220.0),
-                );
-                ui.end_row();
-            });
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            if ui.button("Log in").clicked() {
-                self.try_login();
-            }
-            if ui.button("Demo credentials").clicked() {
-                self.login_name = "admin".into();
-                self.login_pass = "admin".into();
-                self.login_error = None;
-            }
-            if ui.button("Settings").clicked() {
-                self.show_settings = true;
-            }
+        ui.vertical_centered(|ui| {
+            ui.add_space(70.0);
+            egui::Frame::new()
+                .fill(theme::paper())
+                .stroke(egui::Stroke::new(1.0, theme::line()))
+                .corner_radius(egui::CornerRadius::same(10))
+                .inner_margin(egui::Margin::same(24))
+                .show(ui, |ui| {
+                    ui.set_max_width(420.0);
+                    ui.heading("odclinic");
+                    ui.label(egui::RichText::new("Sign in to the clinic").color(theme::muted()));
+                    ui.add_space(12.0);
+                    if let Some(err) = self.login_error.clone() {
+                        ui.colored_label(ui.visuals().error_fg_color, err);
+                    }
+                    ui.add_space(8.0);
+                    egui::Grid::new("login_grid")
+                        .num_columns(2)
+                        .spacing([8.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("User name");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.login_name)
+                                    .desired_width(220.0)
+                                    .hint_text("userod.UserName"),
+                            );
+                            ui.end_row();
+                            ui.label("Password");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.login_pass)
+                                    .password(true)
+                                    .desired_width(220.0),
+                            );
+                            ui.end_row();
+                        });
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Log in").clicked() {
+                            self.try_login();
+                        }
+                        if ui.button("Demo credentials").clicked() {
+                            self.login_name = "admin".into();
+                            self.login_pass = "admin".into();
+                            self.login_error = None;
+                        }
+                        if ui.button("Settings").clicked() {
+                            self.show_settings = true;
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.weak("Settings stays reachable here, so the login requirement can be turned off.");
+                    ui.weak("Demo users: admin / admin, aharrison / harrison.");
+                });
         });
-        ui.add_space(8.0);
-        ui.weak("Settings stays reachable here, so the login requirement can be turned off.");
-        ui.weak("Demo users: admin / admin (full access), aharrison / harrison (clinical).");
     }
 
     fn render(&mut self, ui: &mut egui::Ui) {
@@ -2881,60 +3007,76 @@ impl OdApp {
         if self.login_required() {
             if self.session.as_ref().is_some_and(|s| s.user_num == 0) {
                 self.session = None;
+                self.sync_store_user();
             }
         } else if self.session.is_none() {
             self.session = Some(Session::local());
+            self.sync_store_user();
         }
         if self.login_required() && self.session.is_none() {
-            egui::CentralPanel::default().show(ui, |ui| {
-                if self.show_settings {
-                    self.settings_ui(ui);
-                } else {
-                    self.login_ui(ui);
-                }
-            });
+            egui::CentralPanel::default()
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::paper())
+                        .inner_margin(egui::Margin::same(16)),
+                )
+                .show(ui, |ui| {
+                    if self.show_settings {
+                        self.settings_ui(ui);
+                    } else {
+                        self.login_ui(ui);
+                    }
+                });
             return;
         }
 
         self.top_bar(ui);
+        shell::patient_banner(self, ui);
         self.side_bar(ui);
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(err) = self.error.clone() {
-                ui.colored_label(Color32::from_rgb(200, 60, 60), format!("Error: {err}"));
-                ui.separator();
-            }
-            if let Some(msg) = self.notice.clone() {
-                ui.colored_label(Color32::from_rgb(20, 120, 40), msg);
-                ui.separator();
-            }
-            if self.show_settings {
-                self.settings_ui(ui);
-            } else if Module::ALL.iter().all(|m| !self.can_module(*m)) {
-                ui.label("No modules are available. Check Settings or your permissions.");
-            } else {
-                if !self.can_module(self.module) {
-                    self.module = Module::ALL
-                        .into_iter()
-                        .find(|m| self.can_module(*m))
-                        .unwrap_or(Module::Appointments);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::paper())
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ui, |ui| {
+                if let Some(err) = self.error.clone() {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("Error: {err}"));
+                    ui.separator();
                 }
-                match self.module {
-                    Module::Appointments => self.appointments_ui(ui),
-                    Module::Family => self.family_ui(ui),
-                    Module::Account => self.account_ui(ui),
-                    Module::TreatmentPlan => self.treatment_ui(ui),
-                    Module::Chart => self.chart_ui(ui),
-                    Module::Reports => self.reports_ui(ui),
-                    Module::Setup => self.setup_ui(ui),
+                if let Some(msg) = self.notice.clone() {
+                    ui.colored_label(theme::success(), msg);
+                    ui.separator();
                 }
-            }
-        });
+                if self.show_settings {
+                    self.settings_ui(ui);
+                } else if Module::ALL.iter().all(|m| !self.can_module(*m)) {
+                    ui.label("No modules are available. Check Settings or your permissions.");
+                } else {
+                    if !self.can_module(self.module) {
+                        self.module = Module::ALL
+                            .into_iter()
+                            .find(|m| self.can_module(*m))
+                            .unwrap_or(Module::Appointments);
+                    }
+                    match self.module {
+                        Module::Appointments => self.appointments_ui(ui),
+                        Module::Family => self.family_ui(ui),
+                        Module::Account => self.account_ui(ui),
+                        Module::TreatmentPlan => self.treatment_ui(ui),
+                        Module::Chart => self.chart_ui(ui),
+                        Module::Reports => self.reports_ui(ui),
+                        Module::Setup => self.setup_ui(ui),
+                    }
+                }
+            });
 
         self.patient_window(&ctx);
         self.patient_history_window(&ctx);
         self.registry_window(&ctx);
         self.appointment_window(&ctx);
+        shell::patient_picker_window(self, &ctx);
         schedule_board::hold_window(self, &ctx);
         self.appointment_history_window(&ctx);
         self.recall_window(&ctx);
@@ -2955,72 +3097,62 @@ impl OdApp {
     }
 
     fn top_bar(&mut self, ui: &mut Ui) {
-        egui::Panel::top("menu").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("odclinic");
-                ui.separator();
-                for module in Module::ALL {
-                    if !self.can_module(module) {
-                        continue;
-                    }
-                    if ui.button(module.label()).clicked() {
-                        self.module = module;
-                        self.show_settings = false;
-                        self.refresh();
-                    }
-                }
-                ui.separator();
-                if ui.button("Settings").clicked() {
-                    self.show_settings = true;
-                }
-                if ui.button("Refresh").clicked() {
-                    self.refresh();
-                    self.notice = Some("Refreshed".into());
-                }
-                let mut do_logout = false;
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(session) = &self.session {
-                        ui.label(format!("Signed in: {}", session.user_name));
-                        if self.login_required() && ui.button("Log out").clicked() {
-                            do_logout = true;
-                        }
-                    }
-                    if self.features.enabled(FeatureKey::ShowDatabaseLabel) {
-                        ui.label(&self.db_label);
-                    }
-                });
-                if do_logout {
-                    self.logout();
-                }
-            });
-        });
+        shell::menu_bar(self, ui);
+    }
+
+    fn side_bar_module(&mut self, ui: &mut Ui, module: Module) {
+        let selected = !self.show_settings && self.module == module;
+        if ui.selectable_label(selected, module.label()).clicked() {
+            self.module = module;
+            self.show_settings = false;
+            self.refresh();
+        }
     }
 
     fn side_bar(&mut self, ui: &mut Ui) {
         egui::Panel::left("module_bar")
             .resizable(false)
-            .default_size(112.0)
+            .default_size(148.0)
             .show(ui, |ui| {
-                ui.add_space(6.0);
-                for module in Module::ALL {
-                    if !self.can_module(module) {
-                        continue;
-                    }
-                    let selected = !self.show_settings && self.module == module;
-                    if ui.selectable_label(selected, module.label()).clicked() {
-                        self.module = module;
-                        self.show_settings = false;
-                        self.refresh();
+                ui.add_space(10.0);
+
+                ui.label(egui::RichText::new("Care").color(theme::muted()).small());
+                for module in [
+                    Module::Appointments,
+                    Module::Family,
+                    Module::Chart,
+                    Module::TreatmentPlan,
+                ] {
+                    if self.can_module(module) {
+                        self.side_bar_module(ui, module);
                     }
                 }
+
                 ui.add_space(12.0);
                 ui.separator();
-                if ui.selectable_label(self.show_settings, "Settings").clicked() {
+                ui.label(egui::RichText::new("Money").color(theme::muted()).small());
+                for module in [Module::Account, Module::Reports] {
+                    if self.can_module(module) {
+                        self.side_bar_module(ui, module);
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.label(egui::RichText::new("System").color(theme::muted()).small());
+                if self.can_module(Module::Setup) {
+                    self.side_bar_module(ui, Module::Setup);
+                }
+                if ui
+                    .selectable_label(self.show_settings, "Settings")
+                    .clicked()
+                {
                     self.show_settings = true;
                 }
-                ui.add_space(12.0);
-                ui.separator();
+
                 if self.features.enabled(FeatureKey::ShowImagingNote) {
+                    ui.add_space(12.0);
+                    ui.separator();
                     ui.label(egui::RichText::new("Imaging omitted").weak().small());
                     ui.label(egui::RichText::new("by scope choice").weak().small());
                 }
@@ -3030,24 +3162,43 @@ impl OdApp {
     // ---------------------------------------------------------------- Appointments
 
     fn appointments_ui(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            for tab in ApptTab::ALL {
-                if !tab.enabled(&self.features) {
-                    continue;
-                }
-                if ui.selectable_label(self.appt_tab == tab, tab.label()).clicked() {
-                    self.appt_tab = tab;
-                    self.refresh();
-                }
-            }
-        });
-        ui.separator();
+        egui::Frame::new()
+            .fill(theme::panel())
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(6, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for tab in ApptTab::ALL {
+                        if !tab.enabled(&self.features) {
+                            continue;
+                        }
+                        if ui
+                            .selectable_label(self.appt_tab == tab, tab.label())
+                            .clicked()
+                        {
+                            self.appt_tab = tab;
+                            self.refresh();
+                        }
+                    }
+                });
+            });
+        ui.add_space(10.0);
+        ui.label(
+            egui::RichText::new(self.appt_tab.description())
+                .color(theme::muted())
+                .small(),
+        );
+        ui.add_space(6.0);
         match self.appt_tab {
             ApptTab::Schedule => self.schedule_ui(ui),
             ApptTab::Recalls => self.recalls_ui(ui),
             ApptTab::Asap => self.asap_ui(ui),
             ApptTab::Waitlist => self.waitlist_ui(ui),
         }
+    }
+
+    fn table_header(ui: &mut Ui, label: &str) {
+        ui.label(egui::RichText::new(label).small().color(theme::muted()));
     }
 
     fn schedule_ui(&mut self, ui: &mut Ui) {
@@ -3064,11 +3215,7 @@ impl OdApp {
                 self.schedule_day -= Duration::days(1);
                 self.refresh();
             }
-            ui.strong(
-                self.schedule_day
-                    .format("%A, %B %d, %Y")
-                    .to_string(),
-            );
+            ui.strong(self.schedule_day.format("%A, %B %d, %Y").to_string());
             if ui.button("Next day >").clicked() {
                 self.schedule_day += Duration::days(1);
                 self.refresh();
@@ -3082,7 +3229,11 @@ impl OdApp {
                 apt.apt_datetime = self.schedule_day.and_hms_opt(9, 0, 0).unwrap_or_default();
                 apt.apt_length = 30;
                 apt.apt_status = AppointmentStatus::Scheduled;
-                apt.operatory_num = self.operatories.first().map(|o| o.operatory_num).unwrap_or(0);
+                apt.operatory_num = self
+                    .operatories
+                    .first()
+                    .map(|o| o.operatory_num)
+                    .unwrap_or(0);
                 apt.provider_num = self.providers.first().map(|p| p.provider_num).unwrap_or(0);
                 apt.clinic_num = 1;
                 apt.pattern = "XXXXXX".into();
@@ -3123,9 +3274,9 @@ impl OdApp {
             .striped(true)
             .spacing([6.0, 2.0])
             .show(ui, |ui| {
-                ui.strong("Time");
+                Self::table_header(ui, "Time");
                 for op in &operatories {
-                    ui.strong(&op.description);
+                    Self::table_header(ui, &op.description);
                 }
                 ui.end_row();
 
@@ -3146,16 +3297,15 @@ impl OdApp {
                                     patient_name(&patients, apt.pat_num),
                                     apt.apt_length
                                 );
-                                let mut button = egui::Button::new(label).min_size([118.0, 18.0].into());
+                                let mut button =
+                                    egui::Button::new(label).min_size([118.0, 18.0].into());
                                 if use_status_colors {
                                     button = button.fill(status_color(apt.apt_status));
                                 }
                                 if ui.add(button).clicked() && can_edit_appointments {
                                     self.apt_edit = Some(apt.clone());
-                                    self.apt_text = apt
-                                        .apt_datetime
-                                        .format("%Y-%m-%d %H:%M")
-                                        .to_string();
+                                    self.apt_text =
+                                        apt.apt_datetime.format("%Y-%m-%d %H:%M").to_string();
                                     self.apt_len_text = apt.apt_length.to_string();
                                     self.apt_edit_open = true;
                                 }
@@ -3178,7 +3328,9 @@ impl OdApp {
 
     fn open_recall_editor(&mut self, recall: Recall) {
         let (years, months, weeks, days) = interval_parts(recall.recall_interval);
-        self.recall_due_text = recall_due_date(&recall).map(|d| d.to_string()).unwrap_or_default();
+        self.recall_due_text = recall_due_date(&recall)
+            .map(|d| d.to_string())
+            .unwrap_or_default();
         self.recall_years_text = years.to_string();
         self.recall_months_text = months.to_string();
         self.recall_weeks_text = weeks.to_string();
@@ -3246,69 +3398,88 @@ impl OdApp {
             return;
         }
 
-        egui::Grid::new("recall_grid")
-            .num_columns(8)
-            .striped(true)
-            .spacing([8.0, 4.0])
+        egui::Frame::new()
+            .fill(theme::paper())
+            .stroke(egui::Stroke::new(1.0, theme::line()))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.strong("Patient");
-                ui.strong("Due");
-                ui.strong("State");
-                ui.strong("Interval");
-                ui.strong("Priority");
-                ui.strong("Status #");
-                ui.strong("Note");
-                ui.strong("Actions");
-                ui.end_row();
+                egui::Grid::new("recall_grid")
+                    .num_columns(8)
+                    .striped(true)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        Self::table_header(ui, "Patient");
+                        Self::table_header(ui, "Due");
+                        Self::table_header(ui, "State");
+                        Self::table_header(ui, "Interval");
+                        Self::table_header(ui, "Priority");
+                        Self::table_header(ui, "Status #");
+                        Self::table_header(ui, "Note");
+                        Self::table_header(ui, "Actions");
+                        ui.end_row();
 
-                for recall in &rows {
-                    let state = recall_due_state(recall, today);
-                    let color = match state {
-                        RecallDueState::Overdue(_) => Color32::from_rgb(190, 60, 60),
-                        RecallDueState::DueToday => Color32::from_rgb(190, 120, 20),
-                        RecallDueState::Disabled | RecallDueState::NoDate => Color32::GRAY,
-                        _ => Color32::from_rgb(30, 110, 50),
-                    };
-                    ui.label(patient_name(&patients, recall.pat_num));
-                    ui.label(
-                        recall_due_date(recall)
-                            .map(|d| d.to_string())
-                            .unwrap_or_else(|| "-".into()),
-                    );
-                    ui.colored_label(color, state.label());
-                    ui.label(format_interval(recall.recall_interval));
-                    ui.label(recall.priority.label());
-                    ui.label(if recall.recall_status == 0 {
-                        "-".into()
-                    } else {
-                        recall.recall_status.to_string()
-                    });
-                    ui.label(&recall.note);
-                    ui.horizontal(|ui| {
-                        if can_edit && ui.button("Edit").clicked() {
-                            self.open_recall_editor(recall.clone());
-                        }
-                        if can_create && ui.button("Schedule").clicked() {
-                            let mut apt = Appointment {
-                                pat_num: recall.pat_num,
-                                apt_datetime: today.and_hms_opt(9, 0, 0).unwrap_or_default(),
-                                apt_length: 30,
-                                apt_status: AppointmentStatus::Scheduled,
-                                operatory_num: self.operatories.first().map(|o| o.operatory_num).unwrap_or(0),
-                                provider_num: self.providers.first().map(|p| p.provider_num).unwrap_or(0),
-                                clinic_num: 1,
-                                pattern: "XXXXXX".into(),
-                                priority: recall.priority,
-                                ..Default::default()
+                        for recall in &rows {
+                            let state = recall_due_state(recall, today);
+                            let color = match state {
+                                RecallDueState::Overdue(_) => theme::danger(),
+                                RecallDueState::DueToday => theme::warning(),
+                                RecallDueState::Disabled | RecallDueState::NoDate => theme::muted(),
+                                _ => theme::success(),
                             };
-                            if let Some(previous) = recall.date_previous {
-                                apt.apt_datetime = previous.and_hms_opt(9, 0, 0).unwrap_or(apt.apt_datetime);
-                            }
-                            self.open_appointment_editor(apt);
+                            ui.label(patient_name(&patients, recall.pat_num));
+                            ui.label(
+                                recall_due_date(recall)
+                                    .map(|d| d.to_string())
+                                    .unwrap_or_else(|| "-".into()),
+                            );
+                            ui.colored_label(color, state.label());
+                            ui.label(format_interval(recall.recall_interval));
+                            ui.label(recall.priority.label());
+                            ui.label(if recall.recall_status == 0 {
+                                "-".into()
+                            } else {
+                                recall.recall_status.to_string()
+                            });
+                            ui.label(&recall.note);
+                            ui.horizontal(|ui| {
+                                if can_edit && ui.button("Edit").clicked() {
+                                    self.open_recall_editor(recall.clone());
+                                }
+                                if can_create && ui.button("Schedule").clicked() {
+                                    let mut apt = Appointment {
+                                        pat_num: recall.pat_num,
+                                        apt_datetime: today
+                                            .and_hms_opt(9, 0, 0)
+                                            .unwrap_or_default(),
+                                        apt_length: 30,
+                                        apt_status: AppointmentStatus::Scheduled,
+                                        operatory_num: self
+                                            .operatories
+                                            .first()
+                                            .map(|o| o.operatory_num)
+                                            .unwrap_or(0),
+                                        provider_num: self
+                                            .providers
+                                            .first()
+                                            .map(|p| p.provider_num)
+                                            .unwrap_or(0),
+                                        clinic_num: 1,
+                                        pattern: "XXXXXX".into(),
+                                        priority: recall.priority,
+                                        ..Default::default()
+                                    };
+                                    if let Some(previous) = recall.date_previous {
+                                        apt.apt_datetime = previous
+                                            .and_hms_opt(9, 0, 0)
+                                            .unwrap_or(apt.apt_datetime);
+                                    }
+                                    self.open_appointment_editor(apt);
+                                }
+                            });
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-                }
             });
     }
 
@@ -3324,10 +3495,17 @@ impl OdApp {
         ui.horizontal(|ui| {
             if can_create && ui.button("+ ASAP appointment").clicked() {
                 let apt = Appointment {
-                    apt_datetime: Local::now().date_naive().and_hms_opt(9, 0, 0).unwrap_or_default(),
+                    apt_datetime: Local::now()
+                        .date_naive()
+                        .and_hms_opt(9, 0, 0)
+                        .unwrap_or_default(),
                     apt_length: 30,
                     apt_status: AppointmentStatus::UnschedList,
-                    operatory_num: self.operatories.first().map(|o| o.operatory_num).unwrap_or(0),
+                    operatory_num: self
+                        .operatories
+                        .first()
+                        .map(|o| o.operatory_num)
+                        .unwrap_or(0),
                     provider_num: self.providers.first().map(|p| p.provider_num).unwrap_or(0),
                     clinic_num: 1,
                     pattern: "XXXXXX".into(),
@@ -3349,44 +3527,51 @@ impl OdApp {
             return;
         }
 
-        egui::Grid::new("asap_grid")
-            .num_columns(7)
-            .striped(true)
-            .spacing([8.0, 4.0])
+        egui::Frame::new()
+            .fill(theme::paper())
+            .stroke(egui::Stroke::new(1.0, theme::line()))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.strong("Date / time");
-                ui.strong("Patient");
-                ui.strong("Status");
-                ui.strong("Provider");
-                ui.strong("Operatory");
-                ui.strong("Notes");
-                ui.strong("Actions");
-                ui.end_row();
+                egui::Grid::new("asap_grid")
+                    .num_columns(7)
+                    .striped(true)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        Self::table_header(ui, "Date / time");
+                        Self::table_header(ui, "Patient");
+                        Self::table_header(ui, "Status");
+                        Self::table_header(ui, "Provider");
+                        Self::table_header(ui, "Operatory");
+                        Self::table_header(ui, "Notes");
+                        Self::table_header(ui, "Actions");
+                        ui.end_row();
 
-                for apt in &asap {
-                    let provider = providers
-                        .iter()
-                        .find(|p| p.provider_num == apt.provider_num)
-                        .map(|p| p.abbreviation.clone())
-                        .unwrap_or_else(|| "-".into());
-                    let operatory = operatories
-                        .iter()
-                        .find(|o| o.operatory_num == apt.operatory_num)
-                        .map(|o| o.abbrev.clone())
-                        .unwrap_or_else(|| "-".into());
-                    ui.label(apt.apt_datetime.format("%Y-%m-%d %H:%M").to_string());
-                    ui.label(patient_name(&patients, apt.pat_num));
-                    ui.label(apt.apt_status.label());
-                    ui.label(provider);
-                    ui.label(operatory);
-                    ui.label(&apt.notes);
-                    ui.horizontal(|ui| {
-                        if can_edit && ui.button("Edit").clicked() {
-                            self.open_appointment_editor(apt.clone());
+                        for apt in &asap {
+                            let provider = providers
+                                .iter()
+                                .find(|p| p.provider_num == apt.provider_num)
+                                .map(|p| p.abbreviation.clone())
+                                .unwrap_or_else(|| "-".into());
+                            let operatory = operatories
+                                .iter()
+                                .find(|o| o.operatory_num == apt.operatory_num)
+                                .map(|o| o.abbrev.clone())
+                                .unwrap_or_else(|| "-".into());
+                            ui.label(apt.apt_datetime.format("%Y-%m-%d %H:%M").to_string());
+                            ui.label(patient_name(&patients, apt.pat_num));
+                            ui.label(apt.apt_status.label());
+                            ui.label(provider);
+                            ui.label(operatory);
+                            ui.label(&apt.notes);
+                            ui.horizontal(|ui| {
+                                if can_edit && ui.button("Edit").clicked() {
+                                    self.open_appointment_editor(apt.clone());
+                                }
+                            });
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-                }
             });
     }
 
@@ -3407,11 +3592,18 @@ impl OdApp {
                     .map(|d| d.def_num)
                     .unwrap_or(0);
                 let apt = Appointment {
-                    apt_datetime: Local::now().date_naive().and_hms_opt(9, 0, 0).unwrap_or_default(),
+                    apt_datetime: Local::now()
+                        .date_naive()
+                        .and_hms_opt(9, 0, 0)
+                        .unwrap_or_default(),
                     apt_length: 30,
                     apt_status: AppointmentStatus::UnschedList,
                     waitlist_status: status,
-                    operatory_num: self.operatories.first().map(|o| o.operatory_num).unwrap_or(0),
+                    operatory_num: self
+                        .operatories
+                        .first()
+                        .map(|o| o.operatory_num)
+                        .unwrap_or(0),
                     provider_num: self.providers.first().map(|p| p.provider_num).unwrap_or(0),
                     clinic_num: 1,
                     pattern: pattern_for_length(30),
@@ -3433,42 +3625,53 @@ impl OdApp {
             return;
         }
 
-        egui::Grid::new("waitlist_grid")
-            .num_columns(6)
-            .striped(true)
-            .spacing([8.0, 4.0])
+        egui::Frame::new()
+            .fill(theme::paper())
+            .stroke(egui::Stroke::new(1.0, theme::line()))
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.strong("Date / time");
-                ui.strong("Patient");
-                ui.strong("Waitlist status");
-                ui.strong("Priority");
-                ui.strong("Notes");
-                ui.strong("Actions");
-                ui.end_row();
+                egui::Grid::new("waitlist_grid")
+                    .num_columns(6)
+                    .striped(true)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        Self::table_header(ui, "Date / time");
+                        Self::table_header(ui, "Patient");
+                        Self::table_header(ui, "Waitlist status");
+                        Self::table_header(ui, "Priority");
+                        Self::table_header(ui, "Notes");
+                        Self::table_header(ui, "Actions");
+                        ui.end_row();
 
-                for apt in &rows {
-                    ui.label(apt.apt_datetime.format("%Y-%m-%d %H:%M").to_string());
-                    ui.label(patient_name(&patients, apt.pat_num));
-                    ui.label(waitlist_status_name(&definitions, apt.waitlist_status));
-                    ui.label(apt.priority.label());
-                    ui.label(&apt.notes);
-                    ui.horizontal(|ui| {
-                        if can_edit && ui.button("Edit").clicked() {
-                            self.open_appointment_editor(apt.clone());
-                        }
-                        if can_edit && ui.button("Schedule").clicked() {
-                            let scheduled = schedule_from_waitlist(apt, apt.apt_datetime, apt.apt_length);
-                            self.open_appointment_editor(scheduled);
-                        }
-                        if can_edit && ui.button("Remove").clicked() {
-                            self.remove_from_waitlist(apt.clone());
-                        }
-                        if has_history && ui.button("History").clicked() {
-                            self.open_appointment_history(apt.apt_num);
+                        for apt in &rows {
+                            ui.label(apt.apt_datetime.format("%Y-%m-%d %H:%M").to_string());
+                            ui.label(patient_name(&patients, apt.pat_num));
+                            ui.label(waitlist_status_name(&definitions, apt.waitlist_status));
+                            ui.label(apt.priority.label());
+                            ui.label(&apt.notes);
+                            ui.horizontal(|ui| {
+                                if can_edit && ui.button("Edit").clicked() {
+                                    self.open_appointment_editor(apt.clone());
+                                }
+                                if can_edit && ui.button("Schedule").clicked() {
+                                    let scheduled = schedule_from_waitlist(
+                                        apt,
+                                        apt.apt_datetime,
+                                        apt.apt_length,
+                                    );
+                                    self.open_appointment_editor(scheduled);
+                                }
+                                if can_edit && ui.button("Remove").clicked() {
+                                    self.remove_from_waitlist(apt.clone());
+                                }
+                                if has_history && ui.button("History").clicked() {
+                                    self.open_appointment_history(apt.apt_num);
+                                }
+                            });
+                            ui.end_row();
                         }
                     });
-                    ui.end_row();
-                }
             });
     }
 
@@ -3490,7 +3693,8 @@ impl OdApp {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| apt.clone());
-            let mut change = AppointmentChange::from_snapshot(&before, AppointmentChangeAction::Deleted);
+            let mut change =
+                AppointmentChange::from_snapshot(&before, AppointmentChangeAction::Deleted);
             change.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
             if let Err(e) = self.store.append_appointment_change(&change) {
                 self.error = Some(e);
@@ -3509,7 +3713,9 @@ impl OdApp {
                         apt.apt_num
                     ),
                 );
-                self.notice = Some("Removed from waitlist. No patient cancellation or reconfirmation sent.".into());
+                self.notice = Some(
+                    "Removed from waitlist. No patient cancellation or reconfirmation sent.".into(),
+                );
                 self.error = None;
                 self.refresh();
             }
@@ -3519,7 +3725,10 @@ impl OdApp {
 
     fn open_appointment_history(&mut self, apt_num: Id) {
         self.apt_history_num = Some(apt_num);
-        self.apt_history = self.store.list_appointment_changes(apt_num).unwrap_or_default();
+        self.apt_history = self
+            .store
+            .list_appointment_changes(apt_num)
+            .unwrap_or_default();
         self.apt_history_open = true;
     }
 
@@ -3527,29 +3736,29 @@ impl OdApp {
 
     fn family_ui(&mut self, ui: &mut Ui) {
         let show_patient_search = self.features.enabled(FeatureKey::PatientSearch);
-        let can_edit_patients = self.features.enabled(FeatureKey::PatientEdit)
-            && self.can(Permission::PATIENT_EDIT);
-        let can_create_patients = self.features.enabled(FeatureKey::PatientEdit)
-            && self.can(Permission::PATIENT_CREATE);
-        let can_delete_patients = self.features.enabled(FeatureKey::PatientDelete)
-            && self.can(Permission::PATIENT_EDIT);
+        let can_edit_patients =
+            self.features.enabled(FeatureKey::PatientEdit) && self.can(Permission::PATIENT_EDIT);
+        let can_create_patients =
+            self.features.enabled(FeatureKey::PatientEdit) && self.can(Permission::PATIENT_CREATE);
+        let can_delete_patients =
+            self.features.enabled(FeatureKey::PatientDelete) && self.can(Permission::PATIENT_EDIT);
         ui.horizontal(|ui| {
             if show_patient_search {
                 ui.label("Search:");
                 ui.add(egui::TextEdit::singleline(&mut self.search).desired_width(220.0));
             }
             if can_create_patients && ui.button("+ New patient").clicked() {
-                let mut patient = Patient::default();
-                patient.gender = Gender::Unknown;
-                patient.clinic_num = 1;
-                self.patient_edit = Some(patient);
-                self.birth_text.clear();
-                self.patient_edit_open = true;
+                self.patient_picker_target = PatientPickerTarget::Global;
+                self.open_new_patient();
             }
         });
         ui.separator();
 
-        let query = if show_patient_search { self.search.as_str() } else { "" };
+        let query = if show_patient_search {
+            self.search.as_str()
+        } else {
+            ""
+        };
         let filtered = self.store.find_patients(query).unwrap_or_default();
         let provider_names = self.providers.clone();
 
@@ -3596,13 +3805,8 @@ impl OdApp {
                 ui.heading(patient.display_name());
                 ui.horizontal(|ui| {
                     if can_edit_patients && ui.button("Edit patient").clicked() {
-                        self.birth_text = patient
-                            .birth_date
-                            .map(|d| d.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default();
-                        self.patient_reason_text.clear();
-                        self.patient_edit = Some(patient.clone());
-                        self.patient_edit_open = true;
+                        self.patient_picker_target = PatientPickerTarget::Global;
+                        self.open_patient_editor(patient.clone());
                     }
                     if self.features.enabled(FeatureKey::PatientCorrectionHistory)
                         && ui.button("Correction history").clicked()
@@ -3638,19 +3842,27 @@ impl OdApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(format!("Chart #{}", patient.pat_num));
                     ui.separator();
-                    ui.label(format!("DOB {}", patient.birth_date.map(|d| d.to_string()).unwrap_or_default()));
+                    ui.label(format!(
+                        "DOB {}",
+                        patient
+                            .birth_date
+                            .map(|d| d.to_string())
+                            .unwrap_or_default()
+                    ));
                     ui.separator();
                     ui.label(format!("Phone {}", patient.home_phone));
                     ui.separator();
                     ui.label(format!("Email {}", patient.email));
                 });
                 ui.label(&patient.address);
-                ui.label(format!("{}, {} {}", patient.city, patient.state, patient.zip));
+                ui.label(format!(
+                    "{}, {} {}",
+                    patient.city, patient.state, patient.zip
+                ));
                 if self.patient_forms_allowed() {
                     if self.patient_form_pdf_patient != patient.pat_num {
                         self.patient_form_pdf_patient = patient.pat_num;
-                        self.patient_form_pdf_path =
-                            default_patient_form_pdf_path(patient.pat_num);
+                        self.patient_form_pdf_path = default_patient_form_pdf_path(patient.pat_num);
                     }
                     ui.horizontal(|ui| {
                         ui.label("Form PDF:");
@@ -3670,7 +3882,10 @@ impl OdApp {
 
     fn open_patient_history(&mut self, pat_num: Id) {
         self.patient_history_pat_num = Some(pat_num);
-        self.patient_corrections = self.store.list_patient_corrections(pat_num).unwrap_or_default();
+        self.patient_corrections = self
+            .store
+            .list_patient_corrections(pat_num)
+            .unwrap_or_default();
         self.patient_history_open = true;
     }
 
@@ -3729,8 +3944,8 @@ impl OdApp {
         let user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
         let can_issue_card = self.features.enabled(FeatureKey::ClinicCardsEnabled)
             && self.can(Permission::PATIENT_EDIT);
-        let can_invoice = self.features.enabled(FeatureKey::A5Invoice)
-            && self.can(Permission::BILLING);
+        let can_invoice =
+            self.features.enabled(FeatureKey::A5Invoice) && self.can(Permission::BILLING);
 
         // Work on local copies so widget drawing never holds a borrow of self.
         let mut tab = self.registry_tab;
@@ -4234,7 +4449,10 @@ impl OdApp {
         rows.sort_by_key(|r| r.date);
 
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.account_show_refunds_transfers_only, "Show refunds/transfers only");
+            ui.checkbox(
+                &mut self.account_show_refunds_transfers_only,
+                "Show refunds/transfers only",
+            );
             ui.label("Filter applies to ledger and helps locate plan credit resolutions/refunds.");
         });
         ui.horizontal(|ui| {
@@ -4244,20 +4462,39 @@ impl OdApp {
                 PaymentTarget::Unallocated => "Any/Unallocated target".into(),
                 PaymentTarget::Procedure(pn) => format!("Procedure #{}", pn),
                 PaymentTarget::PayPlan(pn) => format!("Plan #{}", pn),
-                PaymentTarget::PayPlanCharge { plan_num, charge_num } => format!("Plan #{} charge #{}", plan_num, charge_num),
+                PaymentTarget::PayPlanCharge {
+                    plan_num,
+                    charge_num,
+                } => format!("Plan #{} charge #{}", plan_num, charge_num),
             };
             egui::ComboBox::from_id_salt("acct_transfer_target_filter")
                 .selected_text(target_label)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.account_transfer_target_filter, PaymentTarget::Unallocated, "Any/Unallocated target");
+                    ui.selectable_value(
+                        &mut self.account_transfer_target_filter,
+                        PaymentTarget::Unallocated,
+                        "Any/Unallocated target",
+                    );
                     for p in &procedures {
-                        ui.selectable_value(&mut self.account_transfer_target_filter, PaymentTarget::Procedure(p.proc_num), format!("Procedure #{}", p.proc_num));
+                        ui.selectable_value(
+                            &mut self.account_transfer_target_filter,
+                            PaymentTarget::Procedure(p.proc_num),
+                            format!("Procedure #{}", p.proc_num),
+                        );
                     }
                 });
             ui.label("From");
-            ui.add(egui::TextEdit::singleline(&mut self.account_transfer_from_text).desired_width(80.0).hint_text("YYYY-MM-DD"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.account_transfer_from_text)
+                    .desired_width(80.0)
+                    .hint_text("YYYY-MM-DD"),
+            );
             ui.label("To");
-            ui.add(egui::TextEdit::singleline(&mut self.account_transfer_to_text).desired_width(80.0).hint_text("YYYY-MM-DD"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.account_transfer_to_text)
+                    .desired_width(80.0)
+                    .hint_text("YYYY-MM-DD"),
+            );
             if ui.small_button("Clear transfer filters").clicked() {
                 self.account_show_refunds_transfers_only = false;
                 self.account_transfer_plan_filter = 0;
@@ -4267,8 +4504,12 @@ impl OdApp {
             }
         });
 
-        let from_date = chrono::NaiveDate::parse_from_str(self.account_transfer_from_text.trim(), "%Y-%m-%d").ok();
-        let to_date = chrono::NaiveDate::parse_from_str(self.account_transfer_to_text.trim(), "%Y-%m-%d").ok();
+        let from_date =
+            chrono::NaiveDate::parse_from_str(self.account_transfer_from_text.trim(), "%Y-%m-%d")
+                .ok();
+        let to_date =
+            chrono::NaiveDate::parse_from_str(self.account_transfer_to_text.trim(), "%Y-%m-%d")
+                .ok();
         let filtered_rows = filter_account_ledger_rows(
             &rows,
             self.account_show_refunds_transfers_only,
@@ -4338,9 +4579,15 @@ impl OdApp {
             }
             if ui.button("Open export folder").clicked() {
                 let path = report_export_path(&self.account_ledger_export_path, "csv");
-                let folder = path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let folder = path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 match std::process::Command::new("explorer").arg(&folder).spawn() {
-                    Ok(_) => { self.notice = Some(format!("Opened {}", folder.display())); self.error = None; }
+                    Ok(_) => {
+                        self.notice = Some(format!("Opened {}", folder.display()));
+                        self.error = None;
+                    }
                     Err(e) => self.error = Some(format!("Could not open export folder: {e}")),
                 }
             }
@@ -4528,8 +4775,14 @@ impl OdApp {
                 self.payment_date_text = chrono::Local::now().format("%Y-%m-%d").to_string();
                 self.payment_amount_text = "0.00".to_string();
                 self.payment_rows = vec![
-                    PaymentRow { target: PaymentTarget::PayPlan(plan_num), amount_text: format!("{:.2}", -amt) },
-                    PaymentRow { target: PaymentTarget::Unallocated, amount_text: format!("{:.2}", amt) },
+                    PaymentRow {
+                        target: PaymentTarget::PayPlan(plan_num),
+                        amount_text: format!("{:.2}", -amt),
+                    },
+                    PaymentRow {
+                        target: PaymentTarget::Unallocated,
+                        amount_text: format!("{:.2}", amt),
+                    },
                 ];
                 self.payment_edit_open = true;
             } else {
@@ -4607,9 +4860,7 @@ impl OdApp {
                         });
                         self.plan_amount_text.clear();
                         self.plan_count_text = "6".into();
-                        self.plan_start_text = chrono::Local::now()
-                            .format("%Y-%m-%d")
-                            .to_string();
+                        self.plan_start_text = chrono::Local::now().format("%Y-%m-%d").to_string();
                         self.plan_apr_text = "0".into();
                         self.plan_down_payment_text = "0".into();
                         self.plan_interest_start_text.clear();
@@ -4668,7 +4919,10 @@ impl OdApp {
                     default_account_audit_export_path(num),
                 );
                 self.account_audit_export_path = path.clone();
-                self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num), &path);
+                self.remember_export_path(
+                    &patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num),
+                    &path,
+                );
             }
             let audit_includes_log = self.features.enabled(FeatureKey::ShowAuditLog)
                 && self.can(Permission::AUDIT_TRAIL);
@@ -4762,7 +5016,9 @@ impl OdApp {
                             audit_file_saved = Some(path_text.clone());
                             audit_saved = Some(path_text);
                         }
-                        Err(err) => self.error = Some(format!("Could not write account audit CSV: {err}")),
+                        Err(err) => {
+                            self.error = Some(format!("Could not write account audit CSV: {err}"))
+                        }
                     }
                 }
                 if ui.button("Save HTML").clicked() {
@@ -4776,7 +5032,9 @@ impl OdApp {
                             audit_file_saved = Some(path_text.clone());
                             audit_saved = Some(path_text);
                         }
-                        Err(err) => self.error = Some(format!("Could not write account audit HTML: {err}")),
+                        Err(err) => {
+                            self.error = Some(format!("Could not write account audit HTML: {err}"))
+                        }
                     }
                 }
                 if ui.button("Copy CSV").clicked() {
@@ -4787,19 +5045,26 @@ impl OdApp {
                 }
                 if ui.button("Open export folder").clicked() {
                     let path = report_export_path(&self.account_audit_export_path, "csv");
-                    let folder = path.parent().map(|p| p.to_path_buf())
+                    let folder = path
+                        .parent()
+                        .map(|p| p.to_path_buf())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                     match std::process::Command::new("explorer").arg(&folder).spawn() {
                         Ok(_) => {
                             self.notice = Some(format!("Opened {}", folder.display()));
                             self.error = None;
                         }
-                        Err(err) => self.error = Some(format!("Could not open export folder: {err}")),
+                        Err(err) => {
+                            self.error = Some(format!("Could not open export folder: {err}"))
+                        }
                     }
                 }
             });
             if let Some(path) = audit_path_changed.or(audit_file_saved) {
-                self.remember_export_path(&patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num), &path);
+                self.remember_export_path(
+                    &patient_export_key(EXPORT_KEY_ACCOUNT_AUDIT, num),
+                    &path,
+                );
             }
             if let Some(destination) = audit_saved {
                 self.audit(
@@ -4824,8 +5089,20 @@ impl OdApp {
             for plan in &plans {
                 if plan.is_dynamic {
                     dyn_count += 1;
-                    let own_links: Vec<PayPlanLink> = plan_links.iter().filter(|l| l.pay_plan_num == plan.pay_plan_num).cloned().collect();
-                    let r = od_core::reconciliation(plan, &own_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
+                    let own_links: Vec<PayPlanLink> = plan_links
+                        .iter()
+                        .filter(|l| l.pay_plan_num == plan.pay_plan_num)
+                        .cloned()
+                        .collect();
+                    let r = od_core::reconciliation(
+                        plan,
+                        &own_links,
+                        &procedures,
+                        &adjustments,
+                        &splits,
+                        &plan_charges,
+                        as_of,
+                    );
                     dyn_issued_count += r.issued_count;
                     dyn_expected_due_count += r.expected_due_count;
                     dyn_issued_total += r.issued_total;
@@ -4837,20 +5114,41 @@ impl OdApp {
                 }
             }
             if dyn_count > 0 {
-                let stale_suffix = if dyn_stale_count > 0 { format!(" · stale {dyn_stale_count} {dyn_stale_total:.2}") } else { String::new() };
+                let stale_suffix = if dyn_stale_count > 0 {
+                    format!(" · stale {dyn_stale_count} {dyn_stale_total:.2}")
+                } else {
+                    String::new()
+                };
                 ui.label(format!(
                     "Dynamic portfolio (as of {as_of}): {dyn_count} plan(s) · issued {dyn_issued_count}/{dyn_expected_due_count} due {dyn_issued_total:.2}/{dyn_expected_due_total:.2} · missing due {dyn_missing_due_count} {dyn_missing_due_total:.2}{stale_suffix}"
                 ));
                 if dyn_missing_due_count > 0 || dyn_stale_count > 0 {
                     ui.horizontal(|ui| {
                         if dyn_missing_due_count > 0 {
-                            ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Missing due charges detected.");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(180, 90, 0),
+                                "Missing due charges detected.",
+                            );
                         }
                         if dyn_stale_count > 0 {
-                            ui.colored_label(egui::Color32::from_rgb(180, 90, 0), "Stale/over-issued charges detected.");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(180, 90, 0),
+                                "Stale/over-issued charges detected.",
+                            );
                         }
-                        if dyn_missing_due_count > 0 && self.can(Permission::BILLING) && ui.button("Reconcile/issue all due").clicked() {
-                            self.reconcile_dynamic_plans_due_portfolio(&plans, &plan_links, &procedures, &adjustments, &splits, &plan_charges, as_of);
+                        if dyn_missing_due_count > 0
+                            && self.can(Permission::BILLING)
+                            && ui.button("Reconcile/issue all due").clicked()
+                        {
+                            self.reconcile_dynamic_plans_due_portfolio(
+                                &plans,
+                                &plan_links,
+                                &procedures,
+                                &adjustments,
+                                &splits,
+                                &plan_charges,
+                                as_of,
+                            );
                         }
                     });
                 }
@@ -4862,7 +5160,8 @@ impl OdApp {
                     .filter(|l| l.pay_plan_num == plan.pay_plan_num)
                     .cloned()
                     .collect();
-                let breakdown = od_core::pay_plan_balance_breakdown(plan, &plan_charges, &splits, as_of);
+                let breakdown =
+                    od_core::pay_plan_balance_breakdown(plan, &plan_charges, &splits, as_of);
                 let balance = od_core::pay_plan_balance(plan, &plan_charges, &splits, as_of);
                 let due_now = breakdown.due_now - breakdown.unapplied_credit;
                 let kind = if plan.is_dynamic { "dynamic" } else { "static" };
@@ -5428,7 +5727,10 @@ impl OdApp {
                             claim.claim_identifier.clone()
                         },
                         claim.claim_status.label(),
-                        claim.date_sent.map(|d| d.to_string()).unwrap_or_else(|| "not sent".into())
+                        claim
+                            .date_sent
+                            .map(|d| d.to_string())
+                            .unwrap_or_else(|| "not sent".into())
                     ),
                     |ui| {
                         ui.label(format!("Fee billed: {:.2}", claim.total_fee));
@@ -5648,7 +5950,11 @@ impl OdApp {
                         && plan.status == TreatPlanStatus::Active
                         && ui.button("Make inactive").clicked()
                     {
-                        self.change_plan_status(num, plan.treat_plan_num, TreatPlanStatus::Inactive);
+                        self.change_plan_status(
+                            num,
+                            plan.treat_plan_num,
+                            TreatPlanStatus::Inactive,
+                        );
                     }
                     if can_edit
                         && plan.status != TreatPlanStatus::Saved
@@ -5702,10 +6008,9 @@ impl OdApp {
                                         );
                                     }
                                     if can_edit && ui.button("Remove").clicked() {
-                                        if let Err(err) = self.store.delete_treat_plan_line(
-                                            plan,
-                                            line.line_num,
-                                        ) {
+                                        if let Err(err) =
+                                            self.store.delete_treat_plan_line(plan, line.line_num)
+                                        {
                                             self.error = Some(err);
                                         } else {
                                             self.audit_if(
@@ -5785,10 +6090,7 @@ impl OdApp {
             FeatureKey::AuditTreatmentPlans,
             Permission::TREAT_PLAN_EDIT,
             pat_num,
-            format!(
-                "Treatment plan {plan_num} set to {}",
-                status.label()
-            ),
+            format!("Treatment plan {plan_num} set to {}", status.label()),
         );
         self.notice = Some(format!("Treatment plan is now {}", status.label()));
     }
@@ -5811,7 +6113,10 @@ impl OdApp {
                     FeatureKey::AuditTreatmentPlans,
                     Permission::TREAT_PLAN_EDIT,
                     plan.pat_num,
-                    format!("Saved snapshot {saved_num} created from plan {}", plan.treat_plan_num),
+                    format!(
+                        "Saved snapshot {saved_num} created from plan {}",
+                        plan.treat_plan_num
+                    ),
                 );
                 if let Some(err) = failed {
                     self.error = Some(err);
@@ -5981,8 +6286,8 @@ impl OdApp {
                 });
             });
         if save {
-            proc.proc_date =
-                NaiveDate::parse_from_str(&self.proc_date_text, "%Y-%m-%d").unwrap_or(proc.proc_date);
+            proc.proc_date = NaiveDate::parse_from_str(&self.proc_date_text, "%Y-%m-%d")
+                .unwrap_or(proc.proc_date);
             proc.code_num = self.proc_code_num;
             proc.fee = self.proc_fee_text.parse().unwrap_or(0.0);
             proc.unit_qty = self.proc_units_text.parse().unwrap_or(1.0);
@@ -6066,7 +6371,9 @@ impl OdApp {
                 .min_by_key(|s| s.discount_sub_num)
                 .cloned();
             match subscription {
-                None => self.notice = Some("No active discount subscription for this patient.".into()),
+                None => {
+                    self.notice = Some("No active discount subscription for this patient.".into())
+                }
                 Some(sub) => {
                     let plan = self
                         .discount_plans
@@ -6074,7 +6381,10 @@ impl OdApp {
                         .find(|p| p.discount_plan_num == sub.discount_plan_num)
                         .cloned();
                     match plan {
-                        None => self.notice = Some("The patient's discount plan no longer exists.".into()),
+                        None => {
+                            self.notice =
+                                Some("The patient's discount plan no longer exists.".into())
+                        }
                         Some(plan) => {
                             let (bucket_start, bucket_end) = annual_bucket(
                                 proc.proc_date,
@@ -6082,7 +6392,8 @@ impl OdApp {
                                 sub.date_term,
                                 today,
                             );
-                            let history = self.store.list_procedures(proc.pat_num).unwrap_or_default();
+                            let history =
+                                self.store.list_procedures(proc.pat_num).unwrap_or_default();
                             let running_total: f64 = self
                                 .store
                                 .list_adjustments(proc.pat_num)
@@ -6222,8 +6533,7 @@ impl OdApp {
     }
 
     fn patient_forms_allowed(&self) -> bool {
-        self.features.enabled(FeatureKey::PatientFormsEnabled)
-            && self.can(Permission::PATIENT_EDIT)
+        self.features.enabled(FeatureKey::PatientFormsEnabled) && self.can(Permission::PATIENT_EDIT)
     }
 
     fn open_patient_form(&mut self, pat_num: Id) {
@@ -6325,19 +6635,15 @@ impl OdApp {
             return;
         }
         let today = Local::now().date_naive();
-        let (payment, allocations) = match build_patient_credit_application(
-            pat_num,
-            procedures,
-            adjustments,
-            splits,
-            today,
-        ) {
-            Ok(built) => built,
-            Err(err) => {
-                self.error = Some(err);
-                return;
-            }
-        };
+        let (payment, allocations) =
+            match build_patient_credit_application(pat_num, procedures, adjustments, splits, today)
+            {
+                Ok(built) => built,
+                Err(err) => {
+                    self.error = Some(err);
+                    return;
+                }
+            };
         let applied: f64 = allocations
             .iter()
             .filter(|a| a.amount > 0.0)
@@ -6472,17 +6778,15 @@ impl OdApp {
         }
 
         let practice = self.report_prefs.practice_name.clone();
-        let mut manifest = ReportTable::new(&[
-            "Patient #",
-            "Patient",
-            "Balance",
-            "Statement #",
-            "PDF",
-        ]);
+        let mut manifest =
+            ReportTable::new(&["Patient #", "Patient", "Balance", "Statement #", "PDF"]);
         let mut statements = 0usize;
         let mut total: f64 = 0.0;
         for row in rows {
-            let note = format!("Statement generated {} ({title})", Local::now().date_naive());
+            let note = format!(
+                "Statement generated {} ({title})",
+                Local::now().date_naive()
+            );
             let (doc, patient_name) = self.statement_document_for(row.pat_num, as_of, &note);
             let statement = Statement {
                 pat_num: row.pat_num,
@@ -6718,7 +7022,9 @@ impl OdApp {
         }
         if !current.uses_date_range() {
             if current == ReportKind::PeriodCloseHistory {
-                ui.label("Every audited close and reopen is listed, regardless of the date range above.");
+                ui.label(
+                    "Every audited close and reopen is listed, regardless of the date range above.",
+                );
                 self.period_close_history_filters(ui);
             } else {
                 ui.label("Balance and summary reports use the range end date as 'as of'; the start date is ignored.");
@@ -6750,7 +7056,9 @@ impl OdApp {
                     ui.weak("Journal posting is off in Settings, or the Adjustment Create permission is missing.");
                 }
             });
-            let locked = self.closed_periods.in_range(self.report_from, self.report_to);
+            let locked = self
+                .closed_periods
+                .in_range(self.report_from, self.report_to);
             if !locked.is_empty() {
                 let labels = locked
                     .iter()
@@ -6829,11 +7137,8 @@ impl OdApp {
                 false,
             );
             // Finance-charge types may be hidden, so its picker shows all defs.
-            let all_adj_type_choices = sorted_definitions(
-                &self.definitions,
-                Some(DefinitionCategory::ADJ_TYPES),
-                true,
-            );
+            let all_adj_type_choices =
+                sorted_definitions(&self.definitions, Some(DefinitionCategory::ADJ_TYPES), true);
             ui.collapsing("Report options (as in Open Dental)", |ui| {
                 match current {
                     ReportKind::Aging => {
@@ -8289,7 +8594,8 @@ impl OdApp {
         ui.horizontal(|ui| {
             ui.label("Practice on exports");
             let response = ui.add(
-                egui::TextEdit::singleline(&mut self.report_prefs.practice_name).desired_width(260.0),
+                egui::TextEdit::singleline(&mut self.report_prefs.practice_name)
+                    .desired_width(260.0),
             );
             if response.changed() {
                 if let Err(err) = self.save_report_prefs() {
@@ -8391,7 +8697,10 @@ impl OdApp {
                 upstream_table = Some(table);
             }
             ReportKind::Schedule => {
-                let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
+                let appts = self
+                    .store
+                    .list_appointments(from_dt, to_dt)
+                    .unwrap_or_default();
                 for apt in &appts {
                     rows.push(ReportRow::new(
                         patient_name(&patients, apt.pat_num),
@@ -8419,7 +8728,10 @@ impl OdApp {
                 }
                 // The schedule cache holds only `schedule_day`, so read the
                 // report window itself for ASAP appointments.
-                let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
+                let appts = self
+                    .store
+                    .list_appointments(from_dt, to_dt)
+                    .unwrap_or_default();
                 let mut asap = asap_report(&appts, &patients, from_dt, to_dt);
                 for row in &mut asap {
                     row.detail = format!("ASAP · {}", row.detail);
@@ -8447,15 +8759,31 @@ impl OdApp {
                     }
                 }
                 for patient in &patients {
-                    plans.extend(self.store.list_pay_plans(patient.pat_num).unwrap_or_default());
+                    plans.extend(
+                        self.store
+                            .list_pay_plans(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                     charges.extend(
                         self.store
                             .list_pay_plan_charges(patient.pat_num)
                             .unwrap_or_default(),
                     );
-                    procedures.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
-                    adjustments.extend(self.store.list_adjustments(patient.pat_num).unwrap_or_default());
-                    for split in self.store.list_pay_splits(patient.pat_num).unwrap_or_default() {
+                    procedures.extend(
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
+                    adjustments.extend(
+                        self.store
+                            .list_adjustments(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
+                    for split in self
+                        .store
+                        .list_pay_splits(patient.pat_num)
+                        .unwrap_or_default()
+                    {
                         if seen_splits.insert(split.split_num) {
                             splits.push(split);
                         }
@@ -8476,7 +8804,11 @@ impl OdApp {
                 let mut plans = Vec::new();
                 let mut lines = Vec::new();
                 for patient in &patients {
-                    for plan in self.store.list_treat_plans(patient.pat_num).unwrap_or_default() {
+                    for plan in self
+                        .store
+                        .list_treat_plans(patient.pat_num)
+                        .unwrap_or_default()
+                    {
                         lines.extend(
                             self.store
                                 .list_treat_plan_lines(plan.treat_plan_num)
@@ -8495,13 +8827,19 @@ impl OdApp {
                 let mut claim_procs = Vec::new();
                 for patient in &patients {
                     procedures.extend(
-                        self.store.list_procedures(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     adjustments.extend(
-                        self.store.list_adjustments(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_adjustments(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     splits.extend(
-                        self.store.list_pay_splits(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_pay_splits(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     if insurance {
                         claim_procs.extend(
@@ -8536,13 +8874,19 @@ impl OdApp {
                 };
                 for patient in &patients {
                     procedures.extend(
-                        self.store.list_procedures(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     adjustments.extend(
-                        self.store.list_adjustments(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_adjustments(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     splits.extend(
-                        self.store.list_pay_splits(patient.pat_num).unwrap_or_default(),
+                        self.store
+                            .list_pay_splits(patient.pat_num)
+                            .unwrap_or_default(),
                     );
                     plan_charges.extend(
                         self.store
@@ -8581,7 +8925,11 @@ impl OdApp {
                 let mut all_adjustments = Vec::new();
                 let plan_links = self.store.list_pay_plan_links().unwrap_or_default();
                 for patient in &patients {
-                    plans.extend(self.store.list_pay_plans(patient.pat_num).unwrap_or_default());
+                    plans.extend(
+                        self.store
+                            .list_pay_plans(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                     charges.extend(
                         self.store
                             .list_pay_plan_charges(patient.pat_num)
@@ -8647,7 +8995,11 @@ impl OdApp {
                 let mut payments = Vec::new();
                 let mut seen_payments = HashSet::new();
                 for patient in &patients {
-                    plans.extend(self.store.list_pay_plans(patient.pat_num).unwrap_or_default());
+                    plans.extend(
+                        self.store
+                            .list_pay_plans(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                     charges.extend(
                         self.store
                             .list_pay_plan_charges(patient.pat_num)
@@ -8662,7 +9014,11 @@ impl OdApp {
                             splits.push(split);
                         }
                     }
-                    for payment in self.store.list_payments(patient.pat_num).unwrap_or_default() {
+                    for payment in self
+                        .store
+                        .list_payments(patient.pat_num)
+                        .unwrap_or_default()
+                    {
                         if seen_payments.insert(payment.pay_num) {
                             payments.push(payment);
                         }
@@ -8895,7 +9251,11 @@ impl OdApp {
                             adjustments.push(adjustment);
                         }
                     }
-                    procedures.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+                    procedures.extend(
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                 }
                 let procedure_codes = self.store.list_procedure_codes().unwrap_or_default();
                 upstream_table = Some(broken_appointments_report(
@@ -9005,15 +9365,16 @@ impl OdApp {
             }
             ReportKind::Referrals => {
                 let referrals = self.store.list_referrals().unwrap_or_default();
-                upstream_table = Some(referrals_report(
-                    &referrals,
-                    &self.report_prefs.referrals,
-                ));
+                upstream_table = Some(referrals_report(&referrals, &self.report_prefs.referrals));
             }
             ReportKind::Patients => {
                 let mut all_procs = Vec::new();
                 for patient in &patients {
-                    all_procs.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
+                    all_procs.extend(
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                 }
                 upstream_table = Some(patients_report(
                     &patients,
@@ -9058,9 +9419,21 @@ impl OdApp {
                 let mut all_payments = Vec::new();
                 let mut all_adjustments = Vec::new();
                 for patient in &patients {
-                    all_procs.extend(self.store.list_procedures(patient.pat_num).unwrap_or_default());
-                    all_payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
-                    all_adjustments.extend(self.store.list_adjustments(patient.pat_num).unwrap_or_default());
+                    all_procs.extend(
+                        self.store
+                            .list_procedures(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
+                    all_payments.extend(
+                        self.store
+                            .list_payments(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
+                    all_adjustments.extend(
+                        self.store
+                            .list_adjustments(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                 }
                 let journal = self.store.list_journal_entries().unwrap_or_default();
                 upstream_table = Some(journal_posting_audit_report(
@@ -9080,7 +9453,11 @@ impl OdApp {
                 let splits = gather_splits(&*self.store, &patients);
                 let mut payments = Vec::new();
                 for patient in &patients {
-                    payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+                    payments.extend(
+                        self.store
+                            .list_payments(patient.pat_num)
+                            .unwrap_or_default(),
+                    );
                 }
                 upstream_table = Some(ledger_tie_out_report(
                     &procedures,
@@ -9290,7 +9667,10 @@ impl OdApp {
                 let procedures = gather_procedures(&*self.store, &patients);
                 // Broken-appointment counts come from the report window, not
                 // from the single-day schedule cache.
-                let appts = self.store.list_appointments(from_dt, to_dt).unwrap_or_default();
+                let appts = self
+                    .store
+                    .list_appointments(from_dt, to_dt)
+                    .unwrap_or_default();
                 let rows = gather_public_health_population(
                     &*self.store,
                     &patients,
@@ -9318,7 +9698,10 @@ impl OdApp {
                 let appt_to = (self.report_from + Duration::days(1))
                     .and_hms_opt(0, 0, 0)
                     .unwrap_or_default();
-                let appts = self.store.list_appointments(appt_from, appt_to).unwrap_or_default();
+                let appts = self
+                    .store
+                    .list_appointments(appt_from, appt_to)
+                    .unwrap_or_default();
                 upstream_table = Some(routing_slips_report(
                     &patients,
                     &providers,
@@ -9496,7 +9879,9 @@ impl OdApp {
                     let totals = bucket_totals[bucket.index()];
                     let label = format!(
                         "{} ({} · {:.2})",
-                        bucket.label(), totals.patients, totals.balance
+                        bucket.label(),
+                        totals.patients,
+                        totals.balance
                     );
                     if ui
                         .selectable_label(self.collections_bucket_filter == Some(bucket), label)
@@ -9635,9 +10020,8 @@ impl OdApp {
         ui.separator();
         ui.horizontal(|ui| {
             ui.label("Export");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.report_export_path).desired_width(360.0),
-            );
+            let response = ui
+                .add(egui::TextEdit::singleline(&mut self.report_export_path).desired_width(360.0));
             if response.changed() {
                 let user_key = self.period_close_history_user_key();
                 self.report_prefs.set_user_export_path(
@@ -9717,8 +10101,10 @@ impl OdApp {
                             self.error = None;
                             audit_export = Some(path_text);
                         }
-                        Err(err) => self.error =
-                            Some(format!("Could not export stale-resolved plans CSV: {err}")),
+                        Err(err) => {
+                            self.error =
+                                Some(format!("Could not export stale-resolved plans CSV: {err}"))
+                        }
                     }
                 }
                 if ui.button("Export filtered plans (HTML)").clicked() {
@@ -9733,8 +10119,10 @@ impl OdApp {
                             self.error = None;
                             audit_export = Some(path_text);
                         }
-                        Err(err) => self.error =
-                            Some(format!("Could not export stale-resolved plans HTML: {err}")),
+                        Err(err) => {
+                            self.error =
+                                Some(format!("Could not export stale-resolved plans HTML: {err}"))
+                        }
                     }
                 }
             });
@@ -9881,8 +10269,7 @@ impl OdApp {
                                 ui.label("");
                             }
                             if can_edit {
-                                if sub.is_open_ended() || sub.date_term.is_some_and(|d| d > today)
-                                {
+                                if sub.is_open_ended() || sub.date_term.is_some_and(|d| d > today) {
                                     if ui.button("End").clicked() {
                                         end_sub = Some((sub.discount_sub_num, sub.pat_num));
                                     }
@@ -9990,9 +10377,7 @@ impl OdApp {
             });
         }
 
-        if self.features.enabled(FeatureKey::ShowUsers)
-            && self.can(Permission::SECURITY_ADMIN)
-        {
+        if self.features.enabled(FeatureKey::ShowUsers) && self.can(Permission::SECURITY_ADMIN) {
             let users = self.store.list_users().unwrap_or_default();
             ui.collapsing(format!("Users ({})", users.len()), |ui| {
                 egui::Grid::new("user_grid")
@@ -10046,10 +10431,7 @@ impl OdApp {
                         ui.strong("Grants");
                         ui.end_row();
                         for permission in Permission::ALL {
-                            let count = grants
-                                .iter()
-                                .filter(|g| g.perm_type == permission)
-                                .count();
+                            let count = grants.iter().filter(|g| g.perm_type == permission).count();
                             ui.label(permission.as_od().to_string());
                             ui.label(permission.label());
                             ui.label(count.to_string());
@@ -10059,9 +10441,7 @@ impl OdApp {
             });
         }
 
-        if self.features.enabled(FeatureKey::ShowAuditLog)
-            && self.can(Permission::AUDIT_TRAIL)
-        {
+        if self.features.enabled(FeatureKey::ShowAuditLog) && self.can(Permission::AUDIT_TRAIL) {
             let mut refresh_log = false;
             let mut export_audit: Option<(Id, String)> = None;
             let mut log_path_changed: Option<String> = None;
@@ -10245,7 +10625,10 @@ impl OdApp {
 
         for category in categories {
             ui.collapsing(category, |ui| {
-                for key in FeatureKey::ALL.into_iter().filter(|k| k.category() == category) {
+                for key in FeatureKey::ALL
+                    .into_iter()
+                    .filter(|k| k.category() == category)
+                {
                     let mut value = features.enabled(key);
                     let response = ui
                         .checkbox(&mut value, key.label())
@@ -10300,8 +10683,7 @@ impl OdApp {
                         }
                     }
                 });
-            if self.features.module_enabled(Module::Family)
-                && ui.button("Family module").clicked()
+            if self.features.module_enabled(Module::Family) && ui.button("Family module").clicked()
             {
                 self.module = Module::Family;
                 self.show_settings = false;
@@ -10322,7 +10704,9 @@ impl OdApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Date  ");
-                    ui.add(egui::TextEdit::singleline(&mut self.adj_date_text).hint_text("YYYY-MM-DD"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.adj_date_text).hint_text("YYYY-MM-DD"),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Amount");
@@ -10340,7 +10724,8 @@ impl OdApp {
                 });
             });
         if save {
-            adj.adj_date = NaiveDate::parse_from_str(&self.adj_date_text, "%Y-%m-%d").unwrap_or(adj.adj_date);
+            adj.adj_date =
+                NaiveDate::parse_from_str(&self.adj_date_text, "%Y-%m-%d").unwrap_or(adj.adj_date);
             adj.adj_amount = self.adj_amount_text.parse().unwrap_or(0.0);
             adj.note = self.adj_note_text.clone();
             let pat_num = adj.pat_num;
@@ -10520,10 +10905,7 @@ impl OdApp {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    save = ui
-                        .button("Post to ledger")
-                        .clicked()
-                        && preview_error.is_none();
+                    save = ui.button("Post to ledger").clicked() && preview_error.is_none();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -10618,7 +11000,11 @@ impl OdApp {
         let procedures = gather_procedures(&*self.store, &self.patients);
         let mut payments = Vec::new();
         for patient in &self.patients {
-            payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+            payments.extend(
+                self.store
+                    .list_payments(patient.pat_num)
+                    .unwrap_or_default(),
+            );
         }
         let adjustments = gather_adjustments(&*self.store, &self.patients);
         let plan = build_posting_batch_plan_with_closed(
@@ -10772,7 +11158,11 @@ impl OdApp {
         let procedures = gather_procedures(&*self.store, &self.patients);
         let mut payments = Vec::new();
         for patient in &self.patients {
-            payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+            payments.extend(
+                self.store
+                    .list_payments(patient.pat_num)
+                    .unwrap_or_default(),
+            );
         }
         let adjustments = gather_adjustments(&*self.store, &self.patients);
         let plan = build_posting_batch_plan_with_closed(
@@ -10786,7 +11176,10 @@ impl OdApp {
             range_to,
         );
         if plan.is_empty() {
-            self.notice = Some("No unposted sources remain (closed periods stay locked); nothing was written.".into());
+            self.notice = Some(
+                "No unposted sources remain (closed periods stay locked); nothing was written."
+                    .into(),
+            );
             self.post_all_open = false;
             return;
         }
@@ -10858,7 +11251,11 @@ impl OdApp {
         let splits = gather_splits(&*self.store, &self.patients);
         let mut payments = Vec::new();
         for patient in &self.patients {
-            payments.extend(self.store.list_payments(patient.pat_num).unwrap_or_default());
+            payments.extend(
+                self.store
+                    .list_payments(patient.pat_num)
+                    .unwrap_or_default(),
+            );
         }
         tie_out_ready(&ledger_tie_out_report(
             &procedures,
@@ -11052,18 +11449,21 @@ impl OdApp {
             return;
         }
         if !allowed {
-            self.error = Some("Journal posting is off, or the Adjustment Create permission is missing.".into());
+            self.error = Some(
+                "Journal posting is off, or the Adjustment Create permission is missing.".into(),
+            );
             return;
         }
         let reason = self.period_action_reason.trim().to_string();
         let mut updated = self.closed_periods.clone();
         let outcome = match action {
             PeriodAction::Close => match gate {
-                Ok(()) => match updated.close(date, &reason, Local::now().naive_local().to_string())
-                {
-                    Ok(period) => Ok(close_audit_text(&period.key(), &reason)),
-                    Err(err) => Err(err),
-                },
+                Ok(()) => {
+                    match updated.close(date, &reason, Local::now().naive_local().to_string()) {
+                        Ok(period) => Ok(close_audit_text(&period.key(), &reason)),
+                        Err(err) => Err(err),
+                    }
+                }
                 Err(err) => Err(err),
             },
             PeriodAction::Reopen => match updated.reopen(date) {
@@ -11073,7 +11473,10 @@ impl OdApp {
         };
         match outcome {
             Ok(log) => {
-                if let Err(err) = self.store.upsert_pref(CLOSED_PERIODS_PREF, &updated.to_json()) {
+                if let Err(err) = self
+                    .store
+                    .upsert_pref(CLOSED_PERIODS_PREF, &updated.to_json())
+                {
                     self.error = Some(format!("Could not save the period close: {err}"));
                     return;
                 }
@@ -11510,7 +11913,11 @@ impl OdApp {
                 }
             } else {
                 plan.completed_amt = amount;
-                plan.pay_amt = if count > 0 { amount / count as f64 } else { 0.0 };
+                plan.pay_amt = if count > 0 {
+                    amount / count as f64
+                } else {
+                    0.0
+                };
             }
             plan.date_pay_plan_start =
                 NaiveDate::parse_from_str(&self.plan_start_text, "%Y-%m-%d").ok();
@@ -11527,10 +11934,15 @@ impl OdApp {
             let pat_num = plan.pat_num;
             let was_new = plan.pay_plan_num == 0;
             if plan.is_closed && plan.pay_plan_num != 0 {
-                let plan_charges = self.store.list_pay_plan_charges(pat_num).unwrap_or_default();
+                let plan_charges = self
+                    .store
+                    .list_pay_plan_charges(pat_num)
+                    .unwrap_or_default();
                 let splits = self.store.list_pay_splits(pat_num).unwrap_or_default();
                 let today = chrono::Local::now().date_naive();
-                if let Some(reason) = od_core::pay_plan_close_block_reason(&plan, &plan_charges, &splits, today) {
+                if let Some(reason) =
+                    od_core::pay_plan_close_block_reason(&plan, &plan_charges, &splits, today)
+                {
                     self.error = Some(reason);
                     return;
                 }
@@ -11549,14 +11961,17 @@ impl OdApp {
                             ),
                         );
                         self.notice = Some(if was_new {
-                            "Dynamic payment plan created. Link production, then issue charges due.".into()
+                            "Dynamic payment plan created. Link production, then issue charges due."
+                                .into()
                         } else {
                             "Payment plan updated".into()
                         });
                         self.error = None;
                     } else if was_new {
-                        let generated =
-                            od_core::generate_plan_charges(&plan, chrono::Local::now().date_naive());
+                        let generated = od_core::generate_plan_charges(
+                            &plan,
+                            chrono::Local::now().date_naive(),
+                        );
                         let generated_count = generated.len();
                         let mut charge_error = None;
                         for charge in generated {
@@ -11611,7 +12026,10 @@ impl OdApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Due   ");
-                    ui.add(egui::TextEdit::singleline(&mut self.plan_charge_date_text).hint_text("YYYY-MM-DD"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.plan_charge_date_text)
+                            .hint_text("YYYY-MM-DD"),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Amount");
@@ -11625,9 +12043,8 @@ impl OdApp {
                 });
             });
         if save {
-            charge.charge_date =
-                NaiveDate::parse_from_str(&self.plan_charge_date_text, "%Y-%m-%d")
-                    .unwrap_or(charge.charge_date);
+            charge.charge_date = NaiveDate::parse_from_str(&self.plan_charge_date_text, "%Y-%m-%d")
+                .unwrap_or(charge.charge_date);
             charge.principal = self.plan_charge_amount_text.parse().unwrap_or(0.0);
             let pat_num = charge.pat_num;
             match self.store.upsert_pay_plan_charge(&charge) {
@@ -11682,37 +12099,37 @@ impl OdApp {
                 ui.text_edit_singleline(&mut plan.description);
             });
             egui::ComboBox::from_label("Fee schedule")
-                    .selected_text(
-                        fee_schedules
-                            .iter()
-                            .find(|f| f.fee_sched_num == plan.fee_sched_num)
-                            .map(|f| f.description.as_str())
-                            .unwrap_or("—"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut plan.fee_sched_num, 0, "—");
-                        for fee in &fee_schedules {
-                            ui.selectable_value(
-                                &mut plan.fee_sched_num,
-                                fee.fee_sched_num,
-                                &fee.description,
-                            );
-                        }
-                    });
+                .selected_text(
+                    fee_schedules
+                        .iter()
+                        .find(|f| f.fee_sched_num == plan.fee_sched_num)
+                        .map(|f| f.description.as_str())
+                        .unwrap_or("—"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut plan.fee_sched_num, 0, "—");
+                    for fee in &fee_schedules {
+                        ui.selectable_value(
+                            &mut plan.fee_sched_num,
+                            fee.fee_sched_num,
+                            &fee.description,
+                        );
+                    }
+                });
             egui::ComboBox::from_label("Adjustment type")
-                    .selected_text(
-                        adj_types
-                            .iter()
-                            .find(|d| d.def_num == plan.def_num)
-                            .map(|d| d.item_name.as_str())
-                            .unwrap_or("—"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut plan.def_num, 0, "—");
-                        for def in &adj_types {
-                            ui.selectable_value(&mut plan.def_num, def.def_num, &def.item_name);
-                        }
-                    });
+                .selected_text(
+                    adj_types
+                        .iter()
+                        .find(|d| d.def_num == plan.def_num)
+                        .map(|d| d.item_name.as_str())
+                        .unwrap_or("—"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut plan.def_num, 0, "—");
+                    for def in &adj_types {
+                        ui.selectable_value(&mut plan.def_num, def.def_num, &def.item_name);
+                    }
+                });
             ui.horizontal(|ui| {
                 ui.label("Annual max");
                 ui.add(egui::DragValue::new(&mut plan.annual_max).speed(1.0));
@@ -11789,44 +12206,44 @@ impl OdApp {
         .default_width(440.0)
         .show(ctx, |ui| {
             egui::ComboBox::from_label("Patient")
-                    .selected_text(
-                        patients
-                            .iter()
-                            .find(|p| p.pat_num == self.discount_sub_pat_num)
-                            .map(|p| format!("{}, {}", p.l_name, p.f_name))
-                            .unwrap_or_else(|| "Select a patient".into()),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.discount_sub_pat_num, 0, "—");
-                        for patient in &patients {
-                            ui.selectable_value(
-                                &mut self.discount_sub_pat_num,
-                                patient.pat_num,
-                                format!(
-                                    "{}, {} (#{})",
-                                    patient.l_name, patient.f_name, patient.pat_num
-                                ),
-                            );
-                        }
-                    });
+                .selected_text(
+                    patients
+                        .iter()
+                        .find(|p| p.pat_num == self.discount_sub_pat_num)
+                        .map(|p| format!("{}, {}", p.l_name, p.f_name))
+                        .unwrap_or_else(|| "Select a patient".into()),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.discount_sub_pat_num, 0, "—");
+                    for patient in &patients {
+                        ui.selectable_value(
+                            &mut self.discount_sub_pat_num,
+                            patient.pat_num,
+                            format!(
+                                "{}, {} (#{})",
+                                patient.l_name, patient.f_name, patient.pat_num
+                            ),
+                        );
+                    }
+                });
             egui::ComboBox::from_label("Plan")
-                    .selected_text(
-                        plans
-                            .iter()
-                            .find(|p| p.discount_plan_num == selected_plan)
-                            .map(|p| p.description.as_str())
-                            .unwrap_or("—"),
-                    )
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut selected_plan, 0, "—");
-                        for plan in &plans {
-                            ui.selectable_value(
-                                &mut selected_plan,
-                                plan.discount_plan_num,
-                                &plan.description,
-                            );
-                        }
-                    });
+                .selected_text(
+                    plans
+                        .iter()
+                        .find(|p| p.discount_plan_num == selected_plan)
+                        .map(|p| p.description.as_str())
+                        .unwrap_or("—"),
+                )
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut selected_plan, 0, "—");
+                    for plan in &plans {
+                        ui.selectable_value(
+                            &mut selected_plan,
+                            plan.discount_plan_num,
+                            &plan.description,
+                        );
+                    }
+                });
             ui.horizontal(|ui| {
                 ui.label("Effective");
                 ui.add(
@@ -11866,15 +12283,16 @@ impl OdApp {
                 self.discount_sub_edit = Some(sub);
                 return;
             }
-            let effective = match parse_discount_date(&self.discount_sub_effective_text, "Effective date") {
-                Ok(value) => value,
-                Err(err) => {
-                    self.error = Some(err);
-                    self.discount_sub_edit_open = true;
-                    self.discount_sub_edit = Some(sub);
-                    return;
-                }
-            };
+            let effective =
+                match parse_discount_date(&self.discount_sub_effective_text, "Effective date") {
+                    Ok(value) => value,
+                    Err(err) => {
+                        self.error = Some(err);
+                        self.discount_sub_edit_open = true;
+                        self.discount_sub_edit = Some(sub);
+                        return;
+                    }
+                };
             let term = match parse_discount_date(&self.discount_sub_term_text, "Term date") {
                 Ok(value) => value,
                 Err(err) => {
@@ -11969,7 +12387,9 @@ impl OdApp {
             });
             ui.label("Note");
             ui.text_edit_multiline(&mut self.treat_plan_note_text);
-            ui.label("OD keeps one Active plan per patient; promoting this plan demotes the others.");
+            ui.label(
+                "OD keeps one Active plan per patient; promoting this plan demotes the others.",
+            );
             ui.separator();
             ui.horizontal(|ui| {
                 save = ui.button("Save").clicked();
@@ -12018,7 +12438,11 @@ impl OdApp {
                     } else {
                         self.notice = Some(format!(
                             "Treatment plan {} saved",
-                            if is_new { format!("#{num}") } else { format!("{num}") }
+                            if is_new {
+                                format!("#{num}")
+                            } else {
+                                format!("{num}")
+                            }
                         ));
                         self.error = None;
                     }
@@ -12148,9 +12572,7 @@ impl OdApp {
                         pat_num,
                         format!(
                             "Treatment plan line {} saved on plan {} (procedure {})",
-                            num,
-                            plan.treat_plan_num,
-                            line.proc_num
+                            num, plan.treat_plan_num, line.proc_num
                         ),
                     );
                     self.notice = Some("Treatment plan line saved".into());
@@ -12202,7 +12624,9 @@ impl OdApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Birth ");
-                    ui.add(egui::TextEdit::singleline(&mut self.birth_text).hint_text("YYYY-MM-DD"));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.birth_text).hint_text("YYYY-MM-DD"),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Phone ");
@@ -12238,11 +12662,7 @@ impl OdApp {
                         .selected_text(patient.gender.label())
                         .show_ui(ui, |ui| {
                             for gender in Gender::ALL {
-                                ui.selectable_value(
-                                    &mut patient.gender,
-                                    gender,
-                                    gender.label(),
-                                );
+                                ui.selectable_value(&mut patient.gender, gender, gender.label());
                             }
                         });
                 });
@@ -12261,7 +12681,10 @@ impl OdApp {
                                 ui.selectable_value(
                                     &mut patient.primary_provider_num,
                                     provider.provider_num,
-                                    format!("{} — {}, {}", provider.abbreviation, provider.l_name, provider.f_name),
+                                    format!(
+                                        "{} — {}, {}",
+                                        provider.abbreviation, provider.l_name, provider.f_name
+                                    ),
                                 );
                             }
                         });
@@ -12337,13 +12760,20 @@ impl OdApp {
                     });
                     self.error = None;
                     self.patient_reason_text.clear();
-                    self.refresh();
+                    self.selected_patient = Some(saved_num);
+                    if self.patient_picker_open {
+                        self.apply_patient_picker_selection(saved_num);
+                    } else {
+                        self.refresh();
+                    }
                 }
                 Err(e) => self.error = Some(e),
             }
             self.patient_edit_open = false;
         } else if cancel {
             self.patient_edit_open = false;
+            self.patient_picker_open = false;
+            self.patient_picker_target = PatientPickerTarget::Global;
         } else if self.patient_edit_open {
             self.patient_edit = Some(patient);
         }
@@ -12388,13 +12818,22 @@ impl OdApp {
                 ui.label("Recall interval (OD packs these into one integer)");
                 ui.horizontal(|ui| {
                     ui.label("Years");
-                    ui.add(egui::TextEdit::singleline(&mut self.recall_years_text).desired_width(40.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recall_years_text).desired_width(40.0),
+                    );
                     ui.label("Months");
-                    ui.add(egui::TextEdit::singleline(&mut self.recall_months_text).desired_width(40.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recall_months_text)
+                            .desired_width(40.0),
+                    );
                     ui.label("Weeks");
-                    ui.add(egui::TextEdit::singleline(&mut self.recall_weeks_text).desired_width(40.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recall_weeks_text).desired_width(40.0),
+                    );
                     ui.label("Days");
-                    ui.add(egui::TextEdit::singleline(&mut self.recall_days_text).desired_width(40.0));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.recall_days_text).desired_width(40.0),
+                    );
                 });
                 ui.horizontal(|ui| {
                     ui.label("Status #");
@@ -12428,7 +12867,11 @@ impl OdApp {
                 self.recall_days_text.parse().unwrap_or(0),
             );
             recall.recall_status = self.recall_status_text.parse().unwrap_or(0);
-            recall.priority = if asap { RecallPriority::Asap } else { RecallPriority::Normal };
+            recall.priority = if asap {
+                RecallPriority::Asap
+            } else {
+                RecallPriority::Normal
+            };
             self.save_recall(&recall);
             self.recall_edit_open = false;
         } else if cancel {
@@ -12445,6 +12888,8 @@ impl OdApp {
         let mut save = false;
         let mut cancel = false;
         let mut delete = false;
+        let mut find_patient = false;
+        let mut cancel_visit = false;
         let mut asap = apt.priority == RecallPriority::Asap;
         let patients = self.patients.clone();
         let waitlist_defs: Vec<Definition> = waitlist_status_definitions(&self.definitions)
@@ -12460,23 +12905,51 @@ impl OdApp {
         let history_on = self.features.enabled(FeatureKey::AppointmentHistory);
         let can_delete_appointment = self.features.enabled(FeatureKey::AppointmentDelete)
             && self.can(Permission::APPOINTMENT_DELETE);
+        let can_edit_appointments = self.features.enabled(FeatureKey::AppointmentEdit)
+            && self.can(Permission::APPOINTMENT_EDIT);
 
-        egui::Window::new("Appointment — Edit")
-            .open(&mut self.apt_edit_open)
-            .resizable(true)
-            .default_width(460.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("When  ");
+        egui::Window::new(if is_existing {
+            "Edit appointment"
+        } else {
+            "New appointment"
+        })
+        .open(&mut self.apt_edit_open)
+        .resizable(true)
+        .default_width(480.0)
+        .show(ctx, |ui| {
+            ui.label(
+                egui::RichText::new(patient_name(&patients, apt.pat_num))
+                    .strong()
+                    .size(17.0),
+            );
+            ui.label(
+                egui::RichText::new(if is_existing {
+                    "Change the visit details, then save."
+                } else {
+                    "Add a visit to the schedule."
+                })
+                .color(theme::muted())
+                .small(),
+            );
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new("SCHEDULE").small().color(theme::muted()));
+            egui::Grid::new("apt_edit_when")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Date & time");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.apt_text).hint_text("YYYY-MM-DD HH:MM"),
+                        egui::TextEdit::singleline(&mut self.apt_text)
+                            .hint_text("YYYY-MM-DD HH:MM")
+                            .desired_width(220.0),
                     );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Minutes");
-                    ui.text_edit_singleline(&mut self.apt_len_text);
-                });
-                ui.horizontal(|ui| {
+                    ui.end_row();
+                    ui.label("Length (min)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.apt_len_text).desired_width(80.0),
+                    );
+                    ui.end_row();
                     ui.label("Status");
                     egui::ComboBox::from_id_salt("apt_status")
                         .selected_text(apt.apt_status.label())
@@ -12485,17 +12958,14 @@ impl OdApp {
                                 ui.selectable_value(&mut apt.apt_status, status, status.label());
                             }
                         });
-                });
-                if apt.apt_status == AppointmentStatus::UnschedList {
-                    ui.horizontal(|ui| {
-                        ui.label("Waitlist");
+                    ui.end_row();
+                    if apt.apt_status == AppointmentStatus::UnschedList {
+                        ui.label("Waitlist status");
                         let selected = waitlist_status_name(&self.definitions, apt.waitlist_status);
                         egui::ComboBox::from_id_salt("waitlist_status")
                             .selected_text(selected)
                             .show_ui(ui, |ui| {
-                                if ui.selectable_value(&mut apt.waitlist_status, 0, "—").clicked() {
-                                    // No change needed; selectable_value writes the value.
-                                }
+                                ui.selectable_value(&mut apt.waitlist_status, 0, "—");
                                 for definition in &waitlist_defs {
                                     ui.selectable_value(
                                         &mut apt.waitlist_status,
@@ -12504,94 +12974,145 @@ impl OdApp {
                                     );
                                 }
                             });
-                    });
-                    ui.weak("OD waitlist status = definition.DefNum in DefCat.RecallUnschedStatus (13).");
-                }
-                ui.horizontal(|ui| {
+                        ui.end_row();
+                    }
+                });
+            if apt.apt_status == AppointmentStatus::UnschedList {
+                ui.label(
+                    egui::RichText::new(
+                        "OD waitlist status = definition.DefNum in DefCat.RecallUnschedStatus (13).",
+                    )
+                    .weak()
+                    .small(),
+                );
+            }
+
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("PATIENT & TEAM").small().color(theme::muted()));
+            egui::Grid::new("apt_edit_team")
+                .num_columns(2)
+                .spacing([14.0, 6.0])
+                .show(ui, |ui| {
                     ui.label("Patient");
                     let current = patient_name(&patients, apt.pat_num);
-                    egui::ComboBox::from_id_salt("apt_patient")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for patient in &patients {
-                                ui.selectable_value(
-                                    &mut apt.pat_num,
-                                    patient.pat_num,
-                                    patient.display_name(),
-                                );
-                            }
-                        });
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("apt_patient")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for patient in &patients {
+                                    ui.selectable_value(
+                                        &mut apt.pat_num,
+                                        patient.pat_num,
+                                        patient.display_name(),
+                                    );
+                                }
+                            });
+                        if self.features.enabled(FeatureKey::PatientSearch)
+                            && ui.button("Find…").clicked()
+                        {
+                            find_patient = true;
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Provider & room");
+                    ui.horizontal(|ui| {
+                        let current = self
+                            .providers
+                            .iter()
+                            .find(|p| p.provider_num == apt.provider_num)
+                            .map(|p| p.display_name())
+                            .unwrap_or_else(|| format!("#{}", apt.provider_num));
+                        egui::ComboBox::from_id_salt("apt_provider")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for provider in &self.providers {
+                                    ui.selectable_value(
+                                        &mut apt.provider_num,
+                                        provider.provider_num,
+                                        provider.display_name(),
+                                    );
+                                }
+                            });
+                        ui.label("·");
+                        let current = self
+                            .operatories
+                            .iter()
+                            .find(|o| o.operatory_num == apt.operatory_num)
+                            .map(|o| o.description.clone())
+                            .unwrap_or_else(|| format!("#{}", apt.operatory_num));
+                        egui::ComboBox::from_id_salt("apt_operatory")
+                            .selected_text(current)
+                            .show_ui(ui, |ui| {
+                                for operatory in &self.operatories {
+                                    ui.selectable_value(
+                                        &mut apt.operatory_num,
+                                        operatory.operatory_num,
+                                        operatory.description.clone(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.end_row();
                 });
-                ui.horizontal(|ui| {
-                    ui.label("Provider");
-                    let current = self
-                        .providers
-                        .iter()
-                        .find(|p| p.provider_num == apt.provider_num)
-                        .map(|p| p.display_name())
-                        .unwrap_or_else(|| format!("#{}", apt.provider_num));
-                    egui::ComboBox::from_id_salt("apt_provider")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for provider in &self.providers {
-                                ui.selectable_value(
-                                    &mut apt.provider_num,
-                                    provider.provider_num,
-                                    provider.display_name(),
-                                );
-                            }
-                        });
-                    ui.label("Operatory");
-                    let current = self
-                        .operatories
-                        .iter()
-                        .find(|o| o.operatory_num == apt.operatory_num)
-                        .map(|o| o.description.clone())
-                        .unwrap_or_else(|| format!("#{}", apt.operatory_num));
-                    egui::ComboBox::from_id_salt("apt_operatory")
-                        .selected_text(current)
-                        .show_ui(ui, |ui| {
-                            for operatory in &self.operatories {
-                                ui.selectable_value(
-                                    &mut apt.operatory_num,
-                                    operatory.operatory_num,
-                                    operatory.description.clone(),
-                                );
-                            }
-                        });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Notes ");
-                    ui.text_edit_singleline(&mut apt.notes);
-                });
-                ui.checkbox(&mut asap, "ASAP priority (appointment.Priority = 1)");
-                ui.separator();
-                if apt.apt_num != 0 && self.features.enabled(FeatureKey::AppointmentConflictWarnings) {
-                    let others: Vec<Appointment> = self
-                        .appointments
-                        .iter()
-                        .filter(|a| a.apt_num != apt.apt_num)
-                        .cloned()
-                        .collect();
-                    let conflicts = schedule_conflicts(&apt, &others);
-                    if conflicts.is_empty() {
-                        ui.colored_label(Color32::from_rgb(20, 120, 40), "No schedule conflicts");
-                    } else {
-                        ui.colored_label(
-                            Color32::from_rgb(190, 60, 60),
-                            format!("Conflicts with appointment(s): {conflicts:?}"),
-                        );
-                    }
-                }
-                ui.horizontal(|ui| {
-                    save = ui.button("Save").clicked();
-                    cancel = ui.button("Cancel").clicked();
-                    delete = apt.apt_num != 0
-                        && can_delete_appointment
-                        && ui.button("Delete").clicked();
-                });
-            });
 
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("NOTES & FLAGS").small().color(theme::muted()));
+            ui.horizontal(|ui| {
+                ui.label("Notes");
+                ui.add(
+                    egui::TextEdit::singleline(&mut apt.notes)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Optional"),
+                );
+            });
+            ui.checkbox(&mut asap, "ASAP priority (appointment.Priority = 1)");
+
+            if apt.apt_num != 0 && self.features.enabled(FeatureKey::AppointmentConflictWarnings) {
+                let others: Vec<Appointment> = self
+                    .appointments
+                    .iter()
+                    .filter(|a| a.apt_num != apt.apt_num)
+                    .cloned()
+                    .collect();
+                let conflicts = schedule_conflicts(&apt, &others);
+                if conflicts.is_empty() {
+                    ui.colored_label(theme::success(), "No schedule conflicts");
+                } else {
+                    ui.colored_label(
+                        theme::danger(),
+                        format!("Conflicts with appointment(s): {conflicts:?}"),
+                    );
+                }
+            }
+
+            ui.add_space(8.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                save = ui.button("Save").clicked();
+                cancel = ui.button("Cancel").clicked();
+                cancel_visit = apt.apt_num != 0
+                    && can_edit_appointments
+                    && ui
+                        .button("Cancel visit")
+                        .on_hover_text("OD has no Cancelled status; this saves AptStatus = Broken.")
+                        .clicked();
+                delete = apt.apt_num != 0
+                    && can_delete_appointment
+                    && ui.button("Delete").clicked();
+            });
+        });
+
+        if find_patient {
+            self.apt_edit = Some(apt);
+            self.apt_edit_open = true;
+            self.open_patient_picker(PatientPickerTarget::Appointment);
+            return;
+        }
+        if cancel_visit {
+            self.cancel_visit(apt);
+            self.apt_edit_open = false;
+            return;
+        }
         if delete {
             if history_on {
                 let mut change = AppointmentChange::from_snapshot(
@@ -12665,8 +13186,10 @@ impl OdApp {
                     if history_on && !is_existing {
                         let mut stored = apt.clone();
                         stored.apt_num = saved_num;
-                        let mut change =
-                            AppointmentChange::from_snapshot(&stored, AppointmentChangeAction::Created);
+                        let mut change = AppointmentChange::from_snapshot(
+                            &stored,
+                            AppointmentChangeAction::Created,
+                        );
                         change.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
                         if let Err(e) = self.store.append_appointment_change(&change) {
                             self.error = Some(e);
@@ -12683,7 +13206,12 @@ impl OdApp {
                             appointment_change_note(before.as_ref().unwrap_or(&apt), &apt),
                         )
                     };
-                    self.audit_if(FeatureKey::AuditAppointmentChanges, permission, apt.pat_num, note);
+                    self.audit_if(
+                        FeatureKey::AuditAppointmentChanges,
+                        permission,
+                        apt.pat_num,
+                        note,
+                    );
                     if let Some(hold_id) = self.board.pending_hold_delete.take() {
                         self.board.remove_hold(hold_id);
                     }
@@ -12782,7 +13310,10 @@ impl OdApp {
                         FeatureKey::AuditPatientChanges,
                         Permission::PATIENT_EDIT,
                         pat_num,
-                        format!("Patient {pat_num} rolled back to correction {}", correction.correction_num),
+                        format!(
+                            "Patient {pat_num} rolled back to correction {}",
+                            correction.correction_num
+                        ),
                     );
                     self.notice = Some("Patient details restored".into());
                     self.error = None;
@@ -12846,7 +13377,8 @@ impl OdApp {
         if let Some(change) = restore {
             let current = self.store.get_appointment(apt_num).ok().flatten();
             if let Some(current) = current {
-                let mut snapshot = AppointmentChange::from_snapshot(&current, AppointmentChangeAction::Changed);
+                let mut snapshot =
+                    AppointmentChange::from_snapshot(&current, AppointmentChangeAction::Changed);
                 snapshot.user_num = self.session.as_ref().map(|s| s.user_num).unwrap_or(0);
                 if let Err(e) = self.store.append_appointment_change(&snapshot) {
                     self.error = Some(e);
@@ -12860,7 +13392,10 @@ impl OdApp {
                         FeatureKey::AuditAppointmentChanges,
                         Permission::APPOINTMENT_EDIT,
                         change.pat_num,
-                        format!("Appointment {apt_num} restored from history {}", change.change_num),
+                        format!(
+                            "Appointment {apt_num} restored from history {}",
+                            change.change_num
+                        ),
                     );
                     self.notice = Some("Appointment restored".into());
                     self.error = None;
@@ -12882,17 +13417,7 @@ fn patient_name(patients: &[Patient], pat_num: Id) -> String {
 }
 
 fn status_color(status: AppointmentStatus) -> Color32 {
-    match status {
-        AppointmentStatus::Scheduled => Color32::from_rgb(198, 222, 250),
-        AppointmentStatus::Complete => Color32::from_rgb(200, 235, 204),
-        AppointmentStatus::Broken => Color32::from_rgb(250, 205, 205),
-        AppointmentStatus::Planned => Color32::from_rgb(228, 228, 228),
-        AppointmentStatus::Unscheduled => Color32::from_rgb(255, 240, 200),
-        AppointmentStatus::UnschedList => Color32::from_rgb(244, 240, 224),
-        AppointmentStatus::Asap => Color32::from_rgb(255, 210, 160),
-        AppointmentStatus::PtNote => Color32::from_rgb(255, 246, 190),
-        AppointmentStatus::PtNoteCompleted => Color32::from_rgb(218, 238, 214),
-    }
+    theme::status_fill(status)
 }
 
 impl eframe::App for OdApp {
@@ -12979,13 +13504,7 @@ mod tests {
             "Resolved",
             "Resolved reason",
         ]);
-        table.push(&[
-            "Smith, Jo",
-            "Alvarez, Ada",
-            "0.00",
-            "0",
-            "",
-        ]);
+        table.push(&["Smith, Jo", "Alvarez, Ada", "0.00", "0", ""]);
         table.push(&[
             "Smith, Jo",
             "Bennett, Ada",
@@ -12993,20 +13512,16 @@ mod tests {
             "2",
             "fee corrected after chart review; fee rechecked",
         ]);
-        table.push(&[
-            "Total (2 plan(s))",
-            "",
-            "0.00",
-            "2",
-            "",
-        ]);
+        table.push(&["Total (2 plan(s))", "", "0.00", "2", ""]);
 
         let without_reasons = ReportTable {
             headers: vec!["Provider".into(), "Guarantor".into(), "Paid".into()],
             rows: vec![vec!["Smith".into(), "Bennett".into(), "10.00".into()]],
         };
         assert!(
-            stale_resolved_export_table(&without_reasons).rows.is_empty(),
+            stale_resolved_export_table(&without_reasons)
+                .rows
+                .is_empty(),
             "without a Resolved column there is no audit evidence to export"
         );
 
@@ -13019,13 +13534,20 @@ mod tests {
             "fee corrected after chart review; fee rechecked"
         );
 
-        let csv = render_report_csv("Payment plans (stale resolved)", "Highland Dental", &filtered);
+        let csv = render_report_csv(
+            "Payment plans (stale resolved)",
+            "Highland Dental",
+            &filtered,
+        );
         assert!(csv.contains("Resolved reason"));
         assert!(csv.contains("fee corrected after chart review"));
         assert!(!csv.contains("Alvarez"), "clean plan must not be exported");
         assert!(!csv.contains("Total ("), "footer must not be exported");
-        let html =
-            render_report_html("Payment plans (stale resolved)", "Highland Dental", &filtered);
+        let html = render_report_html(
+            "Payment plans (stale resolved)",
+            "Highland Dental",
+            &filtered,
+        );
         assert!(html.contains("fee corrected after chart review"));
         assert!(!html.contains("Alvarez"));
     }
@@ -13095,13 +13617,22 @@ mod tests {
         let table = account_audit_export_table(12, "Alvarez, Ada", &[plan], &charges, &log);
         assert_eq!(
             table.headers,
-            vec!["Section", "When", "Patient", "Plan #", "Source #", "User", "Details"]
+            vec![
+                "Section", "When", "Patient", "Plan #", "Source #", "User", "Details"
+            ]
         );
-        assert_eq!(table.rows.len(), 2, "one resolved charge and one matching log row");
+        assert_eq!(
+            table.rows.len(),
+            2,
+            "one resolved charge and one matching log row"
+        );
         assert_eq!(table.rows[0][0], "Resolved charge");
         assert_eq!(table.rows[0][4], "44");
         assert!(table.rows[0][6].contains("reason: fee corrected after chart review"));
-        assert!(table.rows[0][6].contains("Crown plan"), "plan note adds context");
+        assert!(
+            table.rows[0][6].contains("Crown plan"),
+            "plan note adds context"
+        );
         assert_eq!(table.rows[1][0], "Security log");
         assert_eq!(table.rows[1][4], "7");
         assert_eq!(table.rows[1][5], "3");
@@ -13161,16 +13692,34 @@ mod tests {
             "C:\\Audit\\practice.csv"
         );
         assert_eq!(
-            patient_export_path(&prefs, "local", EXPORT_KEY_ACCOUNT_AUDIT, 12, "fallback".into()),
+            patient_export_path(
+                &prefs,
+                "local",
+                EXPORT_KEY_ACCOUNT_AUDIT,
+                12,
+                "fallback".into()
+            ),
             "C:\\Audit\\patient-12.csv"
         );
         assert_eq!(
-            patient_export_path(&prefs, "local", EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            patient_export_path(
+                &prefs,
+                "local",
+                EXPORT_KEY_ACCOUNT_AUDIT,
+                99,
+                "fallback".into()
+            ),
             "C:\\Audit\\account.csv",
             "an account without its own path inherits the user's default"
         );
         assert_eq!(
-            patient_export_path(&ReportPreferences::default(), "local", EXPORT_KEY_ACCOUNT_AUDIT, 99, "fallback".into()),
+            patient_export_path(
+                &ReportPreferences::default(),
+                "local",
+                EXPORT_KEY_ACCOUNT_AUDIT,
+                99,
+                "fallback".into()
+            ),
             "fallback"
         );
         assert_eq!(
@@ -13253,7 +13802,8 @@ mod tests {
         app.report_prefs
             .set_user_export_path(key.clone(), "account-audit.12", "D:\\Audit\\12.csv");
         assert_eq!(
-            app.report_prefs.effective_export_path(&key, "account-audit.12"),
+            app.report_prefs
+                .effective_export_path(&key, "account-audit.12"),
             Some("D:\\Audit\\12.csv")
         );
     }
@@ -13362,7 +13912,8 @@ mod tests {
             rows: vec![vec!["Chen, Lily".into(), "148.00".into()]],
         };
         let title = collections_export_title(Some(CollectionsAgingBucket::Current), as_of, &rows);
-        let expected = "Collections (0-30 days band · as of 2026-11-26 · 2 patient account(s) · 198.00 total)";
+        let expected =
+            "Collections (0-30 days band · as of 2026-11-26 · 2 patient account(s) · 198.00 total)";
         let csv = render_report_csv(&title, "Highland Dental", &table);
         assert!(csv.contains(expected), "{csv}");
         let html = render_report_html(&title, "Highland Dental", &table);
@@ -13446,9 +13997,15 @@ mod tests {
         assert!(app.report_date_text_valid(true));
 
         app.report_from_text = "2026-03-01".into();
-        assert!(!app.report_date_text_valid(true), "reversed range is rejected");
+        assert!(
+            !app.report_date_text_valid(true),
+            "reversed range is rejected"
+        );
         app.report_to_text = "not-a-date".into();
-        assert!(!app.report_date_text_valid(true), "partial text is rejected");
+        assert!(
+            !app.report_date_text_valid(true),
+            "partial text is rejected"
+        );
         assert_eq!(app.report_from, from);
         assert_eq!(app.report_to, to);
 
@@ -13534,12 +14091,13 @@ mod tests {
             .collect();
         assert_eq!(posted.len(), 2);
         assert!(posted.iter().all(|e| e.memo == "GUI posted memo"));
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("posted to journal")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("posted to journal"))
+        );
     }
 
     /// Adjustments already in the journal must not offer a second posting, and
@@ -13589,7 +14147,11 @@ mod tests {
         }
         assert!(app.error.is_some_and(|e| e.contains("already posted")));
         let after_second = app.store.list_journal_entries().unwrap();
-        assert_eq!(after_second.len(), after.len(), "no duplicate lines written");
+        assert_eq!(
+            after_second.len(),
+            after.len(),
+            "no duplicate lines written"
+        );
     }
 
     /// Payment-backed ledger rows carry the payment number so the Action
@@ -13650,7 +14212,10 @@ mod tests {
         assert_eq!(adj_source.label(), "Adjustment");
         assert_eq!(pay_source.label(), "Payment");
         assert_eq!((adj_source.source_num(), pay_source.source_num()), (91, 92));
-        assert_eq!((adj_source.pat_num(), pay_source.pat_num()), (pat_num, pat_num));
+        assert_eq!(
+            (adj_source.pat_num(), pay_source.pat_num()),
+            (pat_num, pat_num)
+        );
         let (adj_debit, adj_credit) = adj_source.default_accounts(&accounts);
         let (pay_debit, pay_credit) = pay_source.default_accounts(&accounts);
         assert_ne!(adj_debit, adj_credit);
@@ -13662,9 +14227,11 @@ mod tests {
         assert!(adj_entries[0].memo.contains("[Adj #91"));
         assert!(pay_entries[0].memo.contains("[Pay #92"));
         assert_eq!(pay_entries[0].check_number, "CHQ-92");
-        assert!(pay_source
-            .memo("edited")
-            .contains(&payment_journal_reference(92, pat_num)));
+        assert!(
+            pay_source
+                .memo("edited")
+                .contains(&payment_journal_reference(92, pat_num))
+        );
         assert!(pay_source.heading().contains("cheque CHQ-92"));
         assert!(!adj_source.is_posted(&pay_entries));
         assert!(!pay_source.is_posted(&adj_entries));
@@ -13711,16 +14278,19 @@ mod tests {
             .filter(|e| e.transaction_num == transaction_num)
             .collect();
         assert_eq!(posted.len(), 2);
-        assert!(posted
-            .iter()
-            .all(|e| e.check_number == "CHQ-55" && e.memo.contains("[Pay #93")));
+        assert!(
+            posted
+                .iter()
+                .all(|e| e.check_number == "CHQ-55" && e.memo.contains("[Pay #93"))
+        );
         assert!(is_payment_posted(&all, 93, pat_num));
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Payment #93 posted to journal")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Payment #93 posted to journal"))
+        );
 
         // Once posted, the window's guard rejects a duplicate before any write.
         assert!(source.is_posted(&app.store.list_journal_entries().unwrap_or_default()));
@@ -13769,10 +14339,16 @@ mod tests {
                 .filter(|e| e.transaction_num == charge.transaction_num)
                 .collect();
             assert_eq!(posted.len(), 2);
-            assert!(posted.iter().any(|e| e.debit_amt == charge.procedure.fee
-                && e.account_num == debit));
-            assert!(posted.iter().any(|e| e.credit_amt == charge.procedure.fee
-                && e.account_num == credit));
+            assert!(
+                posted
+                    .iter()
+                    .any(|e| e.debit_amt == charge.procedure.fee && e.account_num == debit)
+            );
+            assert!(
+                posted
+                    .iter()
+                    .any(|e| e.credit_amt == charge.procedure.fee && e.account_num == credit)
+            );
             assert!(is_procedure_posted(&all, charge.procedure.proc_num, pat));
         }
         app.audit_if(
@@ -13781,12 +14357,13 @@ mod tests {
             pat,
             "Batch posted 3 completed-procedure charge(s)".into(),
         );
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Batch posted 3")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Batch posted 3"))
+        );
 
         // A second run sees every procedure as posted and books nothing.
         let after = app.store.list_journal_entries().unwrap();
@@ -13858,10 +14435,18 @@ mod tests {
                 .filter(|e| e.transaction_num == item.transaction_num)
                 .collect();
             assert_eq!(posted.len(), 2);
-            assert!(posted.iter().any(|e| e.debit_amt == item.source.amount().abs()
-                && e.account_num == item.debit_account));
-            assert!(posted.iter().any(|e| e.credit_amt == item.source.amount().abs()
-                && e.account_num == item.credit_account));
+            assert!(
+                posted
+                    .iter()
+                    .any(|e| e.debit_amt == item.source.amount().abs()
+                        && e.account_num == item.debit_account)
+            );
+            assert!(
+                posted
+                    .iter()
+                    .any(|e| e.credit_amt == item.source.amount().abs()
+                        && e.account_num == item.credit_account)
+            );
         }
         assert!(is_procedure_posted(&all, 600, pat));
         assert!(is_payment_posted(&all, 70, pat));
@@ -13873,24 +14458,27 @@ mod tests {
             pat,
             "Batch posted 3 source(s) to journal".into(),
         );
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Batch posted 3 source(s)")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Batch posted 3 source(s)"))
+        );
 
         let after = app.store.list_journal_entries().unwrap();
-        assert!(build_posting_batch_plan(
-            &procedures,
-            &payments,
-            &adjustments,
-            &after,
-            &defaults,
-            from,
-            to,
-        )
-        .is_empty());
+        assert!(
+            build_posting_batch_plan(
+                &procedures,
+                &payments,
+                &adjustments,
+                &after,
+                &defaults,
+                from,
+                to,
+            )
+            .is_empty()
+        );
         assert_eq!(app.store.list_journal_entries().unwrap().len(), all.len());
     }
 
@@ -13963,7 +14551,9 @@ mod tests {
         assert!(tie_out_ready(&tie_out(&after)).is_ok());
 
         let mut closed = app.closed_periods.clone();
-        closed.close(date, "Signed off after tie-out", "now".into()).unwrap();
+        closed
+            .close(date, "Signed off after tie-out", "now".into())
+            .unwrap();
         app.store
             .upsert_pref(CLOSED_PERIODS_PREF, &closed.to_json())
             .unwrap();
@@ -13977,12 +14567,13 @@ mod tests {
             ClosedPeriods::from_prefs(&app.store.list_prefs().unwrap()),
             app.closed_periods
         );
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Closed accounting period 2026-11")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Closed accounting period 2026-11"))
+        );
 
         let late = Procedure {
             proc_num: 701,
@@ -13990,35 +14581,29 @@ mod tests {
             ..procedure.clone()
         };
         assert!(app.closed_periods.is_closed(late.proc_date));
-        assert!(app
-            .closed_periods
-            .reject_posting(date, "Charge #701")
-            .unwrap_err()
-            .contains("2026-11"));
+        assert!(
+            app.closed_periods
+                .reject_posting(date, "Charge #701")
+                .unwrap_err()
+                .contains("2026-11")
+        );
         assert_eq!(
-            build_posting_batch_plan(
-                &[late.clone()],
+            build_posting_batch_plan(&[late.clone()], &[], &[], &after, &defaults, from, to,).len(),
+            1
+        );
+        assert!(
+            build_posting_batch_plan_with_closed(
+                &[late],
                 &[],
                 &[],
                 &after,
                 &defaults,
+                &app.closed_periods,
                 from,
                 to,
             )
-            .len(),
-            1
+            .is_empty()
         );
-        assert!(build_posting_batch_plan_with_closed(
-            &[late],
-            &[],
-            &[],
-            &after,
-            &defaults,
-            &app.closed_periods,
-            from,
-            to,
-        )
-        .is_empty());
 
         let mut reopened = app.closed_periods.clone();
         reopened.reopen(date).unwrap();
@@ -14032,12 +14617,13 @@ mod tests {
             "Reopened accounting period 2026-11 for a late correction".into(),
         );
         assert!(!app.closed_periods.is_closed(date));
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Reopened accounting period 2026-11")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Reopened accounting period 2026-11"))
+        );
     }
 
     /// A batch containing a malformed transaction group is refused up front,
@@ -14063,7 +14649,10 @@ mod tests {
             ],
         ];
         assert!(app.store.post_journal_batch(&bad).is_err());
-        assert_eq!(app.store.list_journal_entries().unwrap().len(), before.len());
+        assert_eq!(
+            app.store.list_journal_entries().unwrap().len(),
+            before.len()
+        );
     }
 
     fn collections_test_row(
@@ -14124,7 +14713,11 @@ mod tests {
         for row in &rows {
             let pdf = dir.join(batch_statement_filename(row.pat_num, app.report_to));
             let bytes = std::fs::read(&pdf).unwrap();
-            assert!(bytes.starts_with(b"%PDF-1.4"), "not a PDF: {}", pdf.display());
+            assert!(
+                bytes.starts_with(b"%PDF-1.4"),
+                "not a PDF: {}",
+                pdf.display()
+            );
             let statements = app.store.list_statements(row.pat_num).unwrap();
             assert!(
                 statements.iter().any(|s| s.note.contains(expected)),
@@ -14132,12 +14725,10 @@ mod tests {
                 row.pat_num
             );
         }
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Collections statement batch generated 2")));
+        assert!(app.store.list_security_log(50).unwrap().iter().any(|e| {
+            e.log_text
+                .contains("Collections statement batch generated 2")
+        }));
         let key = app.period_close_history_user_key();
         assert_eq!(
             app.report_prefs
@@ -14163,11 +14754,12 @@ mod tests {
 
         app.generate_collections_statement_batch(&[row]);
 
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Statements are turned off"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Statements are turned off")
+        );
         assert!(!dir.exists(), "a gated batch must not create a folder");
     }
 
@@ -14214,27 +14806,30 @@ mod tests {
         app.apply_patient_credit(pat_num, &[procedure], &[], &[credit_split]);
 
         assert!(app.error.is_none(), "{:?}", app.error);
-        assert!(app
-            .notice
-            .as_deref()
-            .unwrap_or_default()
-            .contains("30.00"));
+        assert!(app.notice.as_deref().unwrap_or_default().contains("30.00"));
         let splits = app.store.list_pay_splits(pat_num).unwrap();
-        assert!(splits.iter().any(|s| s.proc_num == 0 && s.split_amount < 0.0));
-        assert!(splits.iter().any(|s| s.proc_num == proc_num && s.split_amount > 0.0));
+        assert!(
+            splits
+                .iter()
+                .any(|s| s.proc_num == 0 && s.split_amount < 0.0)
+        );
+        assert!(
+            splits
+                .iter()
+                .any(|s| s.proc_num == proc_num && s.split_amount > 0.0)
+        );
         assert!(splits.iter().all(|s| s.pat_num == pat_num));
-        assert!(app
-            .store
-            .list_pay_splits(other_pat)
-            .unwrap()
-            .iter()
-            .all(|s| s.pat_num == other_pat));
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("applied 30.00 of this patient's own credit")));
+        assert!(
+            app.store
+                .list_pay_splits(other_pat)
+                .unwrap()
+                .iter()
+                .all(|s| s.pat_num == other_pat)
+        );
+        assert!(app.store.list_security_log(50).unwrap().iter().any(|e| {
+            e.log_text
+                .contains("applied 30.00 of this patient's own credit")
+        }));
     }
 
     #[test]
@@ -14242,7 +14837,8 @@ mod tests {
         use od_domain::Procedure;
         let mut app = OdApp::new();
         app.refresh();
-        app.features.set(FeatureKey::PatientCreditApplication, false);
+        app.features
+            .set(FeatureKey::PatientCreditApplication, false);
         app.session = Some(Session::local());
         let pat_num = app.patients[0].pat_num;
         app.apply_patient_credit(
@@ -14251,11 +14847,12 @@ mod tests {
             &[],
             &[PaySplit::default()],
         );
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("turned off"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("turned off")
+        );
     }
 
     /// Patient forms are a read-only, feature-toggled print/export of existing
@@ -14269,10 +14866,8 @@ mod tests {
         app.session = Some(Session::local());
         app.report_prefs.practice_name = "Highland Dental".into();
         let pat_num = app.patients[0].pat_num;
-        let dir = std::env::temp_dir().join(format!(
-            "odclinic-patient-form-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("odclinic-patient-form-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("form.pdf").to_string_lossy().into_owned();
@@ -14285,21 +14880,23 @@ mod tests {
         let html = render_patient_form_html(&app.patient_form_document(pat_num).unwrap());
         assert!(html.contains("Highland Dental"));
         assert!(html.contains(&app.patients[0].display_name()));
-        assert!(app
-            .store
-            .list_security_log(50)
-            .unwrap()
-            .iter()
-            .any(|e| e.log_text.contains("Patient form PDF saved")));
+        assert!(
+            app.store
+                .list_security_log(50)
+                .unwrap()
+                .iter()
+                .any(|e| e.log_text.contains("Patient form PDF saved"))
+        );
 
         let blocked = dir.join("blocked.pdf").to_string_lossy().into_owned();
         app.features.set(FeatureKey::PatientFormsEnabled, false);
         app.save_patient_form_pdf(pat_num, &blocked);
-        assert!(app
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("permission/feature"));
+        assert!(
+            app.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("permission/feature")
+        );
         assert!(!std::path::Path::new(&blocked).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14332,7 +14929,9 @@ mod tests {
                 row.plan_due_now
             );
             assert!(
-                !row.as_table_row().iter().any(|cell| cell.starts_with("-0.00")),
+                !row.as_table_row()
+                    .iter()
+                    .any(|cell| cell.starts_with("-0.00")),
                 "{} has a negative-zero cell: {:?}",
                 row.patient,
                 row.as_table_row()
@@ -14378,7 +14977,11 @@ mod tests {
         assert_eq!(rows[0].pat_num, 1, "50 sorts before 200 numerically");
         sort_collections_rows(&mut rows, 2, true);
         assert_eq!(rows[0].pat_num, 2, "61 sorts before 30 when descending");
-        assert_eq!(rows[0].as_table_row()[2], "61", "visible row follows the action");
+        assert_eq!(
+            rows[0].as_table_row()[2],
+            "61",
+            "visible row follows the action"
+        );
     }
 
     #[test]
@@ -14396,12 +14999,14 @@ mod tests {
             totals[CollectionsAgingBucket::Days61To90.index()].balance,
             25.0
         );
-        assert_eq!(totals[CollectionsAgingBucket::Over90.index()].balance, 100.0);
+        assert_eq!(
+            totals[CollectionsAgingBucket::Over90.index()].balance,
+            100.0
+        );
 
         app.collections_bucket_filter = Some(CollectionsAgingBucket::Days61To90);
         sort_collections_rows(&mut app.collections_rows, 1, false);
-        let visible =
-            filter_collections_rows(&app.collections_rows, app.collections_bucket_filter);
+        let visible = filter_collections_rows(&app.collections_rows, app.collections_bucket_filter);
         assert_eq!(visible.len(), 1, "one row for the one patient in the band");
         assert_eq!(visible[0].pat_num, 3);
         let exported = visible[0].as_table_row();
@@ -14409,7 +15014,10 @@ mod tests {
         assert_eq!(exported[1], "25.00");
         assert_eq!(exported[2], "61");
         assert_eq!(app.collections_rows[0].patient, exported[0]);
-        assert_eq!(filter_collections_rows(&app.collections_rows, None).len(), 4);
+        assert_eq!(
+            filter_collections_rows(&app.collections_rows, None).len(),
+            4
+        );
     }
 
     #[test]
@@ -14436,7 +15044,10 @@ mod tests {
         assert_eq!(app.selected_patient, Some(patient.pat_num));
 
         app.apply_collections_action(patient.pat_num, CollectionsAction::RecordPayment);
-        assert!(app.payment_edit_open, "payment dialog should open from worklist");
+        assert!(
+            app.payment_edit_open,
+            "payment dialog should open from worklist"
+        );
         assert_eq!(
             app.payment_edit.as_ref().map(|payment| payment.pat_num),
             Some(patient.pat_num),
@@ -14452,8 +15063,15 @@ mod tests {
         let mut app = OdApp::new();
         app.refresh();
         assert!(!app.patients.is_empty(), "demo patients should load");
-        assert!(!app.appointments.is_empty(), "demo appointments should load");
-        assert_eq!(app.waitlist.len(), 2, "waitlist should load from OD unsched list");
+        assert!(
+            !app.appointments.is_empty(),
+            "demo appointments should load"
+        );
+        assert_eq!(
+            app.waitlist.len(),
+            2,
+            "waitlist should load from OD unsched list"
+        );
         assert!(app.waitlist.iter().all(|a| is_waitlist(a)));
         assert_eq!(app.appt_tab, ApptTab::Schedule);
         assert_eq!(app.reminder_rules.len(), 3, "eServices rules should load");
@@ -14473,7 +15091,10 @@ mod tests {
         assert!(app.features.enabled(FeatureKey::ReportTreatmentPlans));
         assert!(app.features.enabled(FeatureKey::ReportAging));
         assert!(app.features.enabled(FeatureKey::ReportPayPlanDetail));
-        assert!(app.features.enabled(FeatureKey::ReportPayPlanChargeApplications));
+        assert!(
+            app.features
+                .enabled(FeatureKey::ReportPayPlanChargeApplications)
+        );
         assert!(app.features.enabled(FeatureKey::ReportBirthday));
         assert!(app.features.enabled(FeatureKey::ReportNewPatients));
         assert!(app.features.enabled(FeatureKey::ReportAppointments));
@@ -14515,7 +15136,10 @@ mod tests {
         // The plan-creation filter reads the hidden start date, so the picker
         // must show both dates for this report.
         assert!(ReportKind::PayPlanDetail.uses_date_range());
-        assert_eq!(ReportKind::PeriodCloseHistory.label(), "Period close history");
+        assert_eq!(
+            ReportKind::PeriodCloseHistory.label(),
+            "Period close history"
+        );
         assert_eq!(
             ReportKind::PeriodCloseHistory.feature_key(),
             FeatureKey::LedgerJournalPosting
@@ -14551,7 +15175,10 @@ mod tests {
         );
         app.report_prefs.practice_name = "Test Clinic".into();
         app.report_prefs.set_export_path("recall-asap", "C:\\r.csv");
-        assert_eq!(app.report_prefs.export_path("recall-asap"), Some("C:\\r.csv"));
+        assert_eq!(
+            app.report_prefs.export_path("recall-asap"),
+            Some("C:\\r.csv")
+        );
         let mut sorted = ReportTable::new(&["Item", "Value", "Detail"]);
         sorted.push(&["Nine", "9.00", ""]);
         sorted.push(&["Hundred", "100.00", ""]);
@@ -14577,26 +15204,34 @@ mod tests {
         let procedures = app.store.list_procedures(1).unwrap();
         let splits = app.store.list_pay_splits(1).unwrap();
         let doc = invoice_for(1, &name, &procedures, &splits, "10", "Test invoice");
-        assert!(doc.total() > 0.0, "registry invoice uses completed procedures");
+        assert!(
+            doc.total() > 0.0,
+            "registry invoice uses completed procedures"
+        );
         assert!(doc.lines.iter().all(|line| line.tax_rate == 10.0));
         println!("ALIVE=True");
     }
 }
 
-    #[test]
-    fn reconcile_dynamic_plans_due_portfolio_issues_and_audits() {
-        let mut app = OdApp::new();
-        app.refresh();
-        let pat_num = app.patients[0].pat_num;
-        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let as_of = chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
-        let adj_num = app.store.upsert_adjustment(&od_domain::Adjustment {
+#[test]
+fn reconcile_dynamic_plans_due_portfolio_issues_and_audits() {
+    let mut app = OdApp::new();
+    app.refresh();
+    let pat_num = app.patients[0].pat_num;
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let as_of = chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap();
+    let adj_num = app
+        .store
+        .upsert_adjustment(&od_domain::Adjustment {
             pat_num,
             adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
             adj_amount: 300.0,
             ..Default::default()
-        }).unwrap();
-        let plan_num = app.store.upsert_pay_plan(&PayPlan {
+        })
+        .unwrap();
+    let plan_num = app
+        .store
+        .upsert_pay_plan(&PayPlan {
             pat_num,
             guarantor: pat_num,
             pay_plan_date: start,
@@ -14606,51 +15241,96 @@ mod tests {
             pay_amt: 100.0,
             date_pay_plan_start: Some(start),
             ..Default::default()
-        }).unwrap();
-        let _ = app.store.upsert_pay_plan_link(&PayPlanLink {
+        })
+        .unwrap();
+    let _ = app
+        .store
+        .upsert_pay_plan_link(&PayPlanLink {
             pay_plan_num: plan_num,
             link_type: PayPlanLink::ADJUSTMENT,
             fkey: adj_num,
             ..Default::default()
-        }).unwrap();
-        app.refresh();
+        })
+        .unwrap();
+    app.refresh();
 
-        let plans = app.store.list_pay_plans(pat_num).unwrap();
-        let links = app.store.list_pay_plan_links().unwrap();
-        let procedures = app.store.list_procedures(pat_num).unwrap();
-        let adjustments = app.store.list_adjustments(pat_num).unwrap();
-        let splits = app.store.list_pay_splits(pat_num).unwrap();
-        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
-        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &charges, as_of);
+    let plans = app.store.list_pay_plans(pat_num).unwrap();
+    let links = app.store.list_pay_plan_links().unwrap();
+    let procedures = app.store.list_procedures(pat_num).unwrap();
+    let adjustments = app.store.list_adjustments(pat_num).unwrap();
+    let splits = app.store.list_pay_splits(pat_num).unwrap();
+    let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+    app.reconcile_dynamic_plans_due_portfolio(
+        &plans,
+        &links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        as_of,
+    );
 
-        let notice = app.notice.clone().unwrap_or_default();
-        assert!(notice.contains("Issued"), "notice: {notice}; err: {:?}", app.error);
-        let after = app.store.list_pay_plan_charges(pat_num).unwrap();
-        let own: Vec<_> = after.iter().filter(|c| c.pay_plan_num == plan_num).collect();
-        assert!(own.len() >= 2, "charges should be issued for Jan+Feb due periods, got {}", own.len());
-        let logs = app.store.list_security_log(200).unwrap();
-        assert!(logs.iter().any(|l| l.log_text.contains("portfolio reconcile") && l.log_text.contains(&format!("plan {plan_num}"))), "audit log missing");
+    let notice = app.notice.clone().unwrap_or_default();
+    assert!(
+        notice.contains("Issued"),
+        "notice: {notice}; err: {:?}",
+        app.error
+    );
+    let after = app.store.list_pay_plan_charges(pat_num).unwrap();
+    let own: Vec<_> = after
+        .iter()
+        .filter(|c| c.pay_plan_num == plan_num)
+        .collect();
+    assert!(
+        own.len() >= 2,
+        "charges should be issued for Jan+Feb due periods, got {}",
+        own.len()
+    );
+    let logs = app.store.list_security_log(200).unwrap();
+    assert!(
+        logs.iter()
+            .any(|l| l.log_text.contains("portfolio reconcile")
+                && l.log_text.contains(&format!("plan {plan_num}"))),
+        "audit log missing"
+    );
 
-        // Idempotent second run.
-        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &after, as_of);
-        let notice2 = app.notice.clone().unwrap_or_default();
-        assert!(notice2.contains("No dynamic charges due to issue"), "notice2: {notice2}; err: {:?}", app.error);
-    }
+    // Idempotent second run.
+    app.reconcile_dynamic_plans_due_portfolio(
+        &plans,
+        &links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &after,
+        as_of,
+    );
+    let notice2 = app.notice.clone().unwrap_or_default();
+    assert!(
+        notice2.contains("No dynamic charges due to issue"),
+        "notice2: {notice2}; err: {:?}",
+        app.error
+    );
+}
 
-    #[test]
-    fn resolve_stale_dynamic_plan_charges_is_safe_and_audited() {
-        let mut app = OdApp::new();
-        app.refresh();
-        let pat_num = app.patients[0].pat_num;
-        let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let as_of = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
-        let adj_num = app.store.upsert_adjustment(&od_domain::Adjustment {
+#[test]
+fn resolve_stale_dynamic_plan_charges_is_safe_and_audited() {
+    let mut app = OdApp::new();
+    app.refresh();
+    let pat_num = app.patients[0].pat_num;
+    let start = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+    let as_of = chrono::NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+    let adj_num = app
+        .store
+        .upsert_adjustment(&od_domain::Adjustment {
             pat_num,
             adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
             adj_amount: 300.0,
             ..Default::default()
-        }).unwrap();
-        let plan_num = app.store.upsert_pay_plan(&PayPlan {
+        })
+        .unwrap();
+    let plan_num = app
+        .store
+        .upsert_pay_plan(&PayPlan {
             pat_num,
             guarantor: pat_num,
             pay_plan_date: start,
@@ -14660,160 +15340,249 @@ mod tests {
             pay_amt: 100.0,
             date_pay_plan_start: Some(start),
             ..Default::default()
-        }).unwrap();
-        let _ = app.store.upsert_pay_plan_link(&PayPlanLink {
+        })
+        .unwrap();
+    let _ = app
+        .store
+        .upsert_pay_plan_link(&PayPlanLink {
             pay_plan_num: plan_num,
             link_type: PayPlanLink::ADJUSTMENT,
             fkey: adj_num,
             ..Default::default()
-        }).unwrap();
-        app.refresh();
-        let plans = app.store.list_pay_plans(pat_num).unwrap();
-        let links = app.store.list_pay_plan_links().unwrap();
-        let procedures = app.store.list_procedures(pat_num).unwrap();
-        let adjustments = app.store.list_adjustments(pat_num).unwrap();
-        let splits = app.store.list_pay_splits(pat_num).unwrap();
-        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
-        app.reconcile_dynamic_plans_due_portfolio(&plans, &links, &procedures, &adjustments, &splits, &charges, as_of);
-        // Reduce production so issued Mar charge becomes stale/over-issued.
-        let _ = app.store.upsert_adjustment(&od_domain::Adjustment {
+        })
+        .unwrap();
+    app.refresh();
+    let plans = app.store.list_pay_plans(pat_num).unwrap();
+    let links = app.store.list_pay_plan_links().unwrap();
+    let procedures = app.store.list_procedures(pat_num).unwrap();
+    let adjustments = app.store.list_adjustments(pat_num).unwrap();
+    let splits = app.store.list_pay_splits(pat_num).unwrap();
+    let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+    app.reconcile_dynamic_plans_due_portfolio(
+        &plans,
+        &links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        as_of,
+    );
+    // Reduce production so issued Mar charge becomes stale/over-issued.
+    let _ = app
+        .store
+        .upsert_adjustment(&od_domain::Adjustment {
             adj_num,
             pat_num,
             adj_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).unwrap(),
             adj_amount: 200.0,
             ..Default::default()
-        }).unwrap();
-        app.refresh();
-        let plans = app.store.list_pay_plans(pat_num).unwrap();
-        let plan = plans.iter().find(|p| p.pay_plan_num == plan_num).unwrap().clone();
-        let links = app.store.list_pay_plan_links().unwrap();
-        let own_links: Vec<_> = links.iter().filter(|l| l.pay_plan_num == plan_num).cloned().collect();
-        let procedures = app.store.list_procedures(pat_num).unwrap();
-        let adjustments = app.store.list_adjustments(pat_num).unwrap();
-        let splits = app.store.list_pay_splits(pat_num).unwrap();
-        let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
-        let rec = od_core::reconciliation(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
-        assert!(rec.stale_issued_count > 0, "expected stale charges");
-        let (_, _, _, stale) = od_core::reconciliation_detail(&plan, &own_links, &procedures, &adjustments, &splits, &charges, as_of);
-        let evidence = od_core::stale_charge_evidence(&stale);
-        assert_eq!(evidence.len(), rec.stale_issued_count);
-        assert!(evidence.iter().any(|line| line.contains("issued")
+        })
+        .unwrap();
+    app.refresh();
+    let plans = app.store.list_pay_plans(pat_num).unwrap();
+    let plan = plans
+        .iter()
+        .find(|p| p.pay_plan_num == plan_num)
+        .unwrap()
+        .clone();
+    let links = app.store.list_pay_plan_links().unwrap();
+    let own_links: Vec<_> = links
+        .iter()
+        .filter(|l| l.pay_plan_num == plan_num)
+        .cloned()
+        .collect();
+    let procedures = app.store.list_procedures(pat_num).unwrap();
+    let adjustments = app.store.list_adjustments(pat_num).unwrap();
+    let splits = app.store.list_pay_splits(pat_num).unwrap();
+    let charges = app.store.list_pay_plan_charges(pat_num).unwrap();
+    let rec = od_core::reconciliation(
+        &plan,
+        &own_links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        as_of,
+    );
+    assert!(rec.stale_issued_count > 0, "expected stale charges");
+    let (_, _, _, stale) = od_core::reconciliation_detail(
+        &plan,
+        &own_links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        as_of,
+    );
+    let evidence = od_core::stale_charge_evidence(&stale);
+    assert_eq!(evidence.len(), rec.stale_issued_count);
+    assert!(
+        evidence.iter().any(|line| line.contains("issued")
             && line.contains("expected")
-            && line.contains("no splits")), "stale evidence preview missing: {evidence:?}");
-        // Empty reason must block resolution before any row is changed.
-        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, "", as_of);
-        assert!(app.error.as_deref().unwrap_or("").contains("resolution reason"));
-        assert!(app.notice.is_none());
-        let unchanged = app.store.list_pay_plan_charges(pat_num).unwrap();
-        assert!(unchanged.iter().any(|c| c.pay_plan_num == plan_num && !od_core::is_stale_resolved_charge(c)));
+            && line.contains("no splits")),
+        "stale evidence preview missing: {evidence:?}"
+    );
+    // Empty reason must block resolution before any row is changed.
+    app.resolve_stale_dynamic_plan_charges(
+        &plan,
+        &own_links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        "",
+        as_of,
+    );
+    assert!(
+        app.error
+            .as_deref()
+            .unwrap_or("")
+            .contains("resolution reason")
+    );
+    assert!(app.notice.is_none());
+    let unchanged = app.store.list_pay_plan_charges(pat_num).unwrap();
+    assert!(
+        unchanged
+            .iter()
+            .any(|c| c.pay_plan_num == plan_num && !od_core::is_stale_resolved_charge(c))
+    );
 
-        let reason = "procedure fee corrected after chart review";
-        app.stale_resolution_reasons.insert(plan_num, reason.into());
-        app.resolve_stale_dynamic_plan_charges(&plan, &own_links, &procedures, &adjustments, &splits, &charges, reason, as_of);
-        let notice = app.notice.clone().unwrap_or_default();
-        assert!(notice.contains("Resolved"), "notice: {notice}; err: {:?}", app.error);
-        let after = app.store.list_pay_plan_charges(pat_num).unwrap();
-        let stale_zeroed = after.iter().any(|c| c.pay_plan_num == plan_num && c.note.contains("Stale resolved") && c.note.contains(reason) && (c.principal + c.interest).abs() < 0.01);
-        assert!(stale_zeroed, "stale charge should be zeroed and annotated with the staff reason");
-        let logs = app.store.list_security_log(200).unwrap();
-        assert!(logs.iter().any(|l| l.log_text.contains("Resolved")
+    let reason = "procedure fee corrected after chart review";
+    app.stale_resolution_reasons.insert(plan_num, reason.into());
+    app.resolve_stale_dynamic_plan_charges(
+        &plan,
+        &own_links,
+        &procedures,
+        &adjustments,
+        &splits,
+        &charges,
+        reason,
+        as_of,
+    );
+    let notice = app.notice.clone().unwrap_or_default();
+    assert!(
+        notice.contains("Resolved"),
+        "notice: {notice}; err: {:?}",
+        app.error
+    );
+    let after = app.store.list_pay_plan_charges(pat_num).unwrap();
+    let stale_zeroed = after.iter().any(|c| {
+        c.pay_plan_num == plan_num
+            && c.note.contains("Stale resolved")
+            && c.note.contains(reason)
+            && (c.principal + c.interest).abs() < 0.01
+    });
+    assert!(
+        stale_zeroed,
+        "stale charge should be zeroed and annotated with the staff reason"
+    );
+    let logs = app.store.list_security_log(200).unwrap();
+    assert!(
+        logs.iter().any(|l| l.log_text.contains("Resolved")
             && l.log_text.contains("stale dynamic charge")
-            && l.log_text.contains(reason)), "audit log missing staff reason");
-    }
+            && l.log_text.contains(reason)),
+        "audit log missing staff reason"
+    );
+}
 
-    #[test]
-    fn stale_resolved_plan_charge_display_filter_respects_toggle() {
-        let active = PayPlanCharge {
-            pay_plan_num: 1,
-            charge_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-            charge_type: PayPlanChargeType::Debit,
-            principal: 100.0,
-            pay_plan_charge_num: 1,
-            ..Default::default()
-        };
-        let resolved = PayPlanCharge {
-            pay_plan_num: 1,
-            charge_date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
-            charge_type: PayPlanChargeType::Debit,
-            note: "[Stale resolved 2026-03-01: production reduced]".into(),
-            pay_plan_charge_num: 2,
-            ..Default::default()
-        };
-        let other_plan = PayPlanCharge {
-            pay_plan_num: 2,
-            note: "[Stale resolved 2026-03-01: production reduced]".into(),
-            pay_plan_charge_num: 3,
-            ..Default::default()
-        };
-        let charges = [active, resolved, other_plan];
+#[test]
+fn stale_resolved_plan_charge_display_filter_respects_toggle() {
+    let active = PayPlanCharge {
+        pay_plan_num: 1,
+        charge_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+        charge_type: PayPlanChargeType::Debit,
+        principal: 100.0,
+        pay_plan_charge_num: 1,
+        ..Default::default()
+    };
+    let resolved = PayPlanCharge {
+        pay_plan_num: 1,
+        charge_date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+        charge_type: PayPlanChargeType::Debit,
+        note: "[Stale resolved 2026-03-01: production reduced]".into(),
+        pay_plan_charge_num: 2,
+        ..Default::default()
+    };
+    let other_plan = PayPlanCharge {
+        pay_plan_num: 2,
+        note: "[Stale resolved 2026-03-01: production reduced]".into(),
+        pay_plan_charge_num: 3,
+        ..Default::default()
+    };
+    let charges = [active, resolved, other_plan];
 
-        let shown = visible_plan_charge_rows(&charges, 1, true);
-        assert_eq!(shown.len(), 2, "resolved rows are visible by default for audit");
-        assert!(shown.iter().any(|c| od_core::is_stale_resolved_charge(c)));
+    let shown = visible_plan_charge_rows(&charges, 1, true);
+    assert_eq!(
+        shown.len(),
+        2,
+        "resolved rows are visible by default for audit"
+    );
+    assert!(shown.iter().any(|c| od_core::is_stale_resolved_charge(c)));
 
-        let hidden = visible_plan_charge_rows(&charges, 1, false);
-        assert_eq!(hidden.len(), 1);
-        assert_eq!(hidden[0].pay_plan_charge_num, 1);
-        assert!(!hidden.iter().any(|c| od_core::is_stale_resolved_charge(c)));
-    }
+    let hidden = visible_plan_charge_rows(&charges, 1, false);
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0].pay_plan_charge_num, 1);
+    assert!(!hidden.iter().any(|c| od_core::is_stale_resolved_charge(c)));
+}
 
-    #[test]
-    fn account_transfer_filter_and_export_respect_plan_target_and_date() {
-        let rows = vec![
-            LedgerRow {
-                date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-                kind: "Refund/Transfer".into(),
-                description: "Payment plan #1 (credit moved/refund -> procedure #10)".into(),
-                charge: 10.0,
-                credit: 0.0,
-                plan_num: 1,
-                transfer_target: Some(PaymentTarget::Procedure(10)),
-                pay_num: 101,
-                adj_num: 0,
-                note: "moved to proc".into(),
-            },
-            LedgerRow {
-                date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
-                kind: "Refund/Transfer".into(),
-                description: "Payment plan #2 (credit moved/refund -> patient account (unallocated))".into(),
-                charge: 20.0,
-                credit: 0.0,
-                plan_num: 2,
-                transfer_target: Some(PaymentTarget::Unallocated),
-                pay_num: 102,
-                adj_num: 0,
-                note: "refund reason".into(),
-            },
-            LedgerRow {
-                date: chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
-                kind: "Payment".into(),
-                description: "Payment plan #2 (unapplied to charge)".into(),
-                charge: 0.0,
-                credit: 20.0,
-                plan_num: 2,
-                transfer_target: None,
-                pay_num: 103,
-                adj_num: 0,
-                note: String::new(),
-            },
-        ];
-        let filtered = filter_account_ledger_rows(
-            &rows,
-            true,
-            2,
-            PaymentTarget::Unallocated,
-            Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
-            Some(chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
-        );
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].plan_num, 2);
-        let table = account_ledger_export_table(&filtered);
-        let csv = render_report_csv("Account ledger (filtered)", "", &table);
-        let html = render_report_html("Account ledger (filtered)", "", &table);
-        assert!(csv.contains("Refund/Transfer"));
-        assert!(csv.contains("plan #2"));
-        assert!(csv.contains("Payment #,Note"));
-        assert!(csv.contains("102,refund reason"));
-        assert!(!csv.contains("procedure #10"));
-        assert!(html.contains("patient account (unallocated)"));
-    }
+#[test]
+fn account_transfer_filter_and_export_respect_plan_target_and_date() {
+    let rows = vec![
+        LedgerRow {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            kind: "Refund/Transfer".into(),
+            description: "Payment plan #1 (credit moved/refund -> procedure #10)".into(),
+            charge: 10.0,
+            credit: 0.0,
+            plan_num: 1,
+            transfer_target: Some(PaymentTarget::Procedure(10)),
+            pay_num: 101,
+            adj_num: 0,
+            note: "moved to proc".into(),
+        },
+        LedgerRow {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap(),
+            kind: "Refund/Transfer".into(),
+            description: "Payment plan #2 (credit moved/refund -> patient account (unallocated))"
+                .into(),
+            charge: 20.0,
+            credit: 0.0,
+            plan_num: 2,
+            transfer_target: Some(PaymentTarget::Unallocated),
+            pay_num: 102,
+            adj_num: 0,
+            note: "refund reason".into(),
+        },
+        LedgerRow {
+            date: chrono::NaiveDate::from_ymd_opt(2026, 2, 15).unwrap(),
+            kind: "Payment".into(),
+            description: "Payment plan #2 (unapplied to charge)".into(),
+            charge: 0.0,
+            credit: 20.0,
+            plan_num: 2,
+            transfer_target: None,
+            pay_num: 103,
+            adj_num: 0,
+            note: String::new(),
+        },
+    ];
+    let filtered = filter_account_ledger_rows(
+        &rows,
+        true,
+        2,
+        PaymentTarget::Unallocated,
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 15).unwrap()),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 12, 31).unwrap()),
+    );
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].plan_num, 2);
+    let table = account_ledger_export_table(&filtered);
+    let csv = render_report_csv("Account ledger (filtered)", "", &table);
+    let html = render_report_html("Account ledger (filtered)", "", &table);
+    assert!(csv.contains("Refund/Transfer"));
+    assert!(csv.contains("plan #2"));
+    assert!(csv.contains("Payment #,Note"));
+    assert!(csv.contains("102,refund reason"));
+    assert!(!csv.contains("procedure #10"));
+    assert!(html.contains("patient account (unallocated)"));
+}
